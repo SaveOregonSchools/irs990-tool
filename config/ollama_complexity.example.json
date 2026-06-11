@@ -1,0 +1,19 @@
+{
+  "default": "standard",
+  "options": {
+    "standard": {
+      "label": "Standard — faster (8K context, 1000-token output)",
+      "description": "Best for normal lookups, filters, rankings, and most single-step questions.",
+      "num_ctx": 8192,
+      "num_predict": 1000,
+      "timeout": 180
+    },
+    "complex": {
+      "label": "Complex — larger prompt room (16K context, 1800-token output)",
+      "description": "Use for multi-step calculations, multi-year comparisons, or more detailed SQL generation.",
+      "num_ctx": 16384,
+      "num_predict": 1800,
+      "timeout": 240
+    }
+  }
+}
