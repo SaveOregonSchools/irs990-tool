@@ -17,6 +17,10 @@ db/*.db-wal
 # Empty placeholder so Git tracks folder
 db/.gitkeep
 
+# Database schema dumps
+db/*.db.sql
+*.db.sql
+
 # Ollama query complexity config
 config/ollama_complexity.json
 
