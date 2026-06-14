@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_2_fast_candidates.py
+grant_ai_assist_v1_4_bulk_status.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
-Fast v1.2 changes
+Fast v1.4 changes
 -----------------
 - Defers secondary indexes during full-refresh loads for signatures, candidates, and applied AI matches.
 - Uses exclusive SQLite locking for bulk-write commands, but not during Ollama adjudication.
@@ -13,6 +13,8 @@ Fast v1.2 changes
 - Skips unnecessary per-signature candidate deletes during full-refresh candidate generation.
 - Makes candidate generation much faster by defaulting to high-signal exact/name/address/EIN lookups.
 - Adds optional balanced/broad candidate modes for token/FTS fallback, with safer geo-constrained token queries.
+- Adds a stats command for raw grants, deterministic resolver results, AI signatures/candidates/decisions, and final applied results.
+- Optimizes candidate generation by staging candidate counts and bulk-updating signature status instead of updating one signature row at a time.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -39,25 +41,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_2_fast_candidates.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_4_bulk_status.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_2_fast_candidates.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_4_bulk_status.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_2_fast_candidates.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_4_bulk_status.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_2_fast_candidates.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_4_bulk_status.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_2_fast_candidates.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_4_bulk_status.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_2_fast_candidates.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_4_bulk_status.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_2_fast_candidates.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_4_bulk_status.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -1404,16 +1406,30 @@ def best_candidates_by_ein(sig: sqlite3.Row, identity_rows: Sequence[sqlite3.Row
     return sorted(best.values(), key=lambda c: (c.candidate_score, c.name_score, c.address_score), reverse=True)[:max_candidates]
 
 
-def insert_candidate_rows(conn: sqlite3.Connection, signature_hash: str, candidates: Sequence[CandidateChoice], delete_existing: bool = True) -> None:
+def insert_candidate_rows(
+    conn: sqlite3.Connection,
+    signature_hash: str,
+    candidates: Sequence[CandidateChoice],
+    delete_existing: bool = True,
+    update_signature: bool = False,
+) -> None:
+    """Insert candidate rows for one signature.
+
+    v1.4 change: by default this no longer updates grant_recipient_signature.
+    Updating that table once per signature became a bottleneck at millions of
+    signatures. cmd_generate_candidates stages counts and bulk-updates signature
+    status periodically / at the end instead.
+    """
     if delete_existing:
         conn.execute(f"DELETE FROM {CAND_TABLE} WHERE signature_hash=?", (signature_hash,))
     rows = []
+    ts = now_stamp()
     for i, c in enumerate(candidates, 1):
         rows.append((
             signature_hash, f"C{i}", i, c.identity_id, c.ein, c.candidate_name, c.source, c.source_rank,
             c.street, c.city, c.state, c.zip5, c.name_score, c.address_score, c.zip_match,
             c.city_state_match, c.state_match, c.exact_name, c.exact_address, c.reported_ein_match,
-            c.candidate_score, ";".join(c.reasons), now_stamp(),
+            c.candidate_score, ";".join(c.reasons), ts,
         ))
     if rows:
         conn.executemany(f"""
@@ -1423,9 +1439,69 @@ def insert_candidate_rows(conn: sqlite3.Connection, signature_hash: str, candida
               exact_name, exact_address, reported_ein_match, candidate_score, candidate_reason, created_at
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows)
-    conn.execute(f"UPDATE {SIG_TABLE} SET candidate_count=?, ai_queue_status=CASE WHEN ? > 0 THEN 'candidates_ready' ELSE 'no_candidates' END, updated_at=? WHERE signature_hash=?",
-                 (len(candidates), len(candidates), now_stamp(), signature_hash))
+    if update_signature:
+        conn.execute(f"UPDATE {SIG_TABLE} SET candidate_count=?, ai_queue_status=CASE WHEN ? > 0 THEN 'candidates_ready' ELSE 'no_candidates' END, updated_at=? WHERE signature_hash=?",
+                     (len(candidates), len(candidates), ts, signature_hash))
 
+
+def create_candidate_count_stage(conn: sqlite3.Connection) -> None:
+    """Create temp staging table used to bulk-update signature candidate status.
+
+    This table lives only for the current SQLite connection. It lets candidate
+    generation process millions of signatures without issuing millions of
+    UPDATE statements against grant_recipient_signature.
+    """
+    conn.executescript("""
+    DROP TABLE IF EXISTS temp.tmp_ai_candidate_counts;
+    CREATE TEMP TABLE tmp_ai_candidate_counts (
+      signature_hash TEXT PRIMARY KEY,
+      candidate_count INTEGER NOT NULL
+    );
+    """)
+
+
+def stage_candidate_counts(conn: sqlite3.Connection, rows: Sequence[Tuple[str, int]]) -> None:
+    if not rows:
+        return
+    conn.executemany(
+        "INSERT OR REPLACE INTO temp.tmp_ai_candidate_counts(signature_hash, candidate_count) VALUES (?,?)",
+        rows,
+    )
+
+
+def bulk_update_signature_candidate_status(conn: sqlite3.Connection, label: str = "candidate status") -> int:
+    """Bulk-update candidate_count / ai_queue_status for staged signatures.
+
+    Returns the number of staged signatures updated. The temp rows are deleted
+    after the update so this can be called periodically without letting the temp
+    table grow without bound.
+    """
+    row = conn.execute("SELECT COUNT(*) AS n FROM temp.tmp_ai_candidate_counts").fetchone()
+    n = int(row["n"] if row is not None else 0)
+    if n <= 0:
+        return 0
+    ts = now_stamp()
+    print(f"Bulk-updating {label} for {n:,} signatures...", flush=True)
+    conn.execute(f"""
+        UPDATE {SIG_TABLE}
+        SET candidate_count = COALESCE((
+              SELECT t.candidate_count
+              FROM temp.tmp_ai_candidate_counts t
+              WHERE t.signature_hash = {SIG_TABLE}.signature_hash
+            ), 0),
+            ai_queue_status = CASE
+              WHEN COALESCE((
+                SELECT t.candidate_count
+                FROM temp.tmp_ai_candidate_counts t
+                WHERE t.signature_hash = {SIG_TABLE}.signature_hash
+              ), 0) > 0 THEN 'candidates_ready'
+              ELSE 'no_candidates'
+            END,
+            updated_at = ?
+        WHERE signature_hash IN (SELECT signature_hash FROM temp.tmp_ai_candidate_counts)
+    """, (ts,))
+    conn.execute("DELETE FROM temp.tmp_ai_candidate_counts")
+    return n
 
 def iter_signatures_for_candidates(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
     where = []
@@ -1459,13 +1535,28 @@ def cmd_generate_candidates(args: argparse.Namespace) -> None:
     if not table_exists(conn, SIG_TABLE):
         raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
     create_candidate_schema(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh)
+    create_candidate_count_stage(conn)
     delete_existing = not args.full_refresh
     processed = 0
     with_candidates = 0
+    staged_count_rows: List[Tuple[str, int]] = []
     started = time.time()
     mode = getattr(args, "candidate_mode", "fast")
     use_fts = bool(mode == "broad" and not args.no_fts)
     print(f"Candidate generation mode: {mode} (token fallback {'on' if mode in ('balanced','broad') else 'off'}, FTS {'on' if use_fts else 'off'})", flush=True)
+    print(
+        "v1.4 optimization: candidate counts are staged and bulk-updated; "
+        "signature status will update in batches instead of once per signature.",
+        flush=True,
+    )
+    if args.full_refresh and (args.limit or args.state or args.min_total_amount is not None or args.queue_status):
+        print(
+            "Note: --full-refresh drops the entire candidate table, but your filters/limit process only a subset of signatures. "
+            "Only processed signatures will have candidate_count/ai_queue_status refreshed.",
+            flush=True,
+        )
+
+    status_update_every = max(int(getattr(args, "status_update_every", 0) or 0), 0)
     for sig in iter_signatures_for_candidates(conn, args):
         identity_rows = get_candidate_identity_rows(
             conn,
@@ -1476,20 +1567,38 @@ def cmd_generate_candidates(args: argparse.Namespace) -> None:
             enough_candidates=args.enough_candidates,
         )
         candidates = best_candidates_by_ein(sig, identity_rows, args.max_candidates, args.min_candidate_score)
-        insert_candidate_rows(conn, sig["signature_hash"], candidates, delete_existing=delete_existing)
+        insert_candidate_rows(conn, sig["signature_hash"], candidates, delete_existing=delete_existing, update_signature=False)
         processed += 1
+        cand_count = len(candidates)
+        staged_count_rows.append((sig["signature_hash"], cand_count))
         if candidates:
             with_candidates += 1
         if processed % args.commit_every == 0:
+            stage_candidate_counts(conn, staged_count_rows)
+            staged_count_rows.clear()
+            # For long non-full-refresh targeted passes, periodic bulk status updates
+            # make progress visible without returning to per-row UPDATE behavior.
+            if status_update_every and processed % status_update_every == 0:
+                bulk_update_signature_candidate_status(conn, "candidate status progress")
             conn.commit()
             elapsed = max(1.0, time.time() - started)
             print(f"Generated candidates for {processed:,} signatures; {with_candidates:,} have candidates; {processed/elapsed:,.0f}/sec", flush=True)
+    if staged_count_rows:
+        stage_candidate_counts(conn, staged_count_rows)
+        staged_count_rows.clear()
     conn.commit()
+
+    # This is the v1.4 speedup: one or a few set-based UPDATEs instead of one
+    # UPDATE per processed signature.
+    bulk_update_signature_candidate_status(conn, "final candidate status")
+    conn.commit()
+
     if args.full_refresh:
         print("Candidate generation complete; creating candidate indexes after load...", flush=True)
         create_candidate_indexes(conn)
     elapsed = max(1.0, time.time() - started)
     print(f"Candidate generation complete: {processed:,} signatures, {with_candidates:,} with candidates at {processed/elapsed:,.0f}/sec", flush=True)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1958,6 +2067,526 @@ def cmd_apply_decisions(args: argparse.Namespace) -> None:
     print(f"Applied {count:,} grant-level AI matches into {APPLIED_TABLE}; final view is {FINAL_VIEW}", flush=True)
 
 
+
+# ---------------------------------------------------------------------------
+# Stats / progress reporting
+# ---------------------------------------------------------------------------
+
+
+def _scalar(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> Any:
+    row = conn.execute(sql, params).fetchone()
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return row[0]
+    return row[0]
+
+
+def _safe_count(conn: sqlite3.Connection, table: str) -> Optional[int]:
+    if not table_exists(conn, table):
+        return None
+    return int(_scalar(conn, f"SELECT COUNT(*) FROM {table}") or 0)
+
+
+def _fmt_num(x: Any) -> str:
+    if x is None:
+        return ""
+    try:
+        if isinstance(x, float):
+            return f"{x:,.2f}"
+        return f"{int(x):,}"
+    except Exception:
+        return str(x)
+
+
+def _pct(part: Any, total: Any) -> Optional[float]:
+    try:
+        part_f = float(part or 0)
+        total_f = float(total or 0)
+        if total_f == 0:
+            return None
+        return round(100.0 * part_f / total_f, 2)
+    except Exception:
+        return None
+
+
+def _add_stat(rows: List[Dict[str, Any]], section: str, metric: str, bucket: str = "",
+              count: Any = None, total_amount: Any = None, pct_of_grants: Any = None,
+              pct_of_section: Any = None, signatures: Any = None, grants_represented: Any = None,
+              notes: str = "") -> None:
+    rows.append({
+        "section": section,
+        "metric": metric,
+        "bucket": bucket or "",
+        "count": int(count) if isinstance(count, bool) is False and count is not None and str(count).replace('.', '', 1).isdigit() else count,
+        "signatures": signatures,
+        "grants_represented": grants_represented,
+        "total_amount": round(float(total_amount), 2) if total_amount not in (None, "") else total_amount,
+        "pct_of_grants": pct_of_grants,
+        "pct_of_section": pct_of_section,
+        "notes": notes,
+    })
+
+
+def _money_expr(prefix: str = "") -> str:
+    pfx = prefix + "." if prefix else ""
+    return f"COALESCE({pfx}cash_amount,0)+COALESCE({pfx}noncash_amount,0)"
+
+
+def _raw_grants_money_expr() -> str:
+    return "COALESCE(cash_grant_amt,0)+COALESCE(non_cash_assistance_amt,0)"
+
+
+def _confidence_bucket_expr(col: str) -> str:
+    return f"""
+    CASE
+      WHEN {col} IS NULL THEN 'missing'
+      WHEN {col} = 0 THEN '0'
+      WHEN {col} < 0.50 THEN '0.01-0.49'
+      WHEN {col} < 0.70 THEN '0.50-0.69'
+      WHEN {col} < 0.85 THEN '0.70-0.84'
+      WHEN {col} < 0.90 THEN '0.85-0.89'
+      WHEN {col} < 0.92 THEN '0.90-0.919'
+      WHEN {col} < 0.95 THEN '0.92-0.949'
+      ELSE '0.95-1.00'
+    END
+    """
+
+
+def _candidate_count_bucket_expr(col: str = "candidate_count") -> str:
+    return f"""
+    CASE
+      WHEN {col} IS NULL OR {col}=0 THEN '0'
+      WHEN {col}=1 THEN '1'
+      WHEN {col} BETWEEN 2 AND 5 THEN '2-5'
+      WHEN {col} BETWEEN 6 AND 10 THEN '6-10'
+      WHEN {col} BETWEEN 11 AND 20 THEN '11-20'
+      ELSE '21+'
+    END
+    """
+
+
+def _has_table_or_note(conn: sqlite3.Connection, rows: List[Dict[str, Any]], table: str, section: str) -> bool:
+    if table_exists(conn, table):
+        return True
+    _add_stat(rows, section, "table_missing", table, notes=f"{table} has not been created yet")
+    return False
+
+
+def _top_group_rows(conn: sqlite3.Connection, sql: str, params: Sequence[Any] = ()) -> List[sqlite3.Row]:
+    return list(conn.execute(sql, params))
+
+
+def collect_stats(conn: sqlite3.Connection, top_n: int = 50, include_final_view: bool = True) -> List[Dict[str, Any]]:
+    """Collect grant matching pipeline statistics.
+
+    The report is intentionally tolerant of partially completed pipelines: if a
+    table has not been created yet, the relevant section reports a missing table
+    instead of failing.
+    """
+    stats: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Raw grants table
+    # ------------------------------------------------------------------
+    if _has_table_or_note(conn, stats, "grants", "raw_grants"):
+        total_grants = int(_scalar(conn, "SELECT COUNT(*) FROM grants") or 0)
+        total_amount = _scalar(conn, f"SELECT SUM({_raw_grants_money_expr()}) FROM grants") or 0
+        _add_stat(stats, "raw_grants", "total_grants", count=total_grants, total_amount=total_amount, pct_of_grants=100.0)
+
+        blank_sql = "recipient_ein IS NULL OR TRIM(CAST(recipient_ein AS TEXT))=''"
+        blank = int(_scalar(conn, f"SELECT COUNT(*) FROM grants WHERE {blank_sql}") or 0)
+        nonblank = total_grants - blank
+        _add_stat(stats, "raw_grants", "reported_recipient_ein", "blank", count=blank, pct_of_grants=_pct(blank, total_grants))
+        _add_stat(stats, "raw_grants", "reported_recipient_ein", "nonblank", count=nonblank, pct_of_grants=_pct(nonblank, total_grants))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(NULLIF(TRIM(CAST(g.recipient_ein AS TEXT)),''),'(blank)') AS bucket,
+                   COUNT(*) AS n,
+                   SUM({_raw_grants_money_expr()}) AS amt
+            FROM grants g
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (min(top_n, 25),)):
+            # This top-EIN list is mostly useful for spotting blanks/placeholders.
+            _add_stat(stats, "raw_grants", "top_reported_recipient_ein_values", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants))
+
+        if table_exists(conn, "returns"):
+            for r in _top_group_rows(conn, f"""
+                SELECT COALESCE(r.return_type,'(missing)') AS bucket,
+                       COUNT(*) AS n,
+                       SUM({_raw_grants_money_expr()}) AS amt
+                FROM grants g
+                LEFT JOIN returns r ON r.filing_id = g.filing_id
+                GROUP BY bucket
+                ORDER BY n DESC
+            """):
+                _add_stat(stats, "raw_grants", "grant_rows_by_filer_return_type", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants))
+    else:
+        total_grants = None
+
+    # ------------------------------------------------------------------
+    # Deterministic first-pass resolver
+    # ------------------------------------------------------------------
+    if _has_table_or_note(conn, stats, RESOLVED_TABLE, "deterministic_resolver"):
+        det_total = int(_scalar(conn, f"SELECT COUNT(*) FROM {RESOLVED_TABLE}") or 0)
+        det_amt = _scalar(conn, f"SELECT SUM(total_amount) FROM {RESOLVED_TABLE}") or 0
+        _add_stat(stats, "deterministic_resolver", "total_rows", count=det_total, total_amount=det_amt, pct_of_grants=_pct(det_total, total_grants))
+
+        resolved_cond = "resolved_ein IS NOT NULL AND TRIM(CAST(resolved_ein AS TEXT))<>''"
+        reported_blank_cond = "recipient_reported_ein IS NULL OR TRIM(CAST(recipient_reported_ein AS TEXT))=''"
+        det_resolved = int(_scalar(conn, f"SELECT COUNT(*) FROM {RESOLVED_TABLE} WHERE {resolved_cond}") or 0)
+        det_unresolved = det_total - det_resolved
+        _add_stat(stats, "deterministic_resolver", "resolved_ein", "nonblank", count=det_resolved, pct_of_grants=_pct(det_resolved, total_grants), pct_of_section=_pct(det_resolved, det_total))
+        _add_stat(stats, "deterministic_resolver", "resolved_ein", "blank_unresolved", count=det_unresolved, pct_of_grants=_pct(det_unresolved, total_grants), pct_of_section=_pct(det_unresolved, det_total))
+
+        for label, cond in [
+            ("reported_blank_and_resolved", f"({reported_blank_cond}) AND ({resolved_cond})"),
+            ("reported_blank_and_unresolved", f"({reported_blank_cond}) AND NOT ({resolved_cond})"),
+            ("reported_nonblank_and_resolved", f"NOT ({reported_blank_cond}) AND ({resolved_cond})"),
+            ("reported_nonblank_and_unresolved", f"NOT ({reported_blank_cond}) AND NOT ({resolved_cond})"),
+        ]:
+            n = int(_scalar(conn, f"SELECT COUNT(*) FROM {RESOLVED_TABLE} WHERE {cond}") or 0)
+            amt = _scalar(conn, f"SELECT SUM(total_amount) FROM {RESOLVED_TABLE} WHERE {cond}") or 0
+            _add_stat(stats, "deterministic_resolver", "reported_ein_vs_resolved", label, count=n, total_amount=amt, pct_of_grants=_pct(n, total_grants), pct_of_section=_pct(n, det_total))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(match_status,'(missing)') AS bucket,
+                   COUNT(*) AS n,
+                   SUM(total_amount) AS amt,
+                   SUM(CASE WHEN {resolved_cond} THEN 1 ELSE 0 END) AS resolved_n
+            FROM {RESOLVED_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "deterministic_resolver", "match_status", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], det_total), notes=f"resolved_rows={r['resolved_n']}")
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(match_method,'(missing)') AS bucket,
+                   COUNT(*) AS n,
+                   SUM(total_amount) AS amt
+            FROM {RESOLVED_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "deterministic_resolver", "match_method", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], det_total))
+
+        bucket = _confidence_bucket_expr("confidence")
+        for r in _top_group_rows(conn, f"""
+            SELECT {bucket} AS bucket, COUNT(*) AS n, SUM(total_amount) AS amt
+            FROM {RESOLVED_TABLE}
+            GROUP BY bucket
+            ORDER BY CASE bucket
+              WHEN 'missing' THEN 0 WHEN '0' THEN 1 WHEN '0.01-0.49' THEN 2 WHEN '0.50-0.69' THEN 3
+              WHEN '0.70-0.84' THEN 4 WHEN '0.85-0.89' THEN 5 WHEN '0.90-0.919' THEN 6
+              WHEN '0.92-0.949' THEN 7 ELSE 8 END
+        """):
+            _add_stat(stats, "deterministic_resolver", "confidence_bucket", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], det_total))
+
+        for label, cond in [
+            ("confidence_lt_0_70", "confidence < 0.70"),
+            ("confidence_lt_0_85", "confidence < 0.85"),
+            ("confidence_lt_0_90", "confidence < 0.90"),
+            ("confidence_lt_0_92", "confidence < 0.92"),
+            ("warnings_present", "warning_flags IS NOT NULL AND TRIM(warning_flags)<>''"),
+            ("unresolved_or_low_confidence_or_warning", f"NOT ({resolved_cond}) OR confidence < 0.92 OR (warning_flags IS NOT NULL AND TRIM(warning_flags)<>'')"),
+        ]:
+            n = int(_scalar(conn, f"SELECT COUNT(*) FROM {RESOLVED_TABLE} WHERE {cond}") or 0)
+            amt = _scalar(conn, f"SELECT SUM(total_amount) FROM {RESOLVED_TABLE} WHERE {cond}") or 0
+            _add_stat(stats, "deterministic_resolver", "review_pool", label, count=n, total_amount=amt, pct_of_grants=_pct(n, total_grants), pct_of_section=_pct(n, det_total))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(NULLIF(TRIM(warning_flags),''),'(none)') AS bucket,
+                   COUNT(*) AS n,
+                   SUM(total_amount) AS amt
+            FROM {RESOLVED_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "deterministic_resolver", "warning_flags_string", r["bucket"], count=r["n"], total_amount=r["amt"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], det_total))
+
+    # ------------------------------------------------------------------
+    # Organization identity layer
+    # ------------------------------------------------------------------
+    if table_exists(conn, ORG_IDENTITY_TABLE):
+        n = int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_IDENTITY_TABLE}") or 0)
+        distinct_eins = int(_scalar(conn, f"SELECT COUNT(DISTINCT ein) FROM {ORG_IDENTITY_TABLE}") or 0)
+        _add_stat(stats, "org_identity", "identity_rows", count=n)
+        _add_stat(stats, "org_identity", "distinct_eins", count=distinct_eins)
+        for r in _top_group_rows(conn, f"""
+            SELECT source AS bucket, COUNT(*) AS n, COUNT(DISTINCT ein) AS distinct_eins
+            FROM {ORG_IDENTITY_TABLE}
+            GROUP BY source
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "org_identity", "source", r["bucket"], count=r["n"], notes=f"distinct_eins={r['distinct_eins']}")
+    else:
+        _add_stat(stats, "org_identity", "table_missing", ORG_IDENTITY_TABLE, notes="Run build-identity")
+
+    if table_exists(conn, ORG_TOKEN_TABLE):
+        _add_stat(stats, "org_identity", "token_rows", count=int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_TOKEN_TABLE}") or 0))
+    if table_exists(conn, f"{ORG_IDENTITY_TABLE}_fts"):
+        # FTS row count is often equal-ish to indexed docs; this is cheap enough.
+        try:
+            _add_stat(stats, "org_identity", "fts_rows", count=int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_IDENTITY_TABLE}_fts") or 0))
+        except sqlite3.Error as e:
+            _add_stat(stats, "org_identity", "fts_rows", notes=f"could not count FTS rows: {e}")
+
+    # ------------------------------------------------------------------
+    # Signatures / AI work queue
+    # ------------------------------------------------------------------
+    if _has_table_or_note(conn, stats, SIG_TABLE, "signatures"):
+        sig_total = int(_scalar(conn, f"SELECT COUNT(*) FROM {SIG_TABLE}") or 0)
+        sig_grants = int(_scalar(conn, f"SELECT COALESCE(SUM(grant_count),0) FROM {SIG_TABLE}") or 0)
+        sig_amt = _scalar(conn, f"SELECT COALESCE(SUM(total_amount),0) FROM {SIG_TABLE}") or 0
+        _add_stat(stats, "signatures", "total_signatures", count=sig_total, grants_represented=sig_grants, total_amount=sig_amt, pct_of_grants=_pct(sig_grants, total_grants))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(ai_queue_status,'(missing)') AS bucket,
+                   COUNT(*) AS sigs,
+                   SUM(grant_count) AS grants,
+                   SUM(total_amount) AS amt
+            FROM {SIG_TABLE}
+            GROUP BY bucket
+            ORDER BY sigs DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "signatures", "ai_queue_status", r["bucket"], signatures=r["sigs"], grants_represented=r["grants"], total_amount=r["amt"], pct_of_section=_pct(r["sigs"], sig_total), pct_of_grants=_pct(r["grants"], total_grants))
+
+        bucket = _candidate_count_bucket_expr("candidate_count")
+        for r in _top_group_rows(conn, f"""
+            SELECT {bucket} AS bucket,
+                   COUNT(*) AS sigs,
+                   SUM(grant_count) AS grants,
+                   SUM(total_amount) AS amt
+            FROM {SIG_TABLE}
+            GROUP BY bucket
+            ORDER BY CASE bucket WHEN '0' THEN 0 WHEN '1' THEN 1 WHEN '2-5' THEN 2 WHEN '6-10' THEN 3 WHEN '11-20' THEN 4 ELSE 5 END
+        """):
+            _add_stat(stats, "signatures", "candidate_count_bucket", r["bucket"], signatures=r["sigs"], grants_represented=r["grants"], total_amount=r["amt"], pct_of_section=_pct(r["sigs"], sig_total), pct_of_grants=_pct(r["grants"], total_grants))
+
+        bucket = _confidence_bucket_expr("first_pass_avg_confidence")
+        for r in _top_group_rows(conn, f"""
+            SELECT {bucket} AS bucket,
+                   COUNT(*) AS sigs,
+                   SUM(grant_count) AS grants,
+                   SUM(total_amount) AS amt
+            FROM {SIG_TABLE}
+            GROUP BY bucket
+            ORDER BY CASE bucket
+              WHEN 'missing' THEN 0 WHEN '0' THEN 1 WHEN '0.01-0.49' THEN 2 WHEN '0.50-0.69' THEN 3
+              WHEN '0.70-0.84' THEN 4 WHEN '0.85-0.89' THEN 5 WHEN '0.90-0.919' THEN 6
+              WHEN '0.92-0.949' THEN 7 ELSE 8 END
+        """):
+            _add_stat(stats, "signatures", "first_pass_avg_confidence_bucket", r["bucket"], signatures=r["sigs"], grants_represented=r["grants"], total_amount=r["amt"], pct_of_section=_pct(r["sigs"], sig_total), pct_of_grants=_pct(r["grants"], total_grants))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(queued_reason,'(missing)') AS bucket,
+                   COUNT(*) AS sigs,
+                   SUM(grant_count) AS grants,
+                   SUM(total_amount) AS amt
+            FROM {SIG_TABLE}
+            GROUP BY bucket
+            ORDER BY sigs DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "signatures", "queued_reason", r["bucket"], signatures=r["sigs"], grants_represented=r["grants"], total_amount=r["amt"], pct_of_section=_pct(r["sigs"], sig_total), pct_of_grants=_pct(r["grants"], total_grants))
+
+    # ------------------------------------------------------------------
+    # Candidate generation
+    # ------------------------------------------------------------------
+    if table_exists(conn, CAND_TABLE):
+        cand_rows = int(_scalar(conn, f"SELECT COUNT(*) FROM {CAND_TABLE}") or 0)
+        cand_sigs = int(_scalar(conn, f"SELECT COUNT(DISTINCT signature_hash) FROM {CAND_TABLE}") or 0)
+        cand_eins = int(_scalar(conn, f"SELECT COUNT(DISTINCT ein) FROM {CAND_TABLE}") or 0)
+        _add_stat(stats, "candidates", "candidate_rows", count=cand_rows)
+        _add_stat(stats, "candidates", "signatures_with_candidates", signatures=cand_sigs)
+        _add_stat(stats, "candidates", "distinct_candidate_eins", count=cand_eins)
+
+        if table_exists(conn, SIG_TABLE):
+            sig_total = int(_scalar(conn, f"SELECT COUNT(*) FROM {SIG_TABLE}") or 0)
+            no_cand_sigs = int(_scalar(conn, f"SELECT COUNT(*) FROM {SIG_TABLE} WHERE COALESCE(candidate_count,0)=0") or 0)
+            with_cand_sigs = sig_total - no_cand_sigs
+            _add_stat(stats, "candidates", "signature_candidate_coverage", "with_candidates", signatures=with_cand_sigs, pct_of_section=_pct(with_cand_sigs, sig_total))
+            _add_stat(stats, "candidates", "signature_candidate_coverage", "no_candidates", signatures=no_cand_sigs, pct_of_section=_pct(no_cand_sigs, sig_total))
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(source,'(missing)') AS bucket,
+                   COUNT(*) AS n,
+                   COUNT(DISTINCT signature_hash) AS sigs,
+                   COUNT(DISTINCT ein) AS eins
+            FROM {CAND_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "candidates", "candidate_source", r["bucket"], count=r["n"], signatures=r["sigs"], notes=f"distinct_eins={r['eins']}")
+
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(candidate_reason,'(missing)') AS bucket,
+                   COUNT(*) AS n,
+                   COUNT(DISTINCT signature_hash) AS sigs
+            FROM {CAND_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "candidates", "candidate_reason", r["bucket"], count=r["n"], signatures=r["sigs"])
+
+        score_bucket = """
+            CASE
+              WHEN candidate_score IS NULL THEN 'missing'
+              WHEN candidate_score < 50 THEN '<50'
+              WHEN candidate_score < 65 THEN '50-64.99'
+              WHEN candidate_score < 80 THEN '65-79.99'
+              WHEN candidate_score < 90 THEN '80-89.99'
+              ELSE '90+'
+            END
+        """
+        for r in _top_group_rows(conn, f"""
+            SELECT {score_bucket} AS bucket, COUNT(*) AS n, COUNT(DISTINCT signature_hash) AS sigs
+            FROM {CAND_TABLE}
+            GROUP BY bucket
+            ORDER BY CASE bucket WHEN 'missing' THEN 0 WHEN '<50' THEN 1 WHEN '50-64.99' THEN 2 WHEN '65-79.99' THEN 3 WHEN '80-89.99' THEN 4 ELSE 5 END
+        """):
+            _add_stat(stats, "candidates", "candidate_score_bucket", r["bucket"], count=r["n"], signatures=r["sigs"])
+    else:
+        _add_stat(stats, "candidates", "table_missing", CAND_TABLE, notes="Run generate-candidates")
+
+    # ------------------------------------------------------------------
+    # Ollama decisions
+    # ------------------------------------------------------------------
+    if table_exists(conn, DECISION_TABLE):
+        dec_total = int(_scalar(conn, f"SELECT COUNT(*) FROM {DECISION_TABLE}") or 0)
+        _add_stat(stats, "ai_decisions", "total_decisions", signatures=dec_total)
+        for metric, col in [("decision", "decision"), ("validation_status", "validation_status"), ("auto_accept", "auto_accept"), ("needs_human_review", "needs_human_review")]:
+            for r in _top_group_rows(conn, f"""
+                SELECT COALESCE(CAST({col} AS TEXT),'(missing)') AS bucket,
+                       COUNT(*) AS sigs
+                FROM {DECISION_TABLE}
+                GROUP BY bucket
+                ORDER BY sigs DESC
+                LIMIT ?
+            """, (top_n,)):
+                _add_stat(stats, "ai_decisions", metric, r["bucket"], signatures=r["sigs"], pct_of_section=_pct(r["sigs"], dec_total))
+
+        bucket = _confidence_bucket_expr("confidence")
+        for r in _top_group_rows(conn, f"""
+            SELECT {bucket} AS bucket, COUNT(*) AS sigs
+            FROM {DECISION_TABLE}
+            GROUP BY bucket
+            ORDER BY CASE bucket
+              WHEN 'missing' THEN 0 WHEN '0' THEN 1 WHEN '0.01-0.49' THEN 2 WHEN '0.50-0.69' THEN 3
+              WHEN '0.70-0.84' THEN 4 WHEN '0.85-0.89' THEN 5 WHEN '0.90-0.919' THEN 6
+              WHEN '0.92-0.949' THEN 7 ELSE 8 END
+        """):
+            _add_stat(stats, "ai_decisions", "confidence_bucket", r["bucket"], signatures=r["sigs"], pct_of_section=_pct(r["sigs"], dec_total))
+
+        auto_sig = int(_scalar(conn, f"SELECT COUNT(*) FROM {DECISION_TABLE} WHERE auto_accept=1 AND validation_status='ok'") or 0)
+        _add_stat(stats, "ai_decisions", "auto_accepted_valid_signatures", signatures=auto_sig, pct_of_section=_pct(auto_sig, dec_total))
+    else:
+        _add_stat(stats, "ai_decisions", "table_missing", DECISION_TABLE, notes="Run adjudicate")
+
+    # ------------------------------------------------------------------
+    # Applied AI decisions and final view
+    # ------------------------------------------------------------------
+    if table_exists(conn, APPLIED_TABLE):
+        applied_rows = int(_scalar(conn, f"SELECT COUNT(*) FROM {APPLIED_TABLE}") or 0)
+        applied_sigs = int(_scalar(conn, f"SELECT COUNT(DISTINCT signature_hash) FROM {APPLIED_TABLE}") or 0)
+        _add_stat(stats, "applied_ai", "applied_grant_rows", count=applied_rows, signatures=applied_sigs, pct_of_grants=_pct(applied_rows, total_grants))
+        for r in _top_group_rows(conn, f"""
+            SELECT COALESCE(ai_decision,'(missing)') AS bucket, COUNT(*) AS n, COUNT(DISTINCT signature_hash) AS sigs
+            FROM {APPLIED_TABLE}
+            GROUP BY bucket
+            ORDER BY n DESC
+            LIMIT ?
+        """, (top_n,)):
+            _add_stat(stats, "applied_ai", "ai_decision", r["bucket"], count=r["n"], signatures=r["sigs"], pct_of_grants=_pct(r["n"], total_grants))
+    else:
+        _add_stat(stats, "applied_ai", "table_missing", APPLIED_TABLE, notes="Run apply-decisions")
+
+    if include_final_view:
+        if table_exists(conn, FINAL_VIEW):
+            final_total = int(_scalar(conn, f"SELECT COUNT(*) FROM {FINAL_VIEW}") or 0)
+            final_resolved_cond = "final_resolved_ein IS NOT NULL AND TRIM(CAST(final_resolved_ein AS TEXT))<>''"
+            final_resolved = int(_scalar(conn, f"SELECT COUNT(*) FROM {FINAL_VIEW} WHERE {final_resolved_cond}") or 0)
+            _add_stat(stats, "final_view", "total_rows", count=final_total, pct_of_grants=_pct(final_total, total_grants))
+            _add_stat(stats, "final_view", "final_resolved_ein", "nonblank", count=final_resolved, pct_of_grants=_pct(final_resolved, total_grants), pct_of_section=_pct(final_resolved, final_total))
+            _add_stat(stats, "final_view", "final_resolved_ein", "blank_unresolved", count=final_total - final_resolved, pct_of_grants=_pct(final_total - final_resolved, total_grants), pct_of_section=_pct(final_total - final_resolved, final_total))
+            for r in _top_group_rows(conn, f"""
+                SELECT COALESCE(final_match_source,'(missing)') AS bucket, COUNT(*) AS n
+                FROM {FINAL_VIEW}
+                GROUP BY bucket
+                ORDER BY n DESC
+            """):
+                _add_stat(stats, "final_view", "final_match_source", r["bucket"], count=r["n"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], final_total))
+            bucket = _confidence_bucket_expr("final_confidence")
+            for r in _top_group_rows(conn, f"""
+                SELECT {bucket} AS bucket, COUNT(*) AS n
+                FROM {FINAL_VIEW}
+                GROUP BY bucket
+                ORDER BY CASE bucket
+                  WHEN 'missing' THEN 0 WHEN '0' THEN 1 WHEN '0.01-0.49' THEN 2 WHEN '0.50-0.69' THEN 3
+                  WHEN '0.70-0.84' THEN 4 WHEN '0.85-0.89' THEN 5 WHEN '0.90-0.919' THEN 6
+                  WHEN '0.92-0.949' THEN 7 ELSE 8 END
+            """):
+                _add_stat(stats, "final_view", "final_confidence_bucket", r["bucket"], count=r["n"], pct_of_grants=_pct(r["n"], total_grants), pct_of_section=_pct(r["n"], final_total))
+        else:
+            _add_stat(stats, "final_view", "view_missing", FINAL_VIEW, notes="Run apply-decisions")
+    else:
+        _add_stat(stats, "final_view", "skipped", notes="Use without --skip-final-view to include final view counts")
+
+    return stats
+
+
+def print_stats(rows: Sequence[Dict[str, Any]], section_filter: Optional[str] = None) -> None:
+    sections: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if section_filter and row.get("section") != section_filter:
+            continue
+        sections[str(row.get("section", ""))].append(row)
+    for section, items in sections.items():
+        print(f"\n=== {section} ===")
+        print(f"{'metric':32} {'bucket':42} {'count':>14} {'sigs':>10} {'grants':>14} {'pct_grants':>10} {'pct_section':>11} {'amount':>16} notes")
+        print("-" * 170)
+        for r in items:
+            print(
+                f"{str(r.get('metric',''))[:32]:32} "
+                f"{str(r.get('bucket',''))[:42]:42} "
+                f"{_fmt_num(r.get('count')):>14} "
+                f"{_fmt_num(r.get('signatures')):>10} "
+                f"{_fmt_num(r.get('grants_represented')):>14} "
+                f"{'' if r.get('pct_of_grants') is None else f'{r.get('pct_of_grants'):.2f}%':>10} "
+                f"{'' if r.get('pct_of_section') is None else f'{r.get('pct_of_section'):.2f}%':>11} "
+                f"{_fmt_num(r.get('total_amount')):>16} "
+                f"{r.get('notes','')}"
+            )
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    conn = connect(args.db, readonly=True)
+    rows = collect_stats(conn, top_n=args.top_n, include_final_view=not args.skip_final_view)
+    if args.csv_out:
+        fieldnames = ["section", "metric", "bucket", "count", "signatures", "grants_represented", "total_amount", "pct_of_grants", "pct_of_section", "notes"]
+        with open(args.csv_out, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in fieldnames})
+        print(f"Wrote stats CSV: {args.csv_out}", flush=True)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2)
+        print(f"Wrote stats JSON: {args.json_out}", flush=True)
+    if not args.no_print:
+        print_stats(rows, section_filter=args.section)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1968,7 +2597,7 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.2 fast candidates)")
+    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.3 stats + fast candidates)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
@@ -2019,6 +2648,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--token-limit", type=int, default=50)
     p.add_argument("--no-fts", action="store_true", help="Disable FTS even in broad candidate mode")
     p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--status-update-every", type=int, default=0,
+                   help="Bulk-update signature candidate_count/queue status every N processed signatures; default 0 updates only at end for maximum speed")
     p.set_defaults(func=cmd_generate_candidates)
 
     p = sub.add_parser("adjudicate", help="Ask local Ollama to adjudicate candidate lists")
@@ -2048,6 +2679,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-confidence", type=float, default=0.92)
     p.add_argument("--batch-size", type=int, default=50000)
     p.set_defaults(func=cmd_apply_decisions)
+
+    p = sub.add_parser("stats", help="Report raw grant, deterministic resolver, candidate, AI decision, and final-view statistics")
+    add_common_db(p)
+    p.add_argument("--top-n", type=int, default=50, help="Maximum rows for grouped breakdowns")
+    p.add_argument("--section", default=None, choices=["raw_grants", "deterministic_resolver", "org_identity", "signatures", "candidates", "ai_decisions", "applied_ai", "final_view"], help="Print only one stats section")
+    p.add_argument("--skip-final-view", action="store_true", help="Skip counting the final resolved view if it is expensive or not needed")
+    p.add_argument("--csv-out", default=None, help="Optional CSV output path")
+    p.add_argument("--json-out", default=None, help="Optional JSON output path")
+    p.add_argument("--no-print", action="store_true", help="Do not print tables to console")
+    p.set_defaults(func=cmd_stats)
 
     return parser
 
