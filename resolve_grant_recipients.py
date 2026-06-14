@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-resolve_grant_recipients_v2.py
+resolve_grant_recipients_v2_1_fast.py
 
 Builds a precomputed grant-recipient identity resolution layer for the IRS 990
 SQLite database.
@@ -26,19 +26,25 @@ process:
 In dry-run mode, nothing is written to the database; results are written to CSV.
 In normal mode, results are written to table grant_recipient_resolved.
 
+Version 2.1 performance change
+------------------------------
+For full-refresh database loads, secondary indexes are deferred until after all
+rows are inserted. This is much faster for multi-million-row builds because
+SQLite does not have to maintain several large indexes during every insert.
+
 Examples
 --------
 Dry run to CSV:
-  python resolve_grant_recipients_v2.py --db C:\IRSDB\db\irs990.db --dry-run --csv-out grant_matches.csv
+  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --dry-run --csv-out grant_matches.csv
 
 Write/update database table, processing only rows not already resolved:
-  python resolve_grant_recipients_v2.py --db C:\IRSDB\db\irs990.db
+  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db
 
 Rebuild the resolved table from scratch:
-  python resolve_grant_recipients_v2.py --db C:\IRSDB\db\irs990.db --full-refresh
+  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --full-refresh
 
 Enable fuzzy fallback conservatively:
-  python resolve_grant_recipients_v2.py --db C:\IRSDB\db\irs990.db --enable-fuzzy --fuzzy-threshold 0.92
+  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --enable-fuzzy --fuzzy-threshold 0.92
 """
 
 from __future__ import annotations
@@ -142,6 +148,7 @@ def connect(db_path: str, readonly: bool = False) -> sqlite3.Connection:
         if not readonly:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA locking_mode=EXCLUSIVE;")
     except Exception:
         pass
     return conn
@@ -655,7 +662,42 @@ def result_to_tuple(r: MatchResult) -> Tuple[object, ...]:
     return tuple(getattr(r, f) for f in FIELDNAMES)
 
 
-def create_resolved_table(conn: sqlite3.Connection) -> None:
+RESOLVED_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS idx_grr_resolved_ein ON {RESOLVED_TABLE}(resolved_ein)",
+    f"CREATE INDEX IF NOT EXISTS idx_grr_reported_ein ON {RESOLVED_TABLE}(recipient_reported_ein)",
+    f"CREATE INDEX IF NOT EXISTS idx_grr_status ON {RESOLVED_TABLE}(match_status)",
+    f"CREATE INDEX IF NOT EXISTS idx_grr_grantor_ein_year ON {RESOLVED_TABLE}(grantor_ein, tax_year)",
+    f"CREATE INDEX IF NOT EXISTS idx_grr_name_state ON {RESOLVED_TABLE}(recipient_reported_name, recipient_state)",
+]
+
+
+def drop_resolved_indexes(conn: sqlite3.Connection) -> None:
+    for name in (
+        "idx_grr_resolved_ein",
+        "idx_grr_reported_ein",
+        "idx_grr_status",
+        "idx_grr_grantor_ein_year",
+        "idx_grr_name_state",
+    ):
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
+    conn.commit()
+
+
+def create_resolved_indexes(conn: sqlite3.Connection) -> None:
+    # Build indexes after bulk insert. This is much faster than maintaining
+    # them while inserting millions of rows.
+    for i, stmt in enumerate(RESOLVED_INDEXES, 1):
+        print(f"Creating post-load index {i}/{len(RESOLVED_INDEXES)}...", flush=True)
+        conn.execute(stmt)
+        conn.commit()
+    try:
+        conn.execute(f"ANALYZE {RESOLVED_TABLE}")
+        conn.commit()
+    except Exception:
+        pass
+
+
+def create_resolved_table(conn: sqlite3.Connection, create_indexes: bool = True) -> None:
     conn.executescript(f"""
     CREATE TABLE IF NOT EXISTS {RESOLVED_TABLE} (
       grant_id INTEGER PRIMARY KEY,
@@ -688,36 +730,37 @@ def create_resolved_table(conn: sqlite3.Connection) -> None:
       candidate_count INTEGER,
       processed_at TEXT
     );
-
-    CREATE INDEX IF NOT EXISTS idx_grr_resolved_ein ON {RESOLVED_TABLE}(resolved_ein);
-    CREATE INDEX IF NOT EXISTS idx_grr_reported_ein ON {RESOLVED_TABLE}(recipient_reported_ein);
-    CREATE INDEX IF NOT EXISTS idx_grr_status ON {RESOLVED_TABLE}(match_status);
-    CREATE INDEX IF NOT EXISTS idx_grr_grantor_ein_year ON {RESOLVED_TABLE}(grantor_ein, tax_year);
-    CREATE INDEX IF NOT EXISTS idx_grr_name_state ON {RESOLVED_TABLE}(recipient_reported_name, recipient_state);
     """)
     conn.commit()
+    if create_indexes:
+        create_resolved_indexes(conn)
 
 
-def full_refresh_table(conn: sqlite3.Connection) -> None:
+def full_refresh_table(conn: sqlite3.Connection, defer_indexes: bool = True) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {RESOLVED_TABLE}")
     conn.commit()
-    create_resolved_table(conn)
+    create_resolved_table(conn, create_indexes=not defer_indexes)
 
 
-def insert_batch(conn: sqlite3.Connection, batch: Sequence[MatchResult]) -> None:
+def insert_batch(conn: sqlite3.Connection, batch: Sequence[MatchResult], *, upsert: bool) -> None:
     placeholders = ",".join("?" for _ in FIELDNAMES)
     cols = ",".join(FIELDNAMES)
-    updates = ",".join(f"{c}=excluded.{c}" for c in FIELDNAMES if c != "grant_id")
-    sql = f"""
-    INSERT INTO {RESOLVED_TABLE} ({cols}) VALUES ({placeholders})
-    ON CONFLICT(grant_id) DO UPDATE SET {updates}
-    """
+    if upsert:
+        updates = ",".join(f"{c}=excluded.{c}" for c in FIELDNAMES if c != "grant_id")
+        sql = f"""
+        INSERT INTO {RESOLVED_TABLE} ({cols}) VALUES ({placeholders})
+        ON CONFLICT(grant_id) DO UPDATE SET {updates}
+        """
+    else:
+        # Full-refresh loads an empty table, so plain INSERT is faster than UPSERT.
+        sql = f"INSERT INTO {RESOLVED_TABLE} ({cols}) VALUES ({placeholders})"
     conn.executemany(sql, [result_to_tuple(r) for r in batch])
     conn.commit()
 
 
 def process(conn: sqlite3.Connection, idx: OrgIndex, args: argparse.Namespace) -> Counter:
     only_unresolved = (not args.full_refresh) and (not args.dry_run)
+    bulk_insert_mode = (not args.dry_run) and args.full_refresh
     sql, params = grant_sql(only_unresolved, args.min_grant_id, args.max_grant_id)
     cur = conn.execute(sql, params)
 
@@ -754,10 +797,12 @@ def process(conn: sqlite3.Connection, idx: OrgIndex, args: argparse.Namespace) -
 
             if writer is not None:
                 writer.writerow(result_to_tuple(result))
+                if args.flush_csv_every and counts["processed"] % args.flush_csv_every == 0:
+                    out_fh.flush()
             else:
                 batch.append(result)
                 if len(batch) >= args.batch_size:
-                    insert_batch(conn, batch)
+                    insert_batch(conn, batch, upsert=not bulk_insert_mode)
                     batch.clear()
 
             if args.limit and counts["processed"] >= args.limit:
@@ -774,7 +819,7 @@ def process(conn: sqlite3.Connection, idx: OrgIndex, args: argparse.Namespace) -
                 )
 
         if batch:
-            insert_batch(conn, batch)
+            insert_batch(conn, batch, upsert=not bulk_insert_mode)
             batch.clear()
     finally:
         if out_fh is not None:
@@ -796,8 +841,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--address-unique-min-name-score", type=float, default=0.35, help="Minimum name similarity to accept a unique exact address match when recipient name exists. Low by design because address is the primary signal.")
     p.add_argument("--address-name-threshold", type=float, default=0.72, help="Minimum name similarity to select one EIN when multiple EINs share the same exact address.")
     p.add_argument("--address-name-margin", type=float, default=0.08, help="Required gap between best and second-best name score when multiple EINs share an address.")
-    p.add_argument("--batch-size", type=int, default=10_000, help="Rows per database commit in normal mode.")
+    p.add_argument("--batch-size", type=int, default=50_000, help="Rows per database commit in normal mode. Larger is faster but uses more memory.")
     p.add_argument("--progress-every", type=int, default=50_000, help="Progress interval; 0 disables progress messages.")
+    p.add_argument("--flush-csv-every", type=int, default=100_000, help="Dry-run CSV flush interval; 0 disables periodic flush.")
+    p.add_argument("--no-defer-indexes", action="store_true", help="In --full-refresh mode, create secondary indexes before loading rows. Slower; mainly for debugging.")
     p.add_argument("--limit", type=int, default=0, help="Process only N grant rows for testing; 0 means no limit.")
     p.add_argument("--min-grant-id", type=int, default=None, help="Optional lower grant.id bound for testing/incremental work.")
     p.add_argument("--max-grant-id", type=int, default=None, help="Optional upper grant.id bound for testing/incremental work.")
@@ -815,18 +862,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     conn = connect(args.db, readonly=args.dry_run)
     try:
+        defer_indexes = args.full_refresh and not args.no_defer_indexes
         if not args.dry_run:
             if args.full_refresh:
-                print(f"Full refresh requested; recreating {RESOLVED_TABLE}...", flush=True)
-                full_refresh_table(conn)
+                if defer_indexes:
+                    print(f"Full refresh requested; recreating {RESOLVED_TABLE} without secondary indexes for fast bulk load...", flush=True)
+                else:
+                    print(f"Full refresh requested; recreating {RESOLVED_TABLE} with indexes before load...", flush=True)
+                full_refresh_table(conn, defer_indexes=defer_indexes)
             else:
-                create_resolved_table(conn)
+                create_resolved_table(conn, create_indexes=True)
 
         print("Building organization identity index from returns...", flush=True)
         idx = build_org_index(conn)
 
         print("Resolving grant recipient rows...", flush=True)
         counts = process(conn, idx, args)
+
+        if (not args.dry_run) and defer_indexes:
+            print("Bulk load complete; creating indexes after load...", flush=True)
+            create_resolved_indexes(conn)
 
         print("\nDone.")
         print(f"Processed: {counts['processed']:,}")
