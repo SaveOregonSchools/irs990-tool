@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1.py
+grant_ai_assist_v1_1_fast.py
 
-AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
+Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
-This script is intended to run AFTER resolve_grant_recipients_v2.py has created
+Fast v1.1 changes
+-----------------
+- Defers secondary indexes during full-refresh loads for signatures, candidates, and applied AI matches.
+- Uses exclusive SQLite locking for bulk-write commands, but not during Ollama adjudication.
+- Raises safe batch/commit defaults for a 32 GB RAM workstation.
+- Skips unnecessary per-signature candidate deletes during full-refresh candidate generation.
+
+This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
 identity layer that can include IRS EO BMF CSV files, builds one row per unique
 hard-to-match grant recipient signature, generates a compact candidate EIN set,
@@ -20,7 +27,7 @@ only among candidates it was given, or return NO_MATCH / AMBIGUOUS / HUMAN_REVIE
 Expected project layout
 -----------------------
   project_root/
-    irs990.db or DB at C:\IRSDB\db\irs990.db
+    irs990.db or DB at C:\projects\irs990-tool\db\irs990.db
     eo-bmf/
       eo1.csv
       eo2.csv
@@ -30,25 +37,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1.py verify-bmf --project-dir C:\IRSDB
+  python grant_ai_assist_v1_1_fast.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1.py build-identity --db C:\IRSDB\db\irs990.db --project-dir C:\IRSDB --full-refresh
+  python grant_ai_assist_v1_1_fast.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1.py build-signatures --db C:\IRSDB\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_1_fast.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1.py generate-candidates --db C:\IRSDB\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_1_fast.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1.py adjudicate --db C:\IRSDB\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_1_fast.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1.py adjudicate --db C:\IRSDB\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_1_fast.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1.py apply-decisions --db C:\IRSDB\db\irs990.db
+  python grant_ai_assist_v1_1_fast.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -70,7 +77,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-DEFAULT_DB = os.getenv("IRS_DB_PATH", r"C:\IRSDB\db\irs990.db")
+DEFAULT_PROJECT_DIR = os.getenv("IRS_PROJECT_DIR", r"C:\projects\irs990-tool")
+DEFAULT_DB = os.getenv("IRS_DB_PATH", str(Path(DEFAULT_PROJECT_DIR) / "db" / "irs990.db"))
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:12b")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 
@@ -132,7 +140,7 @@ def now_stamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def connect(db_path: str, readonly: bool = False) -> sqlite3.Connection:
+def connect(db_path: str, readonly: bool = False, exclusive: bool = False) -> sqlite3.Connection:
     if readonly:
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
@@ -147,9 +155,29 @@ def connect(db_path: str, readonly: bool = False) -> sqlite3.Connection:
         if not readonly:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
+            if exclusive:
+                conn.execute("PRAGMA locking_mode=EXCLUSIVE;")
     except Exception:
         pass
     return conn
+
+
+def run_index_statements(conn: sqlite3.Connection, statements: Sequence[str], label: str) -> None:
+    total = len(statements)
+    for i, stmt in enumerate(statements, 1):
+        print(f"Creating {label} index {i}/{total}...", flush=True)
+        conn.execute(stmt)
+        conn.commit()
+
+
+def analyze_tables(conn: sqlite3.Connection, tables: Sequence[str]) -> None:
+    for table in tables:
+        try:
+            print(f"Analyzing {table}...", flush=True)
+            conn.execute(f"ANALYZE {table}")
+        except sqlite3.Error as e:
+            print(f"ANALYZE skipped for {table}: {e}", flush=True)
+    conn.commit()
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -391,9 +419,8 @@ def create_identity_indexes(conn: sqlite3.Connection, include_fts_rebuild: bool 
         f"CREATE INDEX IF NOT EXISTS idx_org_token_token_state ON {ORG_TOKEN_TABLE}(token, state);",
         f"CREATE INDEX IF NOT EXISTS idx_org_token_token_zip ON {ORG_TOKEN_TABLE}(token, zip5);",
     ]
-    for stmt in statements:
-        conn.execute(stmt)
-    conn.commit()
+    run_index_statements(conn, statements, "org_identity")
+    analyze_tables(conn, [ORG_IDENTITY_TABLE, ORG_TOKEN_TABLE])
     if include_fts_rebuild and table_exists(conn, "org_identity_fts"):
         try:
             conn.execute("INSERT INTO org_identity_fts(org_identity_fts) VALUES('rebuild')")
@@ -690,7 +717,7 @@ def cmd_verify_bmf(args: argparse.Namespace) -> None:
 def cmd_build_identity(args: argparse.Namespace) -> None:
     bmf_dir = project_bmf_dir(args.project_dir, args.bmf_dir)
     verify_bmf_files(bmf_dir, require=not args.skip_bmf)
-    conn = connect(args.db, readonly=False)
+    conn = connect(args.db, readonly=False, exclusive=True)
     create_identity_schema(conn, full_refresh=args.full_refresh, create_fts=not args.no_fts)
     if args.full_refresh:
         # Index creation after bulk loading is faster, but the UNIQUE index exists from the table definition.
@@ -712,7 +739,19 @@ def cmd_build_identity(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_signature_schema(conn: sqlite3.Connection, full_refresh: bool = False) -> None:
+def create_signature_indexes(conn: sqlite3.Connection) -> None:
+    statements = [
+        f"CREATE INDEX IF NOT EXISTS idx_sig_state_zip ON {SIG_TABLE}(state, zip5);",
+        f"CREATE INDEX IF NOT EXISTS idx_sig_name ON {SIG_TABLE}(recipient_name_norm);",
+        f"CREATE INDEX IF NOT EXISTS idx_sig_amount ON {SIG_TABLE}(total_amount DESC);",
+        f"CREATE INDEX IF NOT EXISTS idx_sig_queue ON {SIG_TABLE}(ai_queue_status, total_amount DESC);",
+        f"CREATE INDEX IF NOT EXISTS idx_sig_grant_grant ON {SIG_GRANT_TABLE}(grant_id);",
+    ]
+    run_index_statements(conn, statements, "signature")
+    analyze_tables(conn, [SIG_TABLE, SIG_GRANT_TABLE])
+
+
+def create_signature_schema(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True) -> None:
     if full_refresh:
         conn.executescript(f"""
         DROP TABLE IF EXISTS {SIG_GRANT_TABLE};
@@ -756,14 +795,10 @@ def create_signature_schema(conn: sqlite3.Connection, full_refresh: bool = False
       grant_id INTEGER NOT NULL,
       PRIMARY KEY(signature_hash, grant_id)
     );
-
-    CREATE INDEX IF NOT EXISTS idx_sig_state_zip ON {SIG_TABLE}(state, zip5);
-    CREATE INDEX IF NOT EXISTS idx_sig_name ON {SIG_TABLE}(recipient_name_norm);
-    CREATE INDEX IF NOT EXISTS idx_sig_amount ON {SIG_TABLE}(total_amount DESC);
-    CREATE INDEX IF NOT EXISTS idx_sig_queue ON {SIG_TABLE}(ai_queue_status, total_amount DESC);
-    CREATE INDEX IF NOT EXISTS idx_sig_grant_grant ON {SIG_GRANT_TABLE}(grant_id);
     """)
     conn.commit()
+    if create_indexes:
+        create_signature_indexes(conn)
 
 
 @dataclass
@@ -943,8 +978,8 @@ def insert_signature_batch(conn: sqlite3.Connection, sigs: Sequence[SigAgg], map
 
 
 def cmd_build_signatures(args: argparse.Namespace) -> None:
-    conn = connect(args.db, readonly=False)
-    create_signature_schema(conn, full_refresh=args.full_refresh)
+    conn = connect(args.db, readonly=False, exclusive=True)
+    create_signature_schema(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh)
     sigs: Dict[str, SigAgg] = {}
     mappings: List[Tuple[str, int]] = []
     processed = 0
@@ -1006,6 +1041,9 @@ def cmd_build_signatures(args: argparse.Namespace) -> None:
             mappings.clear()
     if sigs or mappings:
         insert_signature_batch(conn, list(sigs.values()), mappings)
+    if args.full_refresh:
+        print("Bulk signature build complete; creating signature indexes after load...", flush=True)
+        create_signature_indexes(conn)
     elapsed = max(1.0, time.time() - started)
     sig_count = conn.execute(f"SELECT COUNT(*) FROM {SIG_TABLE}").fetchone()[0]
     map_count = conn.execute(f"SELECT COUNT(*) FROM {SIG_GRANT_TABLE}").fetchone()[0]
@@ -1017,7 +1055,16 @@ def cmd_build_signatures(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_candidate_schema(conn: sqlite3.Connection, full_refresh: bool = False) -> None:
+def create_candidate_indexes(conn: sqlite3.Connection) -> None:
+    statements = [
+        f"CREATE INDEX IF NOT EXISTS idx_ai_cand_sig_rank ON {CAND_TABLE}(signature_hash, candidate_rank);",
+        f"CREATE INDEX IF NOT EXISTS idx_ai_cand_ein ON {CAND_TABLE}(ein);",
+    ]
+    run_index_statements(conn, statements, "candidate")
+    analyze_tables(conn, [CAND_TABLE])
+
+
+def create_candidate_schema(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True) -> None:
     if full_refresh:
         conn.executescript(f"DROP TABLE IF EXISTS {CAND_TABLE};")
         conn.commit()
@@ -1048,10 +1095,10 @@ def create_candidate_schema(conn: sqlite3.Connection, full_refresh: bool = False
       created_at TEXT,
       PRIMARY KEY(signature_hash, candidate_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_ai_cand_sig_rank ON {CAND_TABLE}(signature_hash, candidate_rank);
-    CREATE INDEX IF NOT EXISTS idx_ai_cand_ein ON {CAND_TABLE}(ein);
     """)
     conn.commit()
+    if create_indexes:
+        create_candidate_indexes(conn)
 
 
 def identity_rows_by_sql(conn: sqlite3.Connection, sql: str, params: Sequence[Any]) -> List[sqlite3.Row]:
@@ -1264,8 +1311,9 @@ def best_candidates_by_ein(sig: sqlite3.Row, identity_rows: Sequence[sqlite3.Row
     return sorted(best.values(), key=lambda c: (c.candidate_score, c.name_score, c.address_score), reverse=True)[:max_candidates]
 
 
-def insert_candidate_rows(conn: sqlite3.Connection, signature_hash: str, candidates: Sequence[CandidateChoice]) -> None:
-    conn.execute(f"DELETE FROM {CAND_TABLE} WHERE signature_hash=?", (signature_hash,))
+def insert_candidate_rows(conn: sqlite3.Connection, signature_hash: str, candidates: Sequence[CandidateChoice], delete_existing: bool = True) -> None:
+    if delete_existing:
+        conn.execute(f"DELETE FROM {CAND_TABLE} WHERE signature_hash=?", (signature_hash,))
     rows = []
     for i, c in enumerate(candidates, 1):
         rows.append((
@@ -1274,13 +1322,14 @@ def insert_candidate_rows(conn: sqlite3.Connection, signature_hash: str, candida
             c.city_state_match, c.state_match, c.exact_name, c.exact_address, c.reported_ein_match,
             c.candidate_score, ";".join(c.reasons), now_stamp(),
         ))
-    conn.executemany(f"""
-        INSERT INTO {CAND_TABLE} (
-          signature_hash, candidate_id, candidate_rank, identity_id, ein, candidate_name, source, source_rank,
-          street, city, state, zip5, name_score, address_score, zip_match, city_state_match, state_match,
-          exact_name, exact_address, reported_ein_match, candidate_score, candidate_reason, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, rows)
+    if rows:
+        conn.executemany(f"""
+            INSERT INTO {CAND_TABLE} (
+              signature_hash, candidate_id, candidate_rank, identity_id, ein, candidate_name, source, source_rank,
+              street, city, state, zip5, name_score, address_score, zip_match, city_state_match, state_match,
+              exact_name, exact_address, reported_ein_match, candidate_score, candidate_reason, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
     conn.execute(f"UPDATE {SIG_TABLE} SET candidate_count=?, ai_queue_status=CASE WHEN ? > 0 THEN 'candidates_ready' ELSE 'no_candidates' END, updated_at=? WHERE signature_hash=?",
                  (len(candidates), len(candidates), now_stamp(), signature_hash))
 
@@ -1311,19 +1360,20 @@ def iter_signatures_for_candidates(conn: sqlite3.Connection, args: argparse.Name
 
 
 def cmd_generate_candidates(args: argparse.Namespace) -> None:
-    conn = connect(args.db, readonly=False)
+    conn = connect(args.db, readonly=False, exclusive=True)
     if not table_exists(conn, ORG_IDENTITY_TABLE):
         raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
     if not table_exists(conn, SIG_TABLE):
         raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
-    create_candidate_schema(conn, full_refresh=args.full_refresh)
+    create_candidate_schema(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh)
+    delete_existing = not args.full_refresh
     processed = 0
     with_candidates = 0
     started = time.time()
     for sig in iter_signatures_for_candidates(conn, args):
         identity_rows = get_candidate_identity_rows(conn, sig, use_fts=not args.no_fts, token_limit=args.token_limit)
         candidates = best_candidates_by_ein(sig, identity_rows, args.max_candidates, args.min_candidate_score)
-        insert_candidate_rows(conn, sig["signature_hash"], candidates)
+        insert_candidate_rows(conn, sig["signature_hash"], candidates, delete_existing=delete_existing)
         processed += 1
         if candidates:
             with_candidates += 1
@@ -1332,6 +1382,9 @@ def cmd_generate_candidates(args: argparse.Namespace) -> None:
             elapsed = max(1.0, time.time() - started)
             print(f"Generated candidates for {processed:,} signatures; {with_candidates:,} have candidates; {processed/elapsed:,.0f}/sec", flush=True)
     conn.commit()
+    if args.full_refresh:
+        print("Candidate generation complete; creating candidate indexes after load...", flush=True)
+        create_candidate_indexes(conn)
     elapsed = max(1.0, time.time() - started)
     print(f"Candidate generation complete: {processed:,} signatures, {with_candidates:,} with candidates at {processed/elapsed:,.0f}/sec", flush=True)
 
@@ -1703,25 +1756,16 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool = False) -> None:
-    if full_refresh:
-        conn.executescript(f"DROP VIEW IF EXISTS {FINAL_VIEW}; DROP TABLE IF EXISTS {APPLIED_TABLE};")
-        conn.commit()
-    conn.executescript(f"""
-    CREATE TABLE IF NOT EXISTS {APPLIED_TABLE} (
-      grant_id INTEGER PRIMARY KEY,
-      signature_hash TEXT NOT NULL,
-      selected_ein TEXT NOT NULL,
-      selected_name TEXT,
-      ai_confidence NUMERIC,
-      ai_decision TEXT,
-      model TEXT,
-      applied_at TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_ai_applied_selected_ein ON {APPLIED_TABLE}(selected_ein);
-    CREATE INDEX IF NOT EXISTS idx_ai_applied_sig ON {APPLIED_TABLE}(signature_hash);
-    """)
-    conn.commit()
+def create_applied_indexes(conn: sqlite3.Connection) -> None:
+    statements = [
+        f"CREATE INDEX IF NOT EXISTS idx_ai_applied_selected_ein ON {APPLIED_TABLE}(selected_ein);",
+        f"CREATE INDEX IF NOT EXISTS idx_ai_applied_sig ON {APPLIED_TABLE}(signature_hash);",
+    ]
+    run_index_statements(conn, statements, "applied")
+    analyze_tables(conn, [APPLIED_TABLE])
+
+
+def refresh_final_view(conn: sqlite3.Connection) -> None:
     conn.execute(f"DROP VIEW IF EXISTS {FINAL_VIEW}")
     conn.execute(f"""
     CREATE VIEW {FINAL_VIEW} AS
@@ -1741,11 +1785,36 @@ def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool 
     conn.commit()
 
 
+def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True, create_view: bool = True) -> None:
+    if full_refresh:
+        conn.executescript(f"DROP VIEW IF EXISTS {FINAL_VIEW}; DROP TABLE IF EXISTS {APPLIED_TABLE};")
+        conn.commit()
+    conn.executescript(f"""
+    CREATE TABLE IF NOT EXISTS {APPLIED_TABLE} (
+      grant_id INTEGER PRIMARY KEY,
+      signature_hash TEXT NOT NULL,
+      selected_ein TEXT NOT NULL,
+      selected_name TEXT,
+      ai_confidence NUMERIC,
+      ai_decision TEXT,
+      model TEXT,
+      applied_at TEXT
+    );
+    """)
+    conn.commit()
+    if create_indexes:
+        create_applied_indexes(conn)
+    if create_view:
+        refresh_final_view(conn)
+
+
 def cmd_apply_decisions(args: argparse.Namespace) -> None:
-    conn = connect(args.db, readonly=False)
+    conn = connect(args.db, readonly=False, exclusive=True)
     if not table_exists(conn, DECISION_TABLE):
         raise RuntimeError(f"Missing {DECISION_TABLE}. Run adjudicate first.")
-    create_applied_schema_and_view(conn, full_refresh=args.full_refresh)
+    if args.full_refresh:
+        print("Full refresh: deferring applied-match indexes and final view until after bulk apply...", flush=True)
+    create_applied_schema_and_view(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh, create_view=not args.full_refresh)
     where = "WHERE d.auto_accept=1 AND d.validation_status='ok' AND d.selected_ein IS NOT NULL AND d.selected_ein <> ''"
     params: List[Any] = []
     if args.min_confidence is not None:
@@ -1779,6 +1848,10 @@ def cmd_apply_decisions(args: argparse.Namespace) -> None:
         )
         count += len(batch)
         conn.commit()
+    if args.full_refresh:
+        print("Bulk apply complete; creating applied-match indexes and final view...", flush=True)
+        create_applied_indexes(conn)
+        refresh_final_view(conn)
     print(f"Applied {count:,} grant-level AI matches into {APPLIED_TABLE}; final view is {FINAL_VIEW}", flush=True)
 
 
@@ -1792,17 +1865,17 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher")
+    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.1 fast)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
-    p.add_argument("--project-dir", default=None, help="Main project folder containing eo-bmf/")
+    p.add_argument("--project-dir", default=DEFAULT_PROJECT_DIR, help=f"Main project folder containing eo-bmf/ (default: {DEFAULT_PROJECT_DIR})")
     p.add_argument("--bmf-dir", default=None, help="Explicit EO BMF directory")
     p.set_defaults(func=cmd_verify_bmf)
 
     p = sub.add_parser("build-identity", help="Build org_identity from returns and EO BMF CSVs")
     add_common_db(p)
-    p.add_argument("--project-dir", default=None, help="Main project folder containing eo-bmf/")
+    p.add_argument("--project-dir", default=DEFAULT_PROJECT_DIR, help=f"Main project folder containing eo-bmf/ (default: {DEFAULT_PROJECT_DIR})")
     p.add_argument("--bmf-dir", default=None, help="Explicit EO BMF directory")
     p.add_argument("--full-refresh", action="store_true", help="Drop and rebuild org_identity")
     p.add_argument("--skip-returns", action="store_true", help="Do not import identity rows from returns")
@@ -1810,7 +1883,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-bmf-ico", action="store_true", help="Also index BMF ICO as low-priority alias; off by default")
     p.add_argument("--no-tokens", action="store_true", help="Do not build org_identity_token")
     p.add_argument("--no-fts", action="store_true", help="Do not create/rebuild FTS5 table")
-    p.add_argument("--batch-size", type=int, default=10000)
+    p.add_argument("--batch-size", type=int, default=50000)
     p.set_defaults(func=cmd_build_identity)
 
     p = sub.add_parser("build-signatures", help="Build unique hard-case grant recipient signatures")
@@ -1838,7 +1911,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-candidate-score", type=float, default=45.0)
     p.add_argument("--token-limit", type=int, default=200)
     p.add_argument("--no-fts", action="store_true")
-    p.add_argument("--commit-every", type=int, default=1000)
+    p.add_argument("--commit-every", type=int, default=5000)
     p.set_defaults(func=cmd_generate_candidates)
 
     p = sub.add_parser("adjudicate", help="Ask local Ollama to adjudicate candidate lists")
@@ -1866,7 +1939,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_db(p)
     p.add_argument("--full-refresh", action="store_true")
     p.add_argument("--min-confidence", type=float, default=0.92)
-    p.add_argument("--batch-size", type=int, default=10000)
+    p.add_argument("--batch-size", type=int, default=50000)
     p.set_defaults(func=cmd_apply_decisions)
 
     return parser
