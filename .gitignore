@@ -32,3 +32,6 @@ Thumbs.db
 downloads/
 exports/
 cache/
+
+# IRS Exempt Org business master files
+eo-bmf/
