@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_1_fast.py
+grant_ai_assist_v1_2_fast_candidates.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
-Fast v1.1 changes
+Fast v1.2 changes
 -----------------
 - Defers secondary indexes during full-refresh loads for signatures, candidates, and applied AI matches.
 - Uses exclusive SQLite locking for bulk-write commands, but not during Ollama adjudication.
 - Raises safe batch/commit defaults for a 32 GB RAM workstation.
 - Skips unnecessary per-signature candidate deletes during full-refresh candidate generation.
+- Makes candidate generation much faster by defaulting to high-signal exact/name/address/EIN lookups.
+- Adds optional balanced/broad candidate modes for token/FTS fallback, with safer geo-constrained token queries.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -37,25 +39,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_1_fast.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_2_fast_candidates.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_1_fast.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_2_fast_candidates.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_1_fast.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_2_fast_candidates.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_1_fast.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_2_fast_candidates.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_1_fast.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_2_fast_candidates.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_1_fast.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_2_fast_candidates.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_1_fast.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_2_fast_candidates.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -1105,7 +1107,72 @@ def identity_rows_by_sql(conn: sqlite3.Connection, sql: str, params: Sequence[An
     return list(conn.execute(sql, params))
 
 
-def get_candidate_identity_rows(conn: sqlite3.Connection, sig: sqlite3.Row, use_fts: bool, token_limit: int = 200) -> List[sqlite3.Row]:
+# Additional very-common nonprofit/name words that make token fallback expensive
+# and usually add little identifying power unless paired with a distinctive token.
+TOKEN_FALLBACK_STOPWORDS = NAME_STOPWORDS | {
+    "SCHOOL", "SCHOOLS", "CENTER", "CENTRE", "UNIVERSITY", "COLLEGE", "ACADEMY",
+    "ASSOCIATION", "SOCIETY", "CHURCH", "MINISTRY", "MINISTRIES", "HEALTH", "MEDICAL",
+    "HOSPITAL", "CLINIC", "COMMUNITY", "SERVICE", "SERVICES", "PROGRAM", "PROGRAMS",
+    "PUBLIC", "AMERICAN", "NATIONAL", "INTERNATIONAL", "LOCAL", "COUNTY", "CITY",
+    "FRIENDS", "FAMILY", "FAMILIES", "YOUTH", "CHILD", "CHILDREN", "EDUCATION",
+    "EDUCATIONAL", "ART", "ARTS", "MUSEUM", "CLUB", "TRUST", "CHARITABLE",
+    "NONPROFIT", "NON", "PROFIT", "RELIEF", "SUPPORT", "DEVELOPMENT", "COUNCIL",
+}
+
+
+def distinctive_name_tokens(name_norm: str, max_tokens: int = 5) -> List[str]:
+    """Return tokens useful for candidate fallback lookups.
+
+    The old candidate generator queried org_identity_token for up to eight name
+    tokens, including very common words. On a large EO BMF + returns identity
+    table, tokens such as CENTER, SCHOOL, COMMUNITY, HEALTH, SERVICES, etc. can
+    touch enormous row sets. This helper keeps only more distinctive tokens for
+    the expensive fallback stage. If no distinctive token is available, we skip
+    token fallback rather than scanning millions of generic token hits.
+    """
+    out: List[str] = []
+    for t in name_tokens(name_norm):
+        if t in TOKEN_FALLBACK_STOPWORDS:
+            continue
+        if len(t) < 4:
+            continue
+        out.append(t)
+        if len(out) >= max_tokens:
+            break
+    return out
+
+
+def _add_rows(rows: Dict[int, sqlite3.Row], found: Iterable[sqlite3.Row]) -> None:
+    for r in found:
+        rows[int(r["identity_id"])] = r
+
+
+def _unique_ein_count(rows: Dict[int, sqlite3.Row]) -> int:
+    return len({digits9(r["ein"]) for r in rows.values() if digits9(r["ein"])})
+
+
+def get_candidate_identity_rows(
+    conn: sqlite3.Connection,
+    sig: sqlite3.Row,
+    *,
+    candidate_mode: str = "fast",
+    use_fts: bool = False,
+    token_limit: int = 50,
+    enough_candidates: int = 8,
+) -> List[sqlite3.Row]:
+    """Return org_identity rows that might match one recipient signature.
+
+    v1.2 behavior:
+      - Always run cheap/high-signal lookups first: reported EIN, exact name +
+        address/location, address/location, and exact normalized name.
+      - In default `fast` mode, stop there. This is dramatically faster and is
+        the right first candidate-generation pass for millions of signatures.
+      - `balanced` and `broad` modes add token fallback only if the cheap stage
+        did not already find enough distinct EINs. The token fallback is now
+        constrained through org_identity_token.state/zip5, so SQLite can use the
+        token+geo indexes instead of joining a huge token set to org_identity.
+      - `broad` mode can also use FTS, but only as a later fallback.
+    """
     rows: Dict[int, sqlite3.Row] = {}
     reported_ein = digits9(sig["reported_ein"])
     name_norm = clean_text(sig["recipient_name_norm"])
@@ -1113,43 +1180,57 @@ def get_candidate_identity_rows(conn: sqlite3.Connection, sig: sqlite3.Row, use_
     city = clean_text(sig["city"])
     state = clean_text(sig["state"])
     z5 = clean_text(sig["zip5"])
+    mode = (candidate_mode or "fast").lower()
+    if mode not in {"fast", "balanced", "broad"}:
+        mode = "fast"
 
     queries: List[Tuple[str, Sequence[Any]]] = []
     base_cols = f"SELECT * FROM {ORG_IDENTITY_TABLE} WHERE "
+
+    # Cheap, high-signal lookups. These are backed by org_identity indexes and
+    # are normally safe to run for every signature.
     if reported_ein:
-        queries.append((base_cols + "ein=? ORDER BY source_rank, tax_year DESC LIMIT 100", [reported_ein]))
+        queries.append((base_cols + "ein=? ORDER BY source_rank, tax_year DESC LIMIT 75", [reported_ein]))
     if name_norm and street_norm and z5:
-        queries.append((base_cols + "name_norm=? AND street_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm, street_norm, z5]))
+        queries.append((base_cols + "name_norm=? AND street_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 50", [name_norm, street_norm, z5]))
     if name_norm and street_norm and city and state:
-        queries.append((base_cols + "name_norm=? AND street_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm, street_norm, city, state]))
+        queries.append((base_cols + "name_norm=? AND street_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 50", [name_norm, street_norm, city, state]))
     if name_norm and z5:
-        queries.append((base_cols + "name_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm, z5]))
+        queries.append((base_cols + "name_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 50", [name_norm, z5]))
     if name_norm and city and state:
-        queries.append((base_cols + "name_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm, city, state]))
+        queries.append((base_cols + "name_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 50", [name_norm, city, state]))
     if street_norm and z5:
-        queries.append((base_cols + "street_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 200", [street_norm, z5]))
+        queries.append((base_cols + "street_norm=? AND zip5=? ORDER BY source_rank, tax_year DESC LIMIT 100", [street_norm, z5]))
     if street_norm and city and state:
-        queries.append((base_cols + "street_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 200", [street_norm, city, state]))
+        queries.append((base_cols + "street_norm=? AND city=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 100", [street_norm, city, state]))
     if name_norm and state:
-        queries.append((base_cols + "name_norm=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm, state]))
+        queries.append((base_cols + "name_norm=? AND state=? ORDER BY source_rank, tax_year DESC LIMIT 75", [name_norm, state]))
     if name_norm:
-        queries.append((base_cols + "name_norm=? ORDER BY source_rank, tax_year DESC LIMIT 100", [name_norm]))
+        queries.append((base_cols + "name_norm=? ORDER BY source_rank, tax_year DESC LIMIT 75", [name_norm]))
 
     for sql, params in queries:
-        for r in identity_rows_by_sql(conn, sql, params):
-            rows[int(r["identity_id"])] = r
+        _add_rows(rows, identity_rows_by_sql(conn, sql, params))
 
-    # Token overlap fallback: useful for abbreviations or partial names, constrained by geography when possible.
-    toks = name_tokens(name_norm)
-    if toks:
-        ph = ",".join("?" for _ in toks[:8])
-        params: List[Any] = list(toks[:8])
-        geo_clause = ""
+    if mode == "fast":
+        return list(rows.values())
+
+    # Skip expensive fallback if cheap lookups already found a useful candidate
+    # set. This prevents common names/addresses from triggering unnecessary
+    # token/FTS searches.
+    if _unique_ein_count(rows) >= int(enough_candidates):
+        return list(rows.values())
+
+    # Token overlap fallback: useful for abbreviations/partial names, but only
+    # with distinctive tokens and only with geography when possible.
+    toks = distinctive_name_tokens(name_norm, max_tokens=4 if mode == "balanced" else 6)
+    if toks and (z5 or state):
+        ph = ",".join("?" for _ in toks)
+        params: List[Any] = list(toks)
         if z5:
-            geo_clause = " AND oi.zip5=?"
+            geo_clause = " AND tok.zip5=?"
             params.append(z5)
-        elif state:
-            geo_clause = " AND oi.state=?"
+        else:
+            geo_clause = " AND tok.state=?"
             params.append(state)
         sql = f"""
         SELECT oi.*, COUNT(*) AS token_hits
@@ -1161,28 +1242,40 @@ def get_candidate_identity_rows(conn: sqlite3.Connection, sig: sqlite3.Row, use_
         LIMIT {int(token_limit)}
         """
         try:
-            for r in conn.execute(sql, params):
-                rows[int(r["identity_id"])] = r
+            _add_rows(rows, conn.execute(sql, params))
         except sqlite3.Error:
             pass
 
-    # FTS fallback, if available. It is intentionally constrained after retrieval by score later.
-    if use_fts and name_norm and table_exists(conn, "org_identity_fts"):
-        toks = name_tokens(name_norm)[:6]
+    if mode != "broad" or not use_fts:
+        return list(rows.values())
+
+    if _unique_ein_count(rows) >= int(enough_candidates):
+        return list(rows.values())
+
+    # FTS fallback, intentionally last. It can be useful, but it is much more
+    # expensive than exact/name/address lookup on very large identity tables.
+    if name_norm and table_exists(conn, "org_identity_fts"):
+        toks = distinctive_name_tokens(name_norm, max_tokens=5)
         if toks:
-            # AND terms in FTS5 by whitespace. Use quoted terms for safety.
             match = " ".join('"' + t.replace('"', '') + '"' for t in toks)
+            params: List[Any] = [match]
+            geo_clause = ""
+            if z5:
+                geo_clause = "AND oi.zip5=?"
+                params.append(z5)
+            elif state:
+                geo_clause = "AND oi.state=?"
+                params.append(state)
             try:
                 sql = f"""
                 SELECT oi.*
                 FROM org_identity_fts f
                 JOIN {ORG_IDENTITY_TABLE} oi ON oi.identity_id = f.rowid
-                WHERE org_identity_fts MATCH ?
+                WHERE org_identity_fts MATCH ? {geo_clause}
                 ORDER BY rank
-                LIMIT 100
+                LIMIT 75
                 """
-                for r in conn.execute(sql, (match,)):
-                    rows[int(r["identity_id"])] = r
+                _add_rows(rows, conn.execute(sql, params))
             except sqlite3.Error:
                 pass
 
@@ -1370,8 +1463,18 @@ def cmd_generate_candidates(args: argparse.Namespace) -> None:
     processed = 0
     with_candidates = 0
     started = time.time()
+    mode = getattr(args, "candidate_mode", "fast")
+    use_fts = bool(mode == "broad" and not args.no_fts)
+    print(f"Candidate generation mode: {mode} (token fallback {'on' if mode in ('balanced','broad') else 'off'}, FTS {'on' if use_fts else 'off'})", flush=True)
     for sig in iter_signatures_for_candidates(conn, args):
-        identity_rows = get_candidate_identity_rows(conn, sig, use_fts=not args.no_fts, token_limit=args.token_limit)
+        identity_rows = get_candidate_identity_rows(
+            conn,
+            sig,
+            candidate_mode=mode,
+            use_fts=use_fts,
+            token_limit=args.token_limit,
+            enough_candidates=args.enough_candidates,
+        )
         candidates = best_candidates_by_ein(sig, identity_rows, args.max_candidates, args.min_candidate_score)
         insert_candidate_rows(conn, sig["signature_hash"], candidates, delete_existing=delete_existing)
         processed += 1
@@ -1865,7 +1968,7 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.1 fast)")
+    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.2 fast candidates)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
@@ -1909,8 +2012,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-candidates", type=int, default=20)
     p.add_argument("--min-candidate-score", type=float, default=45.0)
-    p.add_argument("--token-limit", type=int, default=200)
-    p.add_argument("--no-fts", action="store_true")
+    p.add_argument("--candidate-mode", choices=["fast", "balanced", "broad"], default="fast",
+                   help="fast=exact/EIN/address/name only; balanced=adds geo-constrained token fallback; broad=also allows FTS fallback")
+    p.add_argument("--enough-candidates", type=int, default=8,
+                   help="In balanced/broad mode, skip token/FTS fallback once this many distinct EINs are found")
+    p.add_argument("--token-limit", type=int, default=50)
+    p.add_argument("--no-fts", action="store_true", help="Disable FTS even in broad candidate mode")
     p.add_argument("--commit-every", type=int, default=5000)
     p.set_defaults(func=cmd_generate_candidates)
 
