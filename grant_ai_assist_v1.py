@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_5_ollama_diagnostics.py
+grant_ai_assist_v1_6_prompt_tuned.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
@@ -16,6 +16,7 @@ Fast v1.5 changes
 - Adds a stats command for raw grants, deterministic resolver results, AI signatures/candidates/decisions, and final applied results.
 - Optimizes candidate generation by staging candidate counts and bulk-updating signature status instead of updating one signature row at a time.
 - Adds Ollama diagnostics, a test-ollama command, fail-fast behavior for repeated Ollama call failures, retries, and format-mode controls.
+- v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -42,25 +43,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_6_prompt_tuned.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_6_prompt_tuned.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_6_prompt_tuned.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_6_prompt_tuned.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_6_prompt_tuned.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_6_prompt_tuned.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_5_ollama_diagnostics.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_6_prompt_tuned.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -1724,9 +1725,13 @@ def build_ai_input(sig: sqlite3.Row, candidates: Sequence[sqlite3.Row]) -> Dict[
         "rules": [
             "Choose only from the provided candidates.",
             "Do not invent EINs or candidate IDs.",
+            "A blank or missing reported EIN is normal in grant schedules, especially 990-PF filings. Do not mark a case ambiguous merely because reported_ein is blank.",
             "A known reported EIN should be kept unless name/address evidence strongly contradicts it.",
+            "Treat legal/entity words and punctuation as weak evidence: THE, INC, INCORPORATED, CORP, LLC, FOUNDATION, FUND, COMPANY, CO, LTD, ASSOCIATION. Their presence/absence should not block a match when the core name and location agree.",
+            "If one candidate has exact_name=true, exact_address=true, zip_match=true, and candidate_score >= 95, choose SELECT_CANDIDATE with high confidence unless another candidate has similarly strong evidence or a reported EIN conflict exists.",
+            "If one candidate has exact_name=true and either zip_match=true or city_state_match=true, it is usually enough to choose that candidate when alternatives are clearly weaker.",
             "Prefer exact address plus ZIP and strong name evidence over broad name-only similarity.",
-            "If multiple candidates are plausible and evidence does not clearly select one, return AMBIGUOUS or HUMAN_REVIEW.",
+            "Return AMBIGUOUS or HUMAN_REVIEW only when multiple candidates are genuinely plausible, evidence conflicts, or the best candidate is weak.",
             "If no candidate appears to be the grant recipient, return NO_MATCH.",
         ],
         "grant_recipient_signature": {
@@ -1771,9 +1776,14 @@ def call_ollama(
     system_msg = """
 You are a careful nonprofit identity matching adjudicator.
 You receive one grant-recipient record and a candidate list generated by a database.
+Your job is to choose the correct candidate when the evidence is strong, not to require absolute certainty.
 Return only JSON that follows the provided schema.
-Never invent an EIN or candidate ID. If the right answer is unclear, return AMBIGUOUS or HUMAN_REVIEW.
-Precision is more important than recall: a wrong EIN is worse than no match.
+Never invent an EIN or candidate ID.
+A blank reported EIN is common in grant schedules and is not by itself a reason for ambiguity.
+Legal suffix/noise differences such as INC, FOUNDATION, FUND, THE, LLC, CORP, CO, LTD, ASSOCIATION, punctuation, and spacing are weak evidence and should not block a match when core name plus address/location agree.
+If one candidate has exact name/address/ZIP evidence and no similarly strong alternative, return SELECT_CANDIDATE with high confidence and needs_human_review=false.
+Return AMBIGUOUS or HUMAN_REVIEW only when evidence is genuinely conflicting, weak, or there are multiple similarly plausible candidates.
+Precision is more important than recall: a wrong EIN is worse than no match, but do not overuse HUMAN_REVIEW for obvious exact matches.
 """.strip()
     user_msg = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
     payload: Dict[str, Any] = {
@@ -2075,6 +2085,8 @@ def cmd_test_ollama(args: argparse.Namespace) -> None:
         "rules": [
             "Choose only from provided candidates.",
             "Return JSON only.",
+            "This is an exact core-name, exact address, exact ZIP test. Missing reported_ein is expected and must not make the answer ambiguous.",
+            "The correct behavior is SELECT_CANDIDATE with candidate_id C1, high confidence, and needs_human_review=false.",
         ],
         "grant_recipient_signature": {
             "signature_hash": "SIG_TEST",
