@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_6_prompt_tuned.py
+grant_ai_assist_v1_7_no_think.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
@@ -43,25 +43,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_6_prompt_tuned.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_7_no_think.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_6_prompt_tuned.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_7_no_think.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_6_prompt_tuned.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_7_no_think.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_6_prompt_tuned.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_7_no_think.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_6_prompt_tuned.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_7_no_think.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_6_prompt_tuned.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_7_no_think.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_6_prompt_tuned.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_7_no_think.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -216,6 +216,30 @@ def zip5(value: Optional[str]) -> str:
 
 def clean_text(value: Optional[Any]) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def recipient_name_looks_placeholder(name: Any) -> bool:
+    """True when the grant recipient name is likely not an organization identity.
+
+    These rows are common on PF schedules, e.g. "Eligible Patients (See Schedule #2)"
+    or generic grants to individuals/scholarship recipients. They should not be
+    resolved to the grantor just because the grantor address/name appears nearby.
+    """
+    s = normalize_name(str(name or ""))
+    if not s:
+        return True
+    patterns = [
+        r"\bSEE\s+(SCHEDULE|STATEMENT|ATTACHMENT)\b",
+        r"\bELIGIBLE\s+PATIENTS?\b",
+        r"\bVARIOUS\s+(RECIPIENTS?|INDIVIDUALS?|ORGANIZATIONS?)\b",
+        r"\bMULTIPLE\s+(RECIPIENTS?|INDIVIDUALS?|ORGANIZATIONS?)\b",
+        r"\bSCHOLARSHIP\s+(RECIPIENTS?|STUDENTS?)\b",
+        r"^INDIVIDUALS?$",
+        r"^PATIENTS?$",
+        r"^STUDENTS?$",
+        r"^N A$",
+    ]
+    return any(re.search(p, s) for p in patterns)
 
 
 def norm_upper(value: Optional[str]) -> str:
@@ -1772,6 +1796,7 @@ def call_ollama(
     num_predict: int,
     format_mode: str = "schema",
     debug_raw_path: Optional[str] = None,
+    think: bool = False,
 ) -> Dict[str, Any]:
     system_msg = """
 You are a careful nonprofit identity matching adjudicator.
@@ -1783,6 +1808,8 @@ A blank reported EIN is common in grant schedules and is not by itself a reason 
 Legal suffix/noise differences such as INC, FOUNDATION, FUND, THE, LLC, CORP, CO, LTD, ASSOCIATION, punctuation, and spacing are weak evidence and should not block a match when core name plus address/location agree.
 If one candidate has exact name/address/ZIP evidence and no similarly strong alternative, return SELECT_CANDIDATE with high confidence and needs_human_review=false.
 Return AMBIGUOUS or HUMAN_REVIEW only when evidence is genuinely conflicting, weak, or there are multiple similarly plausible candidates.
+The fields sample_grantor_name and sample_grantor_ein identify the funder/filer/grantor, NOT the recipient. Do not use a match to sample_grantor_name as evidence that a candidate is the recipient.
+If the recipient name is a placeholder or non-organization label such as Eligible Patients, Various Recipients, Individuals, Scholarship Recipients, or See Schedule/Statement, do not resolve it to the grantor; return NO_MATCH or HUMAN_REVIEW unless there is separate recipient evidence.
 Precision is more important than recall: a wrong EIN is worse than no match, but do not overuse HUMAN_REVIEW for obvious exact matches.
 """.strip()
     user_msg = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
@@ -1794,6 +1821,10 @@ Precision is more important than recall: a wrong EIN is worse than no match, but
         ],
         "stream": False,
         "keep_alive": "30m",
+        # Disable thinking by default. With thinking-capable Ollama models,
+        # otherwise the model may spend the entire num_predict budget in
+        # message.thinking and return an empty message.content.
+        "think": bool(think),
         "options": {
             "temperature": 0,
             "top_p": 0.9,
@@ -1831,7 +1862,7 @@ Precision is more important than recall: a wrong EIN is worse than no match, but
         try:
             with open(debug_raw_path, "a", encoding="utf-8") as fh:
                 fh.write("\n\n--- OLLAMA RAW RESPONSE ---\n")
-                fh.write(f"timestamp={now_stamp()} status={status} url={url} model={model} format_mode={fmt}\n")
+                fh.write(f"timestamp={now_stamp()} status={status} url={url} model={model} format_mode={fmt} think={bool(think)}\n")
                 fh.write(raw)
                 fh.write("\n--- END RAW RESPONSE ---\n")
         except Exception:
@@ -1905,6 +1936,17 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
     else:
         candidate_id = ""
 
+    # Guardrail: do not let the model resolve placeholder/non-org recipient rows
+    # to the grantor itself merely because the grantor name/address appears in the
+    # candidate set. This is common for PF rows like "Eligible Patients".
+    if selected is not None:
+        grantor_ein = clean_text(sig["sample_grantor_ein"]) if "sample_grantor_ein" in sig.keys() else ""
+        selected_ein = clean_text(selected["ein"])
+        recip_name = clean_text(sig["recipient_name"]) if "recipient_name" in sig.keys() else ""
+        reported_ein = clean_text(sig["reported_ein"]) if "reported_ein" in sig.keys() else ""
+        if grantor_ein and selected_ein == grantor_ein and not reported_ein and recipient_name_looks_placeholder(recip_name):
+            errors.append("selected_grantor_for_placeholder_recipient")
+
     validation_status = "ok" if not errors else "invalid"
     needs_review = bool(output.get("needs_human_review", True))
     auto_accept = 0
@@ -1947,7 +1989,7 @@ def decision_row_tuple(sig_hash: str, input_obj: Dict[str, Any], candidates: Seq
         validation["validation_status"],
         validation["validation_error"],
         args.model,
-        json.dumps({"num_ctx": args.num_ctx, "num_predict": args.num_predict, "temperature": 0}, sort_keys=True),
+        json.dumps({"num_ctx": args.num_ctx, "num_predict": args.num_predict, "temperature": 0, "think": bool(args.think)}, sort_keys=True),
         stable_hash([input_json], "PROMPT_"),
         stable_hash([candidate_set_json], "CANDS_"),
         input_json,
@@ -2012,6 +2054,7 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
                         num_predict=args.num_predict,
                         format_mode=args.format_mode,
                         debug_raw_path=args.debug_raw_out,
+                        think=args.think,
                     )
                     last_error = None
                     break
@@ -2137,7 +2180,7 @@ def cmd_test_ollama(args: argparse.Namespace) -> None:
         ],
     }
     print(f"Testing Ollama endpoint: {args.ollama_url}", flush=True)
-    print(f"Model: {args.model}; format mode: {args.format_mode}; timeout: {args.timeout}s", flush=True)
+    print(f"Model: {args.model}; format mode: {args.format_mode}; think={bool(args.think)}; timeout: {args.timeout}s", flush=True)
     started = time.time()
     output = call_ollama(
         input_obj,
@@ -2148,6 +2191,7 @@ def cmd_test_ollama(args: argparse.Namespace) -> None:
         num_predict=args.num_predict,
         format_mode=args.format_mode,
         debug_raw_path=args.debug_raw_out,
+        think=args.think,
     )
     elapsed = time.time() - started
     print(f"Ollama call succeeded in {elapsed:,.2f} seconds.", flush=True)
@@ -2848,8 +2892,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     p.add_argument("--timeout", type=int, default=180)
     p.add_argument("--num-ctx", type=int, default=4096)
-    p.add_argument("--num-predict", type=int, default=300)
+    p.add_argument("--num-predict", type=int, default=700)
     p.add_argument("--format-mode", choices=["schema", "json", "none"], default="schema")
+    p.add_argument("--think", action="store_true", help="Enable Ollama thinking mode. Default is OFF for speed and to avoid empty content responses.")
     p.add_argument("--debug-raw-out", default=None, help="Optional text file to append raw Ollama responses for debugging")
     p.set_defaults(func=cmd_test_ollama)
 
@@ -2874,6 +2919,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-every", type=int, default=10)
     p.add_argument("--format-mode", choices=["schema", "json", "none"], default="schema",
                    help="Ollama format parameter mode. Try 'json' if schema mode causes endpoint/model trouble.")
+    p.add_argument("--think", action="store_true", help="Enable Ollama thinking mode. Default is OFF for speed and to avoid empty content responses.")
     p.add_argument("--ollama-retries", type=int, default=1, help="Retries per signature after an Ollama call failure")
     p.add_argument("--retry-sleep", type=float, default=2.0, help="Seconds to sleep between Ollama retries")
     p.add_argument("--max-call-failures", type=int, default=3,
