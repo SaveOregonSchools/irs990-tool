@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_9_reported_ein_shortcut.py
+grant_ai_assist_v1_10_shortcut_audit.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
@@ -17,7 +17,7 @@ Fast v1.5 changes
 - Optimizes candidate generation by staging candidate counts and bulk-updating signature status instead of updating one signature row at a time.
 - Adds Ollama diagnostics, a test-ollama command, fail-fast behavior for repeated Ollama call failures, retries, and format-mode controls.
 - v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
-- v1.9 adds reported-EIN identity shortcuts before Ollama and incremental name backfill/repair commands.
+- v1.10 adds expanded reported-EIN shortcut audit CSV fields on top of v1.9 shortcuts/backfill.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -44,25 +44,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_10_shortcut_audit.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_10_shortcut_audit.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_10_shortcut_audit.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_10_shortcut_audit.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_10_shortcut_audit.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_10_shortcut_audit.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_9_reported_ein_shortcut.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_10_shortcut_audit.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -2078,8 +2078,13 @@ def reported_ein_shortcut_decision_row(
             "ein": reported_ein,
             "display_name": selected_name,
             "source": source,
+            "source_detail": clean_text(identity["source_detail"] if "source_detail" in identity.keys() else ""),
             "identity_id": int(identity["identity_id"]),
             "name_score": round(name_score, 4),
+            "street": clean_text(identity["street"] if "street" in identity.keys() else ""),
+            "city": clean_text(identity["city"] if "city" in identity.keys() else ""),
+            "state": clean_text(identity["state"] if "state" in identity.keys() else ""),
+            "zip5": clean_text(identity["zip5"] if "zip5" in identity.keys() else ""),
         },
     }
     input_json = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
@@ -2634,6 +2639,114 @@ def iter_signatures_for_reported_ein_shortcuts(conn: sqlite3.Connection, args: a
     yield from conn.execute(sql, params)
 
 
+
+
+def _sqlite_row_get(row: Any, key: str, default: Any = "") -> Any:
+    """Safely fetch a field from sqlite.Row/dict-like objects."""
+    try:
+        if row is None:
+            return default
+        if hasattr(row, "keys") and key not in row.keys():
+            return default
+        v = row[key]
+        return default if v is None else v
+    except Exception:
+        return default
+
+
+def _candidate_by_candidate_id(candidates: Sequence[sqlite3.Row], candidate_id: str) -> Optional[sqlite3.Row]:
+    cid = clean_text(candidate_id)
+    if not cid:
+        return None
+    for c in candidates:
+        if clean_text(_sqlite_row_get(c, "candidate_id")) == cid:
+            return c
+    return None
+
+
+REPORTED_EIN_SHORTCUT_AUDIT_HEADERS = [
+    # Decision summary
+    "signature_hash", "shortcut_reason", "decision", "selected_candidate_id", "selected_ein", "selected_name",
+    "confidence", "confidence_label", "auto_accept", "validation_status", "validation_error", "needs_human_review",
+    # Raw/signature recipient evidence
+    "reported_ein", "recipient_name", "recipient_name_norm", "recipient_street", "recipient_street_norm",
+    "recipient_city", "recipient_state", "recipient_zip5", "recipient_country",
+    "grant_count", "total_amount", "sample_purpose", "sample_grantor_ein", "sample_grantor_name",
+    # First-pass deterministic evidence
+    "first_pass_statuses_json", "first_pass_methods_json", "first_pass_warning_flags",
+    "first_pass_min_confidence", "first_pass_avg_confidence", "first_pass_max_confidence", "queued_reason",
+    "signature_candidate_count", "ai_queue_status", "loaded_candidate_count",
+    # org_identity shortcut evidence
+    "identity_id", "identity_source", "identity_source_detail", "identity_display_name", "identity_name_score",
+    "identity_street", "identity_city", "identity_state", "identity_zip5",
+    # Matching generated-candidate evidence, if there was a candidate row for the reported EIN
+    "selected_candidate_rank", "selected_candidate_name", "selected_candidate_source", "selected_candidate_source_rank",
+    "selected_candidate_score", "selected_candidate_reason", "selected_name_score", "selected_address_score",
+    "selected_exact_name", "selected_exact_address", "selected_reported_ein_match", "selected_zip_match",
+    "selected_city_state_match", "selected_state_match", "selected_candidate_street", "selected_candidate_city",
+    "selected_candidate_state", "selected_candidate_zip5",
+    # Explanation / raw JSON
+    "reason_codes_json", "explanation", "input_json", "output_json",
+]
+
+
+def reported_ein_shortcut_audit_row(
+    sig: sqlite3.Row,
+    decision_row: Tuple[Any, ...],
+    candidates: Sequence[sqlite3.Row],
+    shortcut_reason: str,
+) -> List[Any]:
+    """Build a wide CSV audit row for a created reported-EIN shortcut decision.
+
+    This row is intentionally redundant so the shortcut output can be reviewed
+    in Excel without opening embedded JSON. Full, non-dry-run execution still
+    stores the compact decision row in grant_recipient_ai_decision.
+    """
+    input_json = decision_row[17] if len(decision_row) > 17 else ""
+    output_json = decision_row[18] if len(decision_row) > 18 else ""
+    try:
+        input_obj = json.loads(input_json or "{}")
+    except Exception:
+        input_obj = {}
+    selected_identity = input_obj.get("selected_identity") if isinstance(input_obj, dict) else {}
+    if not isinstance(selected_identity, dict):
+        selected_identity = {}
+
+    selected_cand = _candidate_by_candidate_id(candidates, clean_text(decision_row[2]))
+
+    def sigv(key: str, default: Any = "") -> Any:
+        return _sqlite_row_get(sig, key, default)
+
+    def candv(key: str, default: Any = "") -> Any:
+        return _sqlite_row_get(selected_cand, key, default)
+
+    return [
+        # Decision summary
+        decision_row[0], shortcut_reason, decision_row[1], decision_row[2], decision_row[3], decision_row[4],
+        decision_row[5], decision_row[6], decision_row[10], decision_row[11], decision_row[12], decision_row[9],
+        # Raw/signature recipient evidence
+        sigv("reported_ein"), sigv("recipient_name"), sigv("recipient_name_norm"), sigv("street"), sigv("street_norm"),
+        sigv("city"), sigv("state"), sigv("zip5"), sigv("country"), sigv("grant_count"), sigv("total_amount"),
+        sigv("sample_purpose"), sigv("sample_grantor_ein"), sigv("sample_grantor_name"),
+        # First-pass deterministic evidence
+        sigv("first_pass_statuses_json"), sigv("first_pass_methods_json"), sigv("first_pass_warning_flags"),
+        sigv("first_pass_min_confidence"), sigv("first_pass_avg_confidence"), sigv("first_pass_max_confidence"),
+        sigv("queued_reason"), sigv("candidate_count"), sigv("ai_queue_status"), len(candidates),
+        # org_identity shortcut evidence
+        selected_identity.get("identity_id", ""), selected_identity.get("source", ""),
+        selected_identity.get("source_detail", ""), selected_identity.get("display_name", ""),
+        selected_identity.get("name_score", ""), selected_identity.get("street", ""),
+        selected_identity.get("city", ""), selected_identity.get("state", ""), selected_identity.get("zip5", ""),
+        # Matching generated-candidate evidence
+        candv("candidate_rank"), candv("candidate_name"), candv("source"), candv("source_rank"),
+        candv("candidate_score"), candv("candidate_reason"), candv("name_score"), candv("address_score"),
+        candv("exact_name"), candv("exact_address"), candv("reported_ein_match"), candv("zip_match"),
+        candv("city_state_match"), candv("state_match"), candv("street"), candv("city"), candv("state"), candv("zip5"),
+        # Explanation / raw JSON
+        decision_row[7], decision_row[8], input_json, output_json,
+    ]
+
+
 def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
     """Create auto-accepted KEEP_REPORTED_EIN decisions from org_identity, no Ollama calls."""
     conn = connect(args.db, readonly=False, exclusive=True)
@@ -2650,10 +2763,7 @@ def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_fh = out_path.open("w", newline="", encoding="utf-8-sig")
         writer = csv.writer(out_fh)
-        writer.writerow([
-            "signature_hash", "decision", "selected_candidate_id", "selected_ein", "selected_name", "confidence",
-            "auto_accept", "validation_status", "validation_error", "explanation", "output_json",
-        ])
+        writer.writerow(REPORTED_EIN_SHORTCUT_AUDIT_HEADERS)
         print(f"Dry run enabled; writing reported-EIN shortcut CSV to {out_path}", flush=True)
 
     processed = 0
@@ -2676,7 +2786,7 @@ def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
             else:
                 created += 1
                 if writer is not None:
-                    writer.writerow([row[0], row[1], row[2], row[3], row[4], row[5], row[10], row[11], row[12], row[8], row[18]])
+                    writer.writerow(reported_ein_shortcut_audit_row(sig, row, cands, reason))
                     if created % args.flush_every == 0:
                         out_fh.flush()
                 else:
@@ -3337,7 +3447,7 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.9 reported-EIN shortcut + validation fixes)")
+    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.10 shortcut audit fields + v1.9 fixes)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
