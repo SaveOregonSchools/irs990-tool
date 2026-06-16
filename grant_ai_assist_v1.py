@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_7_no_think.py
+grant_ai_assist_v1_9_reported_ein_shortcut.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
@@ -17,6 +17,7 @@ Fast v1.5 changes
 - Optimizes candidate generation by staging candidate counts and bulk-updating signature status instead of updating one signature row at a time.
 - Adds Ollama diagnostics, a test-ollama command, fail-fast behavior for repeated Ollama call failures, retries, and format-mode controls.
 - v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
+- v1.9 adds reported-EIN identity shortcuts before Ollama and incremental name backfill/repair commands.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -43,25 +44,25 @@ Expected project layout
 Common commands
 ---------------
 Verify BMF files:
-  python grant_ai_assist_v1_7_no_think.py verify-bmf --project-dir C:\projects\irs990-tool
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py verify-bmf --project-dir C:\projects\irs990-tool
 
 Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_7_no_think.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
 
 Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_7_no_think.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
 
 Generate top candidates for those signatures:
-  python grant_ai_assist_v1_7_no_think.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
 
 Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_7_no_think.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
 
 Store Ollama decisions:
-  python grant_ai_assist_v1_7_no_think.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
 
 Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_7_no_think.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+  python grant_ai_assist_v1_9_reported_ein_shortcut.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
 """
 
 from __future__ import annotations
@@ -1906,6 +1907,250 @@ Precision is more important than recall: a wrong EIN is worse than no match, but
         raise OllamaCallError(f"Assistant content was not valid JSON; first chars={_snippet(content)}") from first_error
 
 
+
+# ---------------------------------------------------------------------------
+# Reported-EIN shortcut / identity-name backfill helpers
+# ---------------------------------------------------------------------------
+
+REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS = (
+    "reported_ein_name_disagrees",
+    "reported_ein_and_name_match_different_known_eins",
+    "reported_ein_points_to=",
+)
+REPORTED_EIN_CONTRADICTION_STATUSES = {"possible_bad_ein_corrected", "conflicting_ein_match"}
+
+
+def _json_counter_has_any(text: Any, keys: Sequence[str]) -> bool:
+    try:
+        data = json.loads(text or "{}")
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    for k in keys:
+        try:
+            if int(data.get(k) or 0) > 0:
+                return True
+        except Exception:
+            if data.get(k):
+                return True
+    return False
+
+
+def signature_has_reported_ein_contradiction(sig: sqlite3.Row) -> bool:
+    """True when first-pass evidence suggests the reported EIN may be wrong.
+
+    This intentionally does NOT treat reported_ein_not_found_in_returns as a
+    contradiction. That is exactly the case EO BMF/org_identity can repair.
+    """
+    flags = clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else "").lower()
+    if any(pat in flags for pat in REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS):
+        return True
+    statuses_json = sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else "{}"
+    return _json_counter_has_any(statuses_json, sorted(REPORTED_EIN_CONTRADICTION_STATUSES))
+
+
+def best_identity_for_ein(conn: sqlite3.Connection, ein: str) -> Optional[sqlite3.Row]:
+    ein = digits9(ein)
+    if not ein or not table_exists(conn, ORG_IDENTITY_TABLE):
+        return None
+    return conn.execute(
+        f"""
+        SELECT *
+        FROM {ORG_IDENTITY_TABLE}
+        WHERE ein=?
+          AND display_name IS NOT NULL AND TRIM(display_name) <> ''
+        ORDER BY
+          CASE
+            WHEN source='returns_org_name' THEN 0
+            WHEN source='bmf_name' THEN 1
+            WHEN source='returns_dba_name' THEN 2
+            WHEN source='bmf_sort_name' THEN 3
+            WHEN source='bmf_ico' THEN 9
+            ELSE 5
+          END,
+          source_rank ASC,
+          COALESCE(tax_year, 0) DESC,
+          identity_id ASC
+        LIMIT 1
+        """,
+        (ein,),
+    ).fetchone()
+
+
+def matching_candidate_for_ein(candidates: Sequence[sqlite3.Row], ein: str) -> Optional[sqlite3.Row]:
+    ein = digits9(ein)
+    if not ein:
+        return None
+    for c in candidates:
+        if digits9(c["ein"]) == ein:
+            return c
+    return None
+
+
+def reported_ein_shortcut_decision_row(
+    conn: sqlite3.Connection,
+    sig: sqlite3.Row,
+    candidates: Sequence[sqlite3.Row],
+    *,
+    min_name_score: float = 0.35,
+    allow_contradictions: bool = False,
+    model_label: str = "rule:reported_ein_identity_lookup",
+) -> Tuple[Optional[Tuple[Any, ...]], str]:
+    """Return a DECISION_TABLE row when reported EIN can be resolved without Ollama.
+
+    This is intentionally conservative. It accepts a known reported EIN from
+    org_identity when first-pass evidence did not flag it as contradictory and
+    either the recipient name is blank/placeholder or has at least weak agreement
+    with the identity name. The threshold is configurable for future tuning.
+    """
+    reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    if not reported_ein:
+        return None, "no_reported_ein"
+    identity = best_identity_for_ein(conn, reported_ein)
+    if identity is None:
+        return None, "reported_ein_not_in_org_identity"
+    if (not allow_contradictions) and signature_has_reported_ein_contradiction(sig):
+        return None, "reported_ein_contradiction_flagged"
+
+    recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+    recip_norm = normalize_name(recip_name)
+    identity_norm = clean_text(identity["name_norm"])
+    name_score = ratio(recip_norm, identity_norm) if recip_norm and identity_norm else 0.0
+    placeholder = recipient_name_looks_placeholder(recip_name)
+    candidate_match = matching_candidate_for_ein(candidates, reported_ein)
+
+    # A provided, known EIN is strong evidence. Still avoid auto-resolving when
+    # the recipient name is a real organization name that strongly disagrees.
+    # Blank/placeholder recipient names are accepted because the EIN itself is
+    # the only real identity signal in those rows.
+    if recip_norm and not placeholder and name_score < min_name_score:
+        return None, "recipient_name_disagrees_with_reported_ein_identity"
+
+    candidate_id = clean_text(candidate_match["candidate_id"]) if candidate_match is not None else "REPORTED_EIN"
+    selected_name = clean_text(identity["display_name"])
+    source = clean_text(identity["source"])
+    confidence = 0.985 if name_score >= 0.72 else (0.965 if placeholder or not recip_norm else 0.94)
+    reason_codes = ["reported_ein_present", "reported_ein_found_in_org_identity", source]
+    if placeholder:
+        reason_codes.append("recipient_name_blank_or_placeholder")
+    elif recip_norm:
+        reason_codes.append("recipient_name_weakly_agrees" if name_score < 0.72 else "recipient_name_agrees")
+    if candidate_match is not None:
+        reason_codes.append("reported_ein_candidate_present")
+
+    explanation = (
+        f"Reported recipient EIN {reported_ein} was found in org_identity as '{selected_name}' "
+        f"from {source}. No first-pass reported-EIN contradiction was flagged. "
+        f"Recipient name score versus identity name is {name_score:.3f}. Ollama was skipped."
+    )
+    output = {
+        "decision": "KEEP_REPORTED_EIN",
+        "candidate_id": candidate_id,
+        "confidence": round(confidence, 4),
+        "confidence_label": "high",
+        "reason_codes": reason_codes,
+        "explanation": explanation,
+        "needs_human_review": False,
+    }
+    input_obj = {
+        "task": "reported_ein_identity_shortcut",
+        "rules": [
+            "Reported recipient EIN was provided by the filing source.",
+            "org_identity has a usable name for the EIN.",
+            "No first-pass contradiction flag was present.",
+            "Ollama adjudication was skipped to avoid unnecessary model calls.",
+        ],
+        "grant_recipient_signature": {
+            "signature_hash": sig["signature_hash"],
+            "reported_ein": reported_ein,
+            "recipient_name": recip_name,
+            "street": clean_text(sig["street"] if "street" in sig.keys() else ""),
+            "city": clean_text(sig["city"] if "city" in sig.keys() else ""),
+            "state": clean_text(sig["state"] if "state" in sig.keys() else ""),
+            "zip5": clean_text(sig["zip5"] if "zip5" in sig.keys() else ""),
+            "grant_count": int(sig["grant_count"] or 0),
+            "total_amount": float(sig["total_amount"] or 0),
+            "first_pass_statuses_json": clean_text(sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else ""),
+            "first_pass_warning_flags": clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else ""),
+        },
+        "selected_identity": {
+            "ein": reported_ein,
+            "display_name": selected_name,
+            "source": source,
+            "identity_id": int(identity["identity_id"]),
+            "name_score": round(name_score, 4),
+        },
+    }
+    input_json = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
+    output_json = json.dumps(output, ensure_ascii=False, sort_keys=True)
+    candidate_set_json = json.dumps(
+        [{"id": c["candidate_id"], "ein": c["ein"], "score": c["candidate_score"]} for c in candidates],
+        sort_keys=True,
+    )
+    row = (
+        sig["signature_hash"],
+        "KEEP_REPORTED_EIN",
+        candidate_id,
+        reported_ein,
+        selected_name,
+        round(confidence, 4),
+        "high",
+        json.dumps(reason_codes, ensure_ascii=False, sort_keys=True),
+        explanation,
+        0,
+        1,
+        "ok",
+        "",
+        model_label,
+        json.dumps({"rule": "reported_ein_identity_lookup", "min_name_score": min_name_score}, sort_keys=True),
+        stable_hash([input_json], "PROMPT_"),
+        stable_hash([candidate_set_json], "CANDS_"),
+        input_json,
+        output_json,
+        now_stamp(),
+    )
+    return row, "shortcut_created"
+
+
+def create_best_identity_name_temp(conn: sqlite3.Connection) -> int:
+    """Build temp table tmp_best_identity_name(ein, display_name, source)."""
+    if not table_exists(conn, ORG_IDENTITY_TABLE):
+        raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
+    conn.execute("DROP TABLE IF EXISTS temp.tmp_best_identity_name")
+    conn.execute(
+        f"""
+        CREATE TEMP TABLE tmp_best_identity_name AS
+        SELECT ein, display_name, source, identity_id
+        FROM (
+          SELECT
+            ein, display_name, source, identity_id,
+            ROW_NUMBER() OVER (
+              PARTITION BY ein
+              ORDER BY
+                CASE
+                  WHEN source='returns_org_name' THEN 0
+                  WHEN source='bmf_name' THEN 1
+                  WHEN source='returns_dba_name' THEN 2
+                  WHEN source='bmf_sort_name' THEN 3
+                  WHEN source='bmf_ico' THEN 9
+                  ELSE 5
+                END,
+                source_rank ASC,
+                COALESCE(tax_year,0) DESC,
+                identity_id ASC
+            ) AS rn
+          FROM {ORG_IDENTITY_TABLE}
+          WHERE ein IS NOT NULL AND TRIM(ein) <> ''
+            AND display_name IS NOT NULL AND TRIM(display_name) <> ''
+        ) t
+        WHERE rn=1
+        """
+    )
+    conn.execute("CREATE INDEX idx_tmp_best_identity_name_ein ON tmp_best_identity_name(ein)")
+    row = conn.execute("SELECT COUNT(*) AS n FROM tmp_best_identity_name").fetchone()
+    return int(row["n"] if row else 0)
+
 def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row], sig: sqlite3.Row, auto_accept_threshold: float) -> Dict[str, Any]:
     candidate_by_id = {clean_text(c["candidate_id"]): c for c in candidates}
     decision = clean_text(output.get("decision"))
@@ -2076,6 +2321,33 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
             cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
             if not cands:
                 continue
+
+            if not getattr(args, "no_reported_ein_shortcut", False):
+                shortcut_row, shortcut_reason = reported_ein_shortcut_decision_row(
+                    conn,
+                    sig,
+                    cands,
+                    min_name_score=getattr(args, "reported_ein_shortcut_min_name_score", 0.35),
+                    allow_contradictions=getattr(args, "reported_ein_shortcut_allow_contradictions", False),
+                )
+                if shortcut_row is not None:
+                    if writer is not None:
+                        writer.writerow([
+                            shortcut_row[0], shortcut_row[1], shortcut_row[2], shortcut_row[3], shortcut_row[4],
+                            shortcut_row[5], shortcut_row[10], shortcut_row[11], shortcut_row[12], shortcut_row[8], shortcut_row[18]
+                        ])
+                        if processed and processed % args.flush_every == 0:
+                            out_fh.flush()
+                    else:
+                        insert_decision(conn, shortcut_row)
+                        if processed and processed % args.commit_every == 0:
+                            conn.commit()
+                    processed += 1
+                    if processed % args.progress_every == 0:
+                        elapsed = max(1.0, time.time() - started)
+                        print(f"Adjudicated {processed:,} signatures at {processed/elapsed:,.2f}/sec; call_failures={call_failures:,}", flush=True)
+                    continue
+
             input_obj = build_ai_input(sig, cands)
             last_error: Optional[BaseException] = None
             output: Dict[str, Any] = {}
@@ -2235,6 +2507,199 @@ def cmd_test_ollama(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Incremental reported-EIN repair/backfill commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_backfill_ein_names(args: argparse.Namespace) -> None:
+    """Fill blank selected/resolved names from org_identity without rebuilding prior stages."""
+    conn = connect(args.db, readonly=False, exclusive=True)
+    if not table_exists(conn, ORG_IDENTITY_TABLE):
+        raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
+    if not table_exists(conn, RESOLVED_TABLE):
+        raise RuntimeError(f"Missing {RESOLVED_TABLE}. Run resolve_grant_recipients first.")
+    n_id = create_best_identity_name_temp(conn)
+    print(f"Prepared best-name lookup for {n_id:,} EINs from org_identity.", flush=True)
+
+    updates: List[Tuple[str, int]] = []
+    resolved_count = int(conn.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM {RESOLVED_TABLE} rr
+        JOIN tmp_best_identity_name b ON b.ein = rr.resolved_ein
+        WHERE rr.resolved_ein IS NOT NULL AND TRIM(rr.resolved_ein) <> ''
+          AND (rr.resolved_org_name IS NULL OR TRIM(rr.resolved_org_name) = '')
+        """
+    ).fetchone()["n"])
+    updates.append((f"{RESOLVED_TABLE}.resolved_org_name", resolved_count))
+
+    decision_count = 0
+    if table_exists(conn, DECISION_TABLE):
+        decision_count = int(conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM {DECISION_TABLE} d
+            JOIN tmp_best_identity_name b ON b.ein = d.selected_ein
+            WHERE d.selected_ein IS NOT NULL AND TRIM(d.selected_ein) <> ''
+              AND (d.selected_name IS NULL OR TRIM(d.selected_name) = '')
+            """
+        ).fetchone()["n"])
+        updates.append((f"{DECISION_TABLE}.selected_name", decision_count))
+
+    applied_count = 0
+    if table_exists(conn, APPLIED_TABLE):
+        applied_count = int(conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM {APPLIED_TABLE} a
+            JOIN tmp_best_identity_name b ON b.ein = a.selected_ein
+            WHERE a.selected_ein IS NOT NULL AND TRIM(a.selected_ein) <> ''
+              AND (a.selected_name IS NULL OR TRIM(a.selected_name) = '')
+            """
+        ).fetchone()["n"])
+        updates.append((f"{APPLIED_TABLE}.selected_name", applied_count))
+
+    print("Rows eligible for name backfill:", flush=True)
+    for label, count in updates:
+        print(f"  {label}: {count:,}", flush=True)
+    if args.dry_run:
+        print("Dry run only; no rows updated.", flush=True)
+        return
+
+    if resolved_count:
+        conn.execute(
+            f"""
+            UPDATE {RESOLVED_TABLE}
+            SET resolved_org_name = (
+              SELECT b.display_name FROM tmp_best_identity_name b WHERE b.ein = {RESOLVED_TABLE}.resolved_ein
+            )
+            WHERE resolved_ein IS NOT NULL AND TRIM(resolved_ein) <> ''
+              AND (resolved_org_name IS NULL OR TRIM(resolved_org_name) = '')
+              AND EXISTS (SELECT 1 FROM tmp_best_identity_name b WHERE b.ein = {RESOLVED_TABLE}.resolved_ein)
+            """
+        )
+    if decision_count:
+        conn.execute(
+            f"""
+            UPDATE {DECISION_TABLE}
+            SET selected_name = (
+              SELECT b.display_name FROM tmp_best_identity_name b WHERE b.ein = {DECISION_TABLE}.selected_ein
+            )
+            WHERE selected_ein IS NOT NULL AND TRIM(selected_ein) <> ''
+              AND (selected_name IS NULL OR TRIM(selected_name) = '')
+              AND EXISTS (SELECT 1 FROM tmp_best_identity_name b WHERE b.ein = {DECISION_TABLE}.selected_ein)
+            """
+        )
+    if applied_count:
+        conn.execute(
+            f"""
+            UPDATE {APPLIED_TABLE}
+            SET selected_name = (
+              SELECT b.display_name FROM tmp_best_identity_name b WHERE b.ein = {APPLIED_TABLE}.selected_ein
+            )
+            WHERE selected_ein IS NOT NULL AND TRIM(selected_ein) <> ''
+              AND (selected_name IS NULL OR TRIM(selected_name) = '')
+              AND EXISTS (SELECT 1 FROM tmp_best_identity_name b WHERE b.ein = {APPLIED_TABLE}.selected_ein)
+            """
+        )
+    if table_exists(conn, APPLIED_TABLE):
+        refresh_final_view(conn)
+    conn.commit()
+    print("Name backfill complete.", flush=True)
+
+
+def iter_signatures_for_reported_ein_shortcuts(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
+    clauses = ["s.reported_ein IS NOT NULL", "TRIM(s.reported_ein) <> ''"]
+    params: List[Any] = []
+    if not args.regenerate and table_exists(conn, DECISION_TABLE):
+        clauses.append(f"NOT EXISTS (SELECT 1 FROM {DECISION_TABLE} d WHERE d.signature_hash = s.signature_hash)")
+    if args.state:
+        clauses.append("s.state=?")
+        params.append(args.state.upper())
+    if args.min_total_amount is not None:
+        clauses.append("s.total_amount >= ?")
+        params.append(args.min_total_amount)
+    if args.queue_status:
+        clauses.append("s.ai_queue_status=?")
+        params.append(args.queue_status)
+    where = "WHERE " + " AND ".join(clauses)
+    limit = f"LIMIT {int(args.limit)}" if args.limit else ""
+    sql = f"""
+    SELECT s.*
+    FROM {SIG_TABLE} s
+    {where}
+    ORDER BY s.total_amount DESC, s.grant_count DESC
+    {limit}
+    """
+    yield from conn.execute(sql, params)
+
+
+def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
+    """Create auto-accepted KEEP_REPORTED_EIN decisions from org_identity, no Ollama calls."""
+    conn = connect(args.db, readonly=False, exclusive=True)
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+    if not table_exists(conn, ORG_IDENTITY_TABLE):
+        raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
+    create_decision_schema(conn, full_refresh=False)
+
+    out_fh = None
+    writer = None
+    if args.dry_run:
+        out_path = Path(args.csv_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_fh = out_path.open("w", newline="", encoding="utf-8-sig")
+        writer = csv.writer(out_fh)
+        writer.writerow([
+            "signature_hash", "decision", "selected_candidate_id", "selected_ein", "selected_name", "confidence",
+            "auto_accept", "validation_status", "validation_error", "explanation", "output_json",
+        ])
+        print(f"Dry run enabled; writing reported-EIN shortcut CSV to {out_path}", flush=True)
+
+    processed = 0
+    created = 0
+    skips = Counter()
+    started = time.time()
+    try:
+        for sig in iter_signatures_for_reported_ein_shortcuts(conn, args):
+            cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates) if table_exists(conn, CAND_TABLE) else []
+            row, reason = reported_ein_shortcut_decision_row(
+                conn,
+                sig,
+                cands,
+                min_name_score=args.min_name_score,
+                allow_contradictions=args.allow_contradictions,
+            )
+            processed += 1
+            if row is None:
+                skips[reason] += 1
+            else:
+                created += 1
+                if writer is not None:
+                    writer.writerow([row[0], row[1], row[2], row[3], row[4], row[5], row[10], row[11], row[12], row[8], row[18]])
+                    if created % args.flush_every == 0:
+                        out_fh.flush()
+                else:
+                    insert_decision(conn, row)
+                    if created % args.commit_every == 0:
+                        conn.commit()
+            if processed % args.progress_every == 0:
+                elapsed = max(1.0, time.time() - started)
+                print(f"Reported-EIN shortcuts scanned {processed:,}; created {created:,}; {processed/elapsed:,.0f}/sec", flush=True)
+        if writer is None:
+            conn.commit()
+    finally:
+        if out_fh is not None:
+            out_fh.flush()
+            out_fh.close()
+    print(f"Reported-EIN shortcut complete: scanned {processed:,}; created {created:,}", flush=True)
+    if skips:
+        print("Skipped reasons:", flush=True)
+        for k, v in skips.most_common():
+            print(f"  {k}: {v:,}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # Apply decisions / final view
 # ---------------------------------------------------------------------------
 
@@ -2260,7 +2725,11 @@ def refresh_final_view(conn: sqlite3.Connection) -> None:
       aa.ai_decision AS ai_decision,
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_ein ELSE rr.resolved_ein END AS final_resolved_ein,
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
-      CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_assisted' ELSE 'deterministic' END AS final_match_source,
+      CASE
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'reported_ein_identity_lookup'
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_assisted'
+        ELSE 'deterministic'
+      END AS final_match_source,
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.ai_confidence ELSE rr.confidence END AS final_confidence
     FROM {RESOLVED_TABLE} rr
     LEFT JOIN {APPLIED_TABLE} aa ON aa.grant_id = rr.grant_id
@@ -2868,7 +3337,7 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.5 diagnostics + fast candidates)")
+    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.9 reported-EIN shortcut + validation fixes)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
@@ -2964,7 +3433,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stop after this many consecutive Ollama failures; use 0 to disable")
     p.add_argument("--fail-fast", action="store_true", help="Stop after the first Ollama call failure")
     p.add_argument("--debug-raw-out", default=None, help="Optional text file to append raw Ollama responses for debugging")
+    p.add_argument("--no-reported-ein-shortcut", action="store_true",
+                   help="Disable the pre-Ollama shortcut that keeps a known reported EIN from org_identity")
+    p.add_argument("--reported-ein-shortcut-min-name-score", type=float, default=0.35,
+                   help="Minimum weak name agreement required for reported-EIN shortcut when recipient name is a real org name; blank/placeholder names bypass this")
+    p.add_argument("--reported-ein-shortcut-allow-contradictions", action="store_true",
+                   help="Allow shortcut even when first-pass warning/status suggests the reported EIN may be wrong; normally leave off")
     p.set_defaults(func=cmd_adjudicate)
+
+    p = sub.add_parser("backfill-ein-names", help="Incrementally fill blank resolved/selected org names from org_identity without rebuilding pipeline tables")
+    add_common_db(p)
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_backfill_ein_names)
+
+    p = sub.add_parser("reported-ein-shortcuts", help="Create auto-accepted KEEP_REPORTED_EIN decisions from org_identity without calling Ollama")
+    add_common_db(p)
+    p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for eligible signatures")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--queue-status", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--min-name-score", type=float, default=0.35)
+    p.add_argument("--allow-contradictions", action="store_true", help="Allow shortcut even when first-pass warning/status suggests reported EIN may be wrong")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--csv-out", default="reported_ein_shortcuts.csv")
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--flush-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=50000)
+    p.set_defaults(func=cmd_reported_ein_shortcuts)
 
     p = sub.add_parser("apply-decisions", help="Apply auto-accepted AI decisions to separate table and final view")
     add_common_db(p)
