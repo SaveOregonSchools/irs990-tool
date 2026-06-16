@@ -18,6 +18,7 @@ Fast v1.5 changes
 - Adds Ollama diagnostics, a test-ollama command, fail-fast behavior for repeated Ollama call failures, retries, and format-mode controls.
 - v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
 - v1.10 adds expanded reported-EIN shortcut audit CSV fields on top of v1.9 shortcuts/backfill.
+- v1.11 adds export/import commands for offline or ChatGPT-assisted adjudication batches.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -2430,6 +2431,294 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Offline / external adjudication export-import
+# ---------------------------------------------------------------------------
+
+EXTERNAL_DECISION_FIELDS = [
+    "signature_hash",
+    "decision",
+    "candidate_id",
+    "confidence",
+    "confidence_label",
+    "reason_codes",
+    "explanation",
+    "needs_human_review",
+]
+
+
+def _bool_from_any(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off", ""}:
+        return False
+    return default
+
+
+def _reason_codes_from_any(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [clean_text(x) for x in value if clean_text(x)]
+    s = clean_text(value)
+    if not s:
+        return []
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, list):
+            return [clean_text(x) for x in parsed if clean_text(x)]
+    except Exception:
+        pass
+    # CSV-friendly fallback: semicolon/pipe/comma separated reason codes.
+    parts = re.split(r"[;|,]+", s)
+    return [clean_text(x) for x in parts if clean_text(x)]
+
+
+def external_output_from_record(record: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Normalize a JSON/CSV external decision record to (signature_hash, model_output)."""
+    # Accept either a wrapper like {"signature_hash": "...", "output": {...}}
+    # or a flat row with decision/candidate_id/confidence columns.
+    sig_hash = clean_text(record.get("signature_hash") or record.get("id") or record.get("signature"))
+    output_obj = record.get("output") or record.get("decision_json") or record.get("model_output")
+    if isinstance(output_obj, str) and clean_text(output_obj):
+        try:
+            output_obj = json.loads(output_obj)
+        except Exception:
+            output_obj = None
+    if isinstance(output_obj, dict):
+        if not sig_hash:
+            sig_hash = clean_text(output_obj.get("signature_hash"))
+        output = dict(output_obj)
+    else:
+        output = {
+            "decision": clean_text(record.get("decision")),
+            "candidate_id": clean_text(record.get("candidate_id") or record.get("selected_candidate_id")),
+            "confidence": record.get("confidence"),
+            "confidence_label": clean_text(record.get("confidence_label")),
+            "reason_codes": _reason_codes_from_any(record.get("reason_codes") or record.get("reason_codes_json")),
+            "explanation": clean_text(record.get("explanation")),
+            "needs_human_review": _bool_from_any(record.get("needs_human_review"), default=True),
+        }
+    # Normalize reason_codes/needs_human_review even for dict output.
+    output["reason_codes"] = _reason_codes_from_any(output.get("reason_codes"))
+    output["needs_human_review"] = _bool_from_any(output.get("needs_human_review"), default=True)
+    if "candidate_id" not in output and "selected_candidate_id" in output:
+        output["candidate_id"] = clean_text(output.get("selected_candidate_id"))
+    return sig_hash, output
+
+
+def iter_external_decision_records(path: Path) -> Iterator[Dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix in {".jsonl", ".ndjson"}:
+        with path.open("r", encoding="utf-8-sig") as fh:
+            for line_no, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise RuntimeError(f"Invalid JSONL at {path}:{line_no}: {e}") from e
+                if not isinstance(obj, dict):
+                    raise RuntimeError(f"JSONL record at {path}:{line_no} is not an object")
+                yield obj
+    elif suffix == ".json":
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict) and isinstance(data.get("records"), list):
+            data = data["records"]
+        if not isinstance(data, list):
+            raise RuntimeError("JSON decision import must be a list or {'records': [...]} object")
+        for obj in data:
+            if not isinstance(obj, dict):
+                raise RuntimeError("JSON decision import contains a non-object item")
+            yield obj
+    else:
+        with path.open("r", newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                yield dict(row)
+
+
+def export_packet_for_signature(sig: sqlite3.Row, candidates: Sequence[sqlite3.Row], include_schema: bool = False) -> Dict[str, Any]:
+    input_obj = build_ai_input(sig, candidates)
+    packet = {
+        "export_format": "grant_ai_adjudication_packet_v1",
+        "signature_hash": sig["signature_hash"],
+        "instructions": {
+            "decision_values": ["SELECT_CANDIDATE", "KEEP_REPORTED_EIN", "NO_MATCH", "AMBIGUOUS", "HUMAN_REVIEW"],
+            "candidate_id_required_for_select": True,
+            "candidate_id_for_non_select": "",
+            "confidence_format": "decimal 0..1, e.g. 0.95",
+            "do_not_invent_candidates_or_eins": True,
+        },
+        "input": input_obj,
+        "response_template": {
+            "signature_hash": sig["signature_hash"],
+            "decision": "SELECT_CANDIDATE | KEEP_REPORTED_EIN | NO_MATCH | AMBIGUOUS | HUMAN_REVIEW",
+            "candidate_id": "C1 or blank",
+            "confidence": 0.0,
+            "confidence_label": "high | medium | low | none",
+            "reason_codes": [],
+            "explanation": "",
+            "needs_human_review": True,
+        },
+    }
+    if include_schema:
+        packet["decision_schema"] = AI_DECISION_SCHEMA
+    return packet
+
+
+def cmd_export_adjudication_packets(args: argparse.Namespace) -> None:
+    """Export signatures+candidates for external/ChatGPT-assisted adjudication."""
+    conn = connect(args.db, readonly=True)
+    if not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {CAND_TABLE}. Run generate-candidates first.")
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path = Path(args.summary_csv) if args.summary_csv else None
+    summary_fh = None
+    summary_writer = None
+    if summary_path:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_fh = summary_path.open("w", newline="", encoding="utf-8-sig")
+        summary_writer = csv.writer(summary_fh)
+        summary_writer.writerow([
+            "signature_hash", "reported_ein", "recipient_name", "city", "state", "zip5",
+            "grant_count", "total_amount", "candidate_count", "top_candidate_id", "top_candidate_ein",
+            "top_candidate_name", "top_candidate_score", "first_pass_statuses_json", "warning_flags",
+        ])
+
+    # iter_signatures_for_adjudication expects args.regenerate/state/min_total_amount/limit.
+    # Reuse it so export matches the adjudicate queue: has candidates and no existing decision unless --regenerate.
+    exported = 0
+    skipped_shortcut = 0
+    started = time.time()
+    with out_path.open("w", encoding="utf-8") as out_fh:
+        try:
+            for sig in iter_signatures_for_adjudication(conn, args):
+                cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
+                if not cands:
+                    continue
+                if not args.include_reported_ein_shortcut_eligible:
+                    shortcut_row, _shortcut_reason = reported_ein_shortcut_decision_row(
+                        conn,
+                        sig,
+                        cands,
+                        min_name_score=args.reported_ein_shortcut_min_name_score,
+                        allow_contradictions=args.reported_ein_shortcut_allow_contradictions,
+                    )
+                    if shortcut_row is not None:
+                        skipped_shortcut += 1
+                        continue
+                packet = export_packet_for_signature(sig, cands, include_schema=args.include_schema)
+                if args.format == "jsonl":
+                    out_fh.write(json.dumps(packet, ensure_ascii=False, sort_keys=True) + "\n")
+                else:
+                    raise RuntimeError("Only --format jsonl is currently supported")
+                exported += 1
+                if summary_writer:
+                    top = cands[0]
+                    summary_writer.writerow([
+                        sig["signature_hash"], sig["reported_ein"], sig["recipient_name"], sig["city"], sig["state"], sig["zip5"],
+                        sig["grant_count"], sig["total_amount"], len(cands), top["candidate_id"], top["ein"],
+                        top["candidate_name"], top["candidate_score"], sig["first_pass_statuses_json"], sig["first_pass_warning_flags"],
+                    ])
+                if exported % args.progress_every == 0:
+                    elapsed = max(1.0, time.time() - started)
+                    print(f"Exported {exported:,} adjudication packets at {exported/elapsed:,.0f}/sec; skipped shortcut-eligible={skipped_shortcut:,}", flush=True)
+        finally:
+            if summary_fh:
+                summary_fh.flush(); summary_fh.close()
+    print(f"Adjudication packet export complete: {exported:,} packets -> {out_path}; skipped shortcut-eligible={skipped_shortcut:,}", flush=True)
+    if summary_path:
+        print(f"Summary CSV written to {summary_path}", flush=True)
+
+
+def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
+    """Import externally adjudicated decisions, validate them, and optionally store them."""
+    conn = connect(args.db, readonly=False)
+    if not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {CAND_TABLE}. Run generate-candidates first.")
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+    create_decision_schema(conn, full_refresh=False)
+
+    in_path = Path(args.in_file)
+    if not in_path.exists():
+        raise FileNotFoundError(in_path)
+    audit_fh = None
+    audit_writer = None
+    if args.audit_csv:
+        audit_path = Path(args.audit_csv)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_fh = audit_path.open("w", newline="", encoding="utf-8-sig")
+        audit_writer = csv.writer(audit_fh)
+        audit_writer.writerow([
+            "signature_hash", "decision", "candidate_id", "selected_ein", "selected_name", "confidence",
+            "auto_accept", "validation_status", "validation_error", "needs_human_review", "explanation",
+        ])
+
+    # Dummy args object for decision_row_tuple.
+    row_args = argparse.Namespace(
+        model=args.source_model,
+        num_ctx=0,
+        num_predict=0,
+        think=False,
+    )
+    processed = inserted = skipped_existing = invalid_missing = 0
+    started = time.time()
+    try:
+        for record in iter_external_decision_records(in_path):
+            processed += 1
+            sig_hash, output = external_output_from_record(record)
+            if not sig_hash:
+                invalid_missing += 1
+                if audit_writer:
+                    audit_writer.writerow(["", output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "missing_signature_hash", output.get("needs_human_review"), output.get("explanation")])
+                continue
+            sig = conn.execute(f"SELECT * FROM {SIG_TABLE} WHERE signature_hash=?", (sig_hash,)).fetchone()
+            if sig is None:
+                invalid_missing += 1
+                if audit_writer:
+                    audit_writer.writerow([sig_hash, output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "signature_not_found", output.get("needs_human_review"), output.get("explanation")])
+                continue
+            if not args.regenerate and conn.execute(f"SELECT 1 FROM {DECISION_TABLE} WHERE signature_hash=? LIMIT 1", (sig_hash,)).fetchone():
+                skipped_existing += 1
+                continue
+            cands = candidates_for_signature(conn, sig_hash, args.max_candidates)
+            validation = validate_ai_output(output, cands, sig, args.auto_accept_threshold)
+            input_obj = build_ai_input(sig, cands)
+            row = decision_row_tuple(sig_hash, input_obj, cands, output, validation, row_args)
+            if audit_writer:
+                audit_writer.writerow([
+                    row[0], row[1], row[2], row[3], row[4], row[5], row[10], row[11], row[12], row[9], row[8]
+                ])
+            if not args.dry_run:
+                insert_decision(conn, row)
+                inserted += 1
+                if inserted % args.commit_every == 0:
+                    conn.commit()
+            if processed % args.progress_every == 0:
+                elapsed = max(1.0, time.time() - started)
+                print(f"Imported/validated {processed:,} external decisions at {processed/elapsed:,.0f}/sec; inserted={inserted:,}; skipped_existing={skipped_existing:,}", flush=True)
+        if not args.dry_run:
+            conn.commit()
+    finally:
+        if audit_fh:
+            audit_fh.flush(); audit_fh.close()
+    mode = "validated only (dry run)" if args.dry_run else "inserted"
+    print(f"External decision import complete: processed={processed:,}; {mode}={inserted:,}; skipped_existing={skipped_existing:,}; missing/invalid_input={invalid_missing:,}", flush=True)
+
+
+
+# ---------------------------------------------------------------------------
 # Ollama test / diagnostics
 # ---------------------------------------------------------------------------
 
@@ -3572,6 +3861,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--flush-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=50000)
     p.set_defaults(func=cmd_reported_ein_shortcuts)
+
+
+    p = sub.add_parser("export-adjudication-packets", help="Export signatures+candidates as JSONL packets for offline/ChatGPT-assisted adjudication")
+    add_common_db(p)
+    p.add_argument("--out", default="adjudication_packets.jsonl", help="Output JSONL packet file")
+    p.add_argument("--summary-csv", default=None, help="Optional human-readable CSV summary of exported packets")
+    p.add_argument("--format", choices=["jsonl"], default="jsonl")
+    p.add_argument("--regenerate", action="store_true", help="Include signatures that already have a decision")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--limit", type=int, default=250)
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--include-schema", action="store_true", help="Include JSON schema in every packet; useful but increases file size")
+    p.add_argument("--include-reported-ein-shortcut-eligible", action="store_true", help="Export cases that the reported-EIN shortcut could handle without AI; default skips them")
+    p.add_argument("--reported-ein-shortcut-min-name-score", type=float, default=0.35)
+    p.add_argument("--reported-ein-shortcut-allow-contradictions", action="store_true")
+    p.add_argument("--progress-every", type=int, default=10000)
+    p.set_defaults(func=cmd_export_adjudication_packets)
+
+    p = sub.add_parser("import-adjudication-decisions", help="Import externally adjudicated JSONL/JSON/CSV decisions, validate, and store them")
+    add_common_db(p)
+    p.add_argument("--in-file", required=True, help="Decision file from external adjudication: JSONL, JSON, or CSV")
+    p.add_argument("--source-model", default="external:chatgpt", help="Model/source label stored in grant_recipient_ai_decision.model")
+    p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for imported signatures")
+    p.add_argument("--dry-run", action="store_true", help="Validate import and write audit CSV, but do not insert decisions")
+    p.add_argument("--audit-csv", default="external_decision_import_audit.csv")
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=10000)
+    p.set_defaults(func=cmd_import_adjudication_decisions)
 
     p = sub.add_parser("apply-decisions", help="Apply auto-accepted AI decisions to separate table and final view")
     add_common_db(p)
