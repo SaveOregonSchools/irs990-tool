@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_10_shortcut_audit.py
+grant_ai_assist_v1_12_reported_ein_triage.py
 
 Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
 
@@ -19,6 +19,7 @@ Fast v1.5 changes
 - v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
 - v1.10 adds expanded reported-EIN shortcut audit CSV fields on top of v1.9 shortcuts/backfill.
 - v1.11 adds export/import commands for offline or ChatGPT-assisted adjudication batches.
+- v1.12 adds reported-EIN triage so non-conflicting reported EINs are kept/parked before Ollama/export.
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
 or refreshed grant_recipient_resolved. It adds a materialized organization
@@ -2119,6 +2120,267 @@ def reported_ein_shortcut_decision_row(
     return row, "shortcut_created"
 
 
+def reported_ein_rule_decision_row(
+    sig: sqlite3.Row,
+    candidates: Sequence[sqlite3.Row],
+    *,
+    decision: str,
+    selected_ein: str,
+    selected_name: str,
+    confidence: float,
+    confidence_label: str,
+    reason_codes: Sequence[str],
+    explanation: str,
+    needs_human_review: bool,
+    auto_accept: bool,
+    validation_status: str = "ok",
+    validation_error: str = "",
+    model_label: str = "rule:reported_ein_triage",
+    extra_input: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, ...]:
+    """Build a DECISION_TABLE tuple for reported-EIN triage without calling Ollama."""
+    selected_ein = digits9(selected_ein)
+    reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    selected_cand = matching_candidate_for_ein(candidates, selected_ein) if selected_ein else None
+    candidate_id = clean_text(selected_cand["candidate_id"]) if selected_cand is not None else ("REPORTED_EIN" if selected_ein else "")
+    output = {
+        "decision": decision,
+        "candidate_id": candidate_id if decision in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"} else "",
+        "confidence": round(float(confidence or 0), 4),
+        "confidence_label": confidence_label,
+        "reason_codes": list(reason_codes),
+        "explanation": explanation,
+        "needs_human_review": bool(needs_human_review),
+    }
+    input_obj = {
+        "task": "reported_ein_triage_no_ollama",
+        "rules": [
+            "The filing supplied a recipient EIN.",
+            "Non-conflicting reported EINs should not be sent to Ollama for second-guessing.",
+            "Only reported-EIN cases with strong contradiction signals should proceed to AI adjudication.",
+        ],
+        "grant_recipient_signature": {
+            "signature_hash": sig["signature_hash"],
+            "reported_ein": reported_ein,
+            "recipient_name": clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else ""),
+            "street": clean_text(sig["street"] if "street" in sig.keys() else ""),
+            "city": clean_text(sig["city"] if "city" in sig.keys() else ""),
+            "state": clean_text(sig["state"] if "state" in sig.keys() else ""),
+            "zip5": clean_text(sig["zip5"] if "zip5" in sig.keys() else ""),
+            "grant_count": int(sig["grant_count"] or 0),
+            "total_amount": float(sig["total_amount"] or 0),
+            "first_pass_statuses_json": clean_text(sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else ""),
+            "first_pass_warning_flags": clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else ""),
+        },
+        "reported_ein_triage": extra_input or {},
+    }
+    input_json = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
+    output_json = json.dumps(output, ensure_ascii=False, sort_keys=True)
+    candidate_set_json = json.dumps(
+        [{"id": c["candidate_id"], "ein": c["ein"], "score": c["candidate_score"]} for c in candidates],
+        sort_keys=True,
+    )
+    return (
+        sig["signature_hash"],
+        decision,
+        output["candidate_id"],
+        selected_ein,
+        clean_text(selected_name),
+        round(float(confidence or 0), 4),
+        confidence_label,
+        json.dumps(list(reason_codes), ensure_ascii=False, sort_keys=True),
+        clean_text(explanation),
+        1 if needs_human_review else 0,
+        1 if auto_accept else 0,
+        validation_status,
+        validation_error,
+        model_label,
+        json.dumps({"rule": "reported_ein_triage"}, sort_keys=True),
+        stable_hash([input_json], "PROMPT_"),
+        stable_hash([candidate_set_json], "CANDS_"),
+        input_json,
+        output_json,
+        now_stamp(),
+    )
+
+
+def reported_ein_triage_decision_row(
+    conn: sqlite3.Connection,
+    sig: sqlite3.Row,
+    candidates: Sequence[sqlite3.Row],
+    *,
+    min_name_score: float = 0.35,
+    allow_contradictions: bool = False,
+    unverified_action: str = "keep",
+    unsafe_action: str = "human_review",
+    unverified_confidence: float = 0.935,
+) -> Tuple[Optional[Tuple[Any, ...]], str]:
+    """Triage reported-EIN signatures before Ollama.
+
+    Returns a DECISION_TABLE tuple when the row should be handled without AI.
+    Default behavior:
+      * Known reported EIN in org_identity, no contradiction -> KEEP_REPORTED_EIN auto-accepted.
+      * Unknown reported EIN, real recipient name, no contradiction -> KEEP_REPORTED_EIN auto-accepted using filing name.
+      * Unknown reported EIN with blank/placeholder recipient, or known EIN with name disagreement -> HUMAN_REVIEW no-AI.
+      * Strong contradiction flags/statuses -> no row; allow Ollama adjudication unless explicitly allowed.
+    """
+    reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    if not reported_ein:
+        return None, "no_reported_ein"
+
+    has_contradiction = signature_has_reported_ein_contradiction(sig)
+    if has_contradiction and not allow_contradictions:
+        return None, "reported_ein_contradiction_flagged"
+
+    # First use the already-tested org_identity shortcut when possible.
+    shortcut_row, shortcut_reason = reported_ein_shortcut_decision_row(
+        conn,
+        sig,
+        candidates,
+        min_name_score=min_name_score,
+        allow_contradictions=allow_contradictions,
+    )
+    if shortcut_row is not None:
+        return shortcut_row, shortcut_reason
+
+    recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+    recip_norm = normalize_name(recip_name)
+    placeholder = recipient_name_looks_placeholder(recip_name)
+    identity = best_identity_for_ein(conn, reported_ein)
+
+    # If org_identity knows the EIN but the filing recipient name strongly disagrees,
+    # do not let AI casually override or discard it. Park it for human review by default.
+    if identity is not None and shortcut_reason == "recipient_name_disagrees_with_reported_ein_identity":
+        if unsafe_action == "ollama":
+            return None, shortcut_reason
+        if unsafe_action == "skip":
+            return None, "reported_ein_name_disagrees_skipped_no_ai"
+        selected_name = clean_text(identity["display_name"])
+        explanation = (
+            f"Reported recipient EIN {reported_ein} is known in org_identity as '{selected_name}', "
+            "but the recipient name has weak agreement with that identity. Ollama was skipped because "
+            "there was no strong first-pass contradiction flag; this should be reviewed manually."
+        )
+        return reported_ein_rule_decision_row(
+            sig,
+            candidates,
+            decision="HUMAN_REVIEW",
+            selected_ein=reported_ein,
+            selected_name=selected_name,
+            confidence=0.0,
+            confidence_label="none",
+            reason_codes=["reported_ein_present", "reported_ein_known_but_name_disagrees", "ollama_skipped_nonconflicting_reported_ein"],
+            explanation=explanation,
+            needs_human_review=True,
+            auto_accept=False,
+            model_label="rule:reported_ein_no_ai_review",
+            extra_input={"shortcut_reason": shortcut_reason, "identity_source": clean_text(identity["source"])},
+        ), "reported_ein_known_name_disagrees_human_review_no_ai"
+
+    # Unknown in org_identity. If the filing supplied a valid 9-digit EIN and a
+    # real recipient name, keep the reported EIN without asking AI to choose a
+    # same-address or fuzzy candidate. This follows the source-filing priority rule.
+    if identity is None:
+        if placeholder or not recip_norm:
+            if unsafe_action == "ollama":
+                return None, "reported_ein_unknown_placeholder_allowed_to_ollama"
+            if unsafe_action == "skip":
+                return None, "reported_ein_unknown_placeholder_skipped_no_ai"
+            explanation = (
+                f"The filing supplied recipient EIN {reported_ein}, but org_identity has no name for it and "
+                "the recipient name is blank/placeholder. Ollama was skipped to avoid selecting unrelated "
+                "same-address candidates; this should be reviewed manually."
+            )
+            return reported_ein_rule_decision_row(
+                sig,
+                candidates,
+                decision="HUMAN_REVIEW",
+                selected_ein=reported_ein,
+                selected_name=recip_name,
+                confidence=0.0,
+                confidence_label="none",
+                reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_blank_or_placeholder", "ollama_skipped"],
+                explanation=explanation,
+                needs_human_review=True,
+                auto_accept=False,
+                model_label="rule:reported_ein_no_ai_review",
+                extra_input={"shortcut_reason": shortcut_reason},
+            ), "reported_ein_unknown_placeholder_human_review_no_ai"
+
+        if unverified_action == "ollama":
+            return None, "reported_ein_unknown_allowed_to_ollama"
+        if unverified_action == "skip":
+            return None, "reported_ein_unknown_skipped_no_ai"
+        if unverified_action == "human_review":
+            explanation = (
+                f"The filing supplied recipient EIN {reported_ein}, but org_identity has no name for it. "
+                "Ollama was skipped because there was no strong reported-EIN contradiction; this should be reviewed manually."
+            )
+            return reported_ein_rule_decision_row(
+                sig,
+                candidates,
+                decision="HUMAN_REVIEW",
+                selected_ein=reported_ein,
+                selected_name=recip_name,
+                confidence=0.0,
+                confidence_label="none",
+                reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_present", "ollama_skipped"],
+                explanation=explanation,
+                needs_human_review=True,
+                auto_accept=False,
+                model_label="rule:reported_ein_no_ai_review",
+                extra_input={"shortcut_reason": shortcut_reason},
+            ), "reported_ein_unknown_human_review_no_ai"
+
+        # Default: keep unverified filing EIN if it has a real recipient name and no contradiction.
+        explanation = (
+            f"The filing supplied recipient EIN {reported_ein} for '{recip_name}'. org_identity has no name for this EIN, "
+            "but no first-pass reported-EIN contradiction was flagged. The reported EIN is kept as an unverified filing-supplied EIN, "
+            "and Ollama was skipped."
+        )
+        return reported_ein_rule_decision_row(
+            sig,
+            candidates,
+            decision="KEEP_REPORTED_EIN",
+            selected_ein=reported_ein,
+            selected_name=recip_name,
+            confidence=unverified_confidence,
+            confidence_label="high" if unverified_confidence >= 0.92 else "medium",
+            reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_present", "reported_ein_from_filing_unverified", "ollama_skipped"],
+            explanation=explanation,
+            needs_human_review=False,
+            auto_accept=True,
+            model_label="rule:reported_ein_from_filing_unverified",
+            extra_input={"shortcut_reason": shortcut_reason},
+        ), "reported_ein_unknown_kept_unverified"
+
+    # Fall back: a reported EIN was present but neither shortcut nor a specific
+    # triage branch handled it. Avoid AI by default unless explicitly requested.
+    if unsafe_action == "ollama":
+        return None, shortcut_reason or "reported_ein_unhandled_allowed_to_ollama"
+    if unsafe_action == "skip":
+        return None, shortcut_reason or "reported_ein_unhandled_skipped_no_ai"
+    explanation = (
+        f"The filing supplied recipient EIN {reported_ein}, but the reported-EIN triage did not find a safe auto-accept path. "
+        "Ollama was skipped because there was no strong first-pass contradiction; this should be reviewed manually."
+    )
+    return reported_ein_rule_decision_row(
+        sig,
+        candidates,
+        decision="HUMAN_REVIEW",
+        selected_ein=reported_ein,
+        selected_name=recip_name,
+        confidence=0.0,
+        confidence_label="none",
+        reason_codes=["reported_ein_present", "reported_ein_unhandled", "ollama_skipped"],
+        explanation=explanation,
+        needs_human_review=True,
+        auto_accept=False,
+        model_label="rule:reported_ein_no_ai_review",
+        extra_input={"shortcut_reason": shortcut_reason},
+    ), "reported_ein_unhandled_human_review_no_ai"
+
+
 def create_best_identity_name_temp(conn: sqlite3.Connection) -> int:
     """Build temp table tmp_best_identity_name(ein, display_name, source)."""
     if not table_exists(conn, ORG_IDENTITY_TABLE):
@@ -2328,24 +2590,31 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
             if not cands:
                 continue
 
-            if not getattr(args, "no_reported_ein_shortcut", False):
-                shortcut_row, shortcut_reason = reported_ein_shortcut_decision_row(
+            # v1.12: triage reported-EIN signatures before Ollama.
+            # Non-conflicting reported EINs are either kept automatically or parked
+            # for human review, so the model is reserved for blank/malformed EINs
+            # and strong reported-EIN contradiction cases.
+            if not (getattr(args, "no_reported_ein_shortcut", False) or getattr(args, "no_reported_ein_triage", False)):
+                triage_row, triage_reason = reported_ein_triage_decision_row(
                     conn,
                     sig,
                     cands,
                     min_name_score=getattr(args, "reported_ein_shortcut_min_name_score", 0.35),
                     allow_contradictions=getattr(args, "reported_ein_shortcut_allow_contradictions", False),
+                    unverified_action=getattr(args, "reported_ein_unverified_action", "keep"),
+                    unsafe_action=getattr(args, "reported_ein_unsafe_action", "human_review"),
+                    unverified_confidence=getattr(args, "reported_ein_unverified_confidence", 0.935),
                 )
-                if shortcut_row is not None:
+                if triage_row is not None:
                     if writer is not None:
                         writer.writerow([
-                            shortcut_row[0], shortcut_row[1], shortcut_row[2], shortcut_row[3], shortcut_row[4],
-                            shortcut_row[5], shortcut_row[10], shortcut_row[11], shortcut_row[12], shortcut_row[8], shortcut_row[18]
+                            triage_row[0], triage_row[1], triage_row[2], triage_row[3], triage_row[4],
+                            triage_row[5], triage_row[10], triage_row[11], triage_row[12], triage_row[8], triage_row[18]
                         ])
                         if processed and processed % args.flush_every == 0:
                             out_fh.flush()
                     else:
-                        insert_decision(conn, shortcut_row)
+                        insert_decision(conn, triage_row)
                         if processed and processed % args.commit_every == 0:
                             conn.commit()
                     processed += 1
@@ -2606,15 +2875,18 @@ def cmd_export_adjudication_packets(args: argparse.Namespace) -> None:
                 cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
                 if not cands:
                     continue
-                if not args.include_reported_ein_shortcut_eligible:
-                    shortcut_row, _shortcut_reason = reported_ein_shortcut_decision_row(
+                if not args.include_reported_ein_shortcut_eligible and not getattr(args, "include_reported_ein_nonconflicts", False):
+                    triage_row, _triage_reason = reported_ein_triage_decision_row(
                         conn,
                         sig,
                         cands,
                         min_name_score=args.reported_ein_shortcut_min_name_score,
                         allow_contradictions=args.reported_ein_shortcut_allow_contradictions,
+                        unverified_action=getattr(args, "reported_ein_unverified_action", "keep"),
+                        unsafe_action=getattr(args, "reported_ein_unsafe_action", "human_review"),
+                        unverified_confidence=getattr(args, "reported_ein_unverified_confidence", 0.935),
                     )
-                    if shortcut_row is not None:
+                    if triage_row is not None:
                         skipped_shortcut += 1
                         continue
                 packet = export_packet_for_signature(sig, cands, include_schema=args.include_schema)
@@ -3098,6 +3370,88 @@ def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
             print(f"  {k}: {v:,}", flush=True)
 
 
+def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
+    """Triage all reported-EIN signatures without Ollama.
+
+    This is broader than reported-ein-shortcuts. It can:
+      * auto-keep known reported EINs from org_identity;
+      * auto-keep unverified filing-supplied EINs with real recipient names;
+      * create HUMAN_REVIEW no-AI decisions for reported-EIN cases that should
+        not be casually second-guessed by the model;
+      * leave strong contradiction cases untouched so adjudicate/export can send
+        them to Ollama if desired.
+    """
+    conn = connect(args.db, readonly=False, exclusive=True)
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+    # org_identity is needed for known-EIN triage, but unverified reported-EIN
+    # triage can still run if org_identity exists but lacks the specific EIN.
+    if not table_exists(conn, ORG_IDENTITY_TABLE):
+        raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
+    create_decision_schema(conn, full_refresh=False)
+
+    out_fh = None
+    writer = None
+    if args.dry_run:
+        out_path = Path(args.csv_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_fh = out_path.open("w", newline="", encoding="utf-8-sig")
+        writer = csv.writer(out_fh)
+        writer.writerow(REPORTED_EIN_SHORTCUT_AUDIT_HEADERS)
+        print(f"Dry run enabled; writing reported-EIN triage CSV to {out_path}", flush=True)
+
+    processed = 0
+    created = 0
+    skips = Counter()
+    by_decision = Counter()
+    started = time.time()
+    try:
+        for sig in iter_signatures_for_reported_ein_shortcuts(conn, args):
+            cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates) if table_exists(conn, CAND_TABLE) else []
+            row, reason = reported_ein_triage_decision_row(
+                conn,
+                sig,
+                cands,
+                min_name_score=args.min_name_score,
+                allow_contradictions=args.allow_contradictions,
+                unverified_action=args.unverified_action,
+                unsafe_action=args.unsafe_action,
+                unverified_confidence=args.unverified_confidence,
+            )
+            processed += 1
+            if row is None:
+                skips[reason] += 1
+            else:
+                created += 1
+                by_decision[row[1]] += 1
+                if writer is not None:
+                    writer.writerow(reported_ein_shortcut_audit_row(sig, row, cands, reason))
+                    if created % args.flush_every == 0:
+                        out_fh.flush()
+                else:
+                    insert_decision(conn, row)
+                    if created % args.commit_every == 0:
+                        conn.commit()
+            if processed % args.progress_every == 0:
+                elapsed = max(1.0, time.time() - started)
+                print(f"Reported-EIN triage scanned {processed:,}; created {created:,}; {processed/elapsed:,.0f}/sec", flush=True)
+        if writer is None:
+            conn.commit()
+    finally:
+        if out_fh is not None:
+            out_fh.flush()
+            out_fh.close()
+    print(f"Reported-EIN triage complete: scanned {processed:,}; created {created:,}", flush=True)
+    if by_decision:
+        print("Created decision types:", flush=True)
+        for k, v in by_decision.most_common():
+            print(f"  {k}: {v:,}", flush=True)
+    if skips:
+        print("Skipped reasons:", flush=True)
+        for k, v in skips.most_common():
+            print(f"  {k}: {v:,}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Apply decisions / final view
 # ---------------------------------------------------------------------------
@@ -3125,7 +3479,9 @@ def refresh_final_view(conn: sqlite3.Connection) -> None:
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_ein ELSE rr.resolved_ein END AS final_resolved_ein,
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
       CASE
-        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'reported_ein_identity_lookup'
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'reported_ein_rule'
         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_assisted'
         ELSE 'deterministic'
       END AS final_match_source,
@@ -3833,11 +4189,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fail-fast", action="store_true", help="Stop after the first Ollama call failure")
     p.add_argument("--debug-raw-out", default=None, help="Optional text file to append raw Ollama responses for debugging")
     p.add_argument("--no-reported-ein-shortcut", action="store_true",
-                   help="Disable the pre-Ollama shortcut that keeps a known reported EIN from org_identity")
+                   help="Backward-compatible synonym for --no-reported-ein-triage")
+    p.add_argument("--no-reported-ein-triage", action="store_true",
+                   help="Disable pre-Ollama reported-EIN triage. Normally leave off so non-conflicting reported EINs skip Ollama.")
     p.add_argument("--reported-ein-shortcut-min-name-score", type=float, default=0.35,
-                   help="Minimum weak name agreement required for reported-EIN shortcut when recipient name is a real org name; blank/placeholder names bypass this")
+                   help="Minimum weak name agreement required for known-EIN shortcut when recipient name is a real org name; blank/placeholder names bypass this")
     p.add_argument("--reported-ein-shortcut-allow-contradictions", action="store_true",
-                   help="Allow shortcut even when first-pass warning/status suggests the reported EIN may be wrong; normally leave off")
+                   help="Allow reported-EIN triage even when first-pass warning/status suggests the reported EIN may be wrong; normally leave off")
+    p.add_argument("--reported-ein-unverified-action", choices=["keep", "human_review", "skip", "ollama"], default="keep",
+                   help="When reported EIN is not in org_identity but recipient name is real and no contradiction is flagged: keep=auto-keep filing EIN; human_review=store no-AI review decision; skip=do nothing; ollama=send to model")
+    p.add_argument("--reported-ein-unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review",
+                   help="For non-contradictory reported-EIN cases unsafe for auto-keep, such as name disagreement or placeholder with unknown EIN")
+    p.add_argument("--reported-ein-unverified-confidence", type=float, default=0.935,
+                   help="Confidence assigned to auto-kept filing-supplied EINs not found in org_identity")
     p.set_defaults(func=cmd_adjudicate)
 
     p = sub.add_parser("backfill-ein-names", help="Incrementally fill blank resolved/selected org names from org_identity without rebuilding pipeline tables")
@@ -3863,6 +4227,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_reported_ein_shortcuts)
 
 
+
+    p = sub.add_parser("reported-ein-triage", help="Triage all reported-EIN signatures before AI: keep safe reported EINs or park unsafe non-conflicts for human review")
+    add_common_db(p)
+    p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for eligible signatures")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--queue-status", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--min-name-score", type=float, default=0.35)
+    p.add_argument("--allow-contradictions", action="store_true", help="Allow triage even when first-pass warning/status suggests reported EIN may be wrong; normally leave off")
+    p.add_argument("--unverified-action", choices=["keep", "human_review", "skip", "ollama"], default="keep",
+                   help="When reported EIN is not in org_identity but recipient name is real and no contradiction is flagged")
+    p.add_argument("--unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review",
+                   help="For non-contradictory reported-EIN cases unsafe for auto-keep, such as name disagreement or placeholder with unknown EIN")
+    p.add_argument("--unverified-confidence", type=float, default=0.935)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--csv-out", default="reported_ein_triage.csv")
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--flush-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=50000)
+    p.set_defaults(func=cmd_reported_ein_triage)
+
     p = sub.add_parser("export-adjudication-packets", help="Export signatures+candidates as JSONL packets for offline/ChatGPT-assisted adjudication")
     add_common_db(p)
     p.add_argument("--out", default="adjudication_packets.jsonl", help="Output JSONL packet file")
@@ -3874,9 +4261,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=250)
     p.add_argument("--max-candidates", type=int, default=20)
     p.add_argument("--include-schema", action="store_true", help="Include JSON schema in every packet; useful but increases file size")
-    p.add_argument("--include-reported-ein-shortcut-eligible", action="store_true", help="Export cases that the reported-EIN shortcut could handle without AI; default skips them")
+    p.add_argument("--include-reported-ein-shortcut-eligible", action="store_true", help="Backward-compatible: include known reported-EIN shortcut cases in export")
+    p.add_argument("--include-reported-ein-nonconflicts", action="store_true", help="Export non-conflicting reported-EIN cases that triage would otherwise keep or park without AI")
     p.add_argument("--reported-ein-shortcut-min-name-score", type=float, default=0.35)
     p.add_argument("--reported-ein-shortcut-allow-contradictions", action="store_true")
+    p.add_argument("--reported-ein-unverified-action", choices=["keep", "human_review", "skip", "ollama"], default="keep")
+    p.add_argument("--reported-ein-unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review")
+    p.add_argument("--reported-ein-unverified-confidence", type=float, default=0.935)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_export_adjudication_packets)
 
