@@ -207,9 +207,58 @@ def table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def raw_digits(value: Optional[str]) -> str:
+    """Return all digits from a string without making any length/validity claim."""
+    return re.sub(r"\D", "", value or "")
+
+
 def digits9(value: Optional[str]) -> str:
-    d = re.sub(r"\D", "", value or "")
+    """Return a 9-digit string if the input contains exactly 9 digits.
+
+    This is a structural normalizer used throughout the script. It intentionally
+    does not decide whether the EIN is usable; use reported_ein_validity_reason()
+    when deciding whether a filing-supplied recipient EIN should be trusted.
+    """
+    d = raw_digits(value)
     return d if len(d) == 9 else ""
+
+
+# Values commonly seen in filings as placeholders, not usable EINs.  The exact
+# 9-digit shape alone is not enough: 000000000 and 999999999 should never be
+# kept as a recipient EIN merely because they have nine digits.
+PLACEHOLDER_EINS = {
+    "000000000", "111111111", "222222222", "333333333", "444444444",
+    "555555555", "666666666", "777777777", "888888888", "999999999",
+    "123456789", "987654321",
+}
+
+
+def reported_ein_validity_reason(value: Optional[str]) -> str:
+    """Return 'ok' or a reason explaining why a reported EIN is unusable.
+
+    This is intentionally stricter than digits9(). It is used only for source
+    filing recipient EIN triage, where accepting placeholder values would create
+    false matches and wasted AI adjudication.
+    """
+    d = raw_digits(value)
+    if not d:
+        return "reported_ein_blank"
+    if len(d) != 9:
+        return f"reported_ein_invalid_length_{len(d)}"
+    if d in PLACEHOLDER_EINS:
+        return "reported_ein_placeholder_value"
+    if len(set(d)) == 1:
+        return "reported_ein_repeated_digit_placeholder"
+    # The first two digits are the EIN prefix.  A 00 prefix is not assigned and
+    # is almost always a placeholder/data-entry artifact.
+    if d[:2] == "00":
+        return "reported_ein_invalid_00_prefix"
+    return "ok"
+
+
+def usable_reported_ein(value: Optional[str]) -> str:
+    """Return a trusted 9-digit reported EIN, or '' if malformed/placeholder."""
+    return digits9(value) if reported_ein_validity_reason(value) == "ok" else ""
 
 
 def zip5(value: Optional[str]) -> str:
@@ -221,28 +270,49 @@ def clean_text(value: Optional[Any]) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
-def recipient_name_looks_placeholder(name: Any) -> bool:
-    """True when the grant recipient name is likely not an organization identity.
+# Recipient labels that usually do not identify one organization.  These rows
+# may be interesting someday by reading attachments, but they are poor targets
+# for automated EIN adjudication because the correct recipients are not present
+# in the row itself.
+NONADJUDICABLE_RECIPIENT_PATTERNS: List[Tuple[str, str]] = [
+    (r"^\s*$", "blank_recipient_name"),
+    (r"\bSEE\s+(SCHEDULE|STATEMENT|ATTACHMENT|ATTACHED|LIST|DETAIL|DETAILS)\b", "see_schedule_or_attachment"),
+    (r"\bSEE\s+ATTACHED\b", "see_attached"),
+    (r"\bATTACHED\s+(SCHEDULE|STATEMENT|LIST|DETAIL|DETAILS)\b", "attached_schedule_or_list"),
+    (r"\bDETAIL(?:ED)?\s+(SCHEDULE|STATEMENT|LIST|ATTACHMENT)\b", "detailed_schedule_or_list"),
+    (r"\bAS\s+PER\s+(SCHEDULE|STATEMENT|ATTACHMENT|LIST)\b", "as_per_schedule_or_list"),
+    (r"\bPER\s+(ATTACHED|SCHEDULE|STATEMENT|LIST)\b", "per_attached_or_schedule"),
+    (r"\bLIST\s+OF\s+(DISTRIBUTIONS?|GRANTS?|RECIPIENTS?|ORGANIZATIONS?)\b", "list_of_recipients"),
+    (r"\bDISTRIBUTIONS?\s+(LIST|SCHEDULE|STATEMENT)\b", "distribution_list_or_schedule"),
+    (r"\bELIGIBLE\s+PATIENTS?\b", "eligible_patients_placeholder"),
+    (r"\bVARIOUS\b", "various_recipients_placeholder"),
+    (r"\bMULTIPLE\b", "multiple_recipients_placeholder"),
+    (r"\bNUMEROUS\b", "numerous_recipients_placeholder"),
+    (r"\bMANY\s+(ORGANIZATIONS?|RECIPIENTS?|INDIVIDUALS?)\b", "many_recipients_placeholder"),
+    (r"\bSCHOLARSHIP\s+(RECIPIENTS?|STUDENTS?)\b", "scholarship_recipient_placeholder"),
+    (r"^INDIVIDUALS?$", "individuals_placeholder"),
+    (r"^PATIENTS?$", "patients_placeholder"),
+    (r"^STUDENTS?$", "students_placeholder"),
+    (r"^N\s*A$", "na_placeholder"),
+    (r"^NONE$", "none_placeholder"),
+    (r"^UNKNOWN$", "unknown_placeholder"),
+    (r"^ANNUAL\s+CAMPAIGN$", "campaign_not_recipient"),
+    (r"^CAMPAIGN$", "campaign_not_recipient"),
+]
 
-    These rows are common on PF schedules, e.g. "Eligible Patients (See Schedule #2)"
-    or generic grants to individuals/scholarship recipients. They should not be
-    resolved to the grantor just because the grantor address/name appears nearby.
-    """
+
+def recipient_name_nonadjudicable_reason(name: Any) -> str:
+    """Return reason when recipient name is not a specific organization identity."""
     s = normalize_name(str(name or ""))
-    if not s:
-        return True
-    patterns = [
-        r"\bSEE\s+(SCHEDULE|STATEMENT|ATTACHMENT)\b",
-        r"\bELIGIBLE\s+PATIENTS?\b",
-        r"\bVARIOUS\s+(RECIPIENTS?|INDIVIDUALS?|ORGANIZATIONS?)\b",
-        r"\bMULTIPLE\s+(RECIPIENTS?|INDIVIDUALS?|ORGANIZATIONS?)\b",
-        r"\bSCHOLARSHIP\s+(RECIPIENTS?|STUDENTS?)\b",
-        r"^INDIVIDUALS?$",
-        r"^PATIENTS?$",
-        r"^STUDENTS?$",
-        r"^N A$",
-    ]
-    return any(re.search(p, s) for p in patterns)
+    for pattern, reason in NONADJUDICABLE_RECIPIENT_PATTERNS:
+        if re.search(pattern, s):
+            return reason
+    return ""
+
+
+def recipient_name_looks_placeholder(name: Any) -> bool:
+    """True when the grant recipient name is likely not one organization."""
+    return bool(recipient_name_nonadjudicable_reason(name))
 
 
 def norm_upper(value: Optional[str]) -> str:
@@ -2006,9 +2076,11 @@ def reported_ein_shortcut_decision_row(
     either the recipient name is blank/placeholder or has at least weak agreement
     with the identity name. The threshold is configurable for future tuning.
     """
-    reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    reported_ein_raw = clean_text(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    validity = reported_ein_validity_reason(reported_ein_raw)
+    reported_ein = usable_reported_ein(reported_ein_raw)
     if not reported_ein:
-        return None, "no_reported_ein"
+        return None, validity
     identity = best_identity_for_ein(conn, reported_ein)
     if identity is None:
         return None, "reported_ein_not_in_org_identity"
@@ -2019,14 +2091,20 @@ def reported_ein_shortcut_decision_row(
     recip_norm = normalize_name(recip_name)
     identity_norm = clean_text(identity["name_norm"])
     name_score = ratio(recip_norm, identity_norm) if recip_norm and identity_norm else 0.0
-    placeholder = recipient_name_looks_placeholder(recip_name)
+    nonadj_reason = recipient_name_nonadjudicable_reason(recip_name)
+    placeholder = bool(nonadj_reason)
     candidate_match = matching_candidate_for_ein(candidates, reported_ein)
+
+    # v1.13: do not shortcut rows that say things like "See attachment" or
+    # "Various organizations".  Even a known EIN on those rows is not a clean
+    # single-recipient identity; reported-ein-triage handles them in a no-AI
+    # placeholder/list bucket.
+    if nonadj_reason:
+        return None, "recipient_name_nonadjudicable_" + nonadj_reason
 
     # A provided, known EIN is strong evidence. Still avoid auto-resolving when
     # the recipient name is a real organization name that strongly disagrees.
-    # Blank/placeholder recipient names are accepted because the EIN itself is
-    # the only real identity signal in those rows.
-    if recip_norm and not placeholder and name_score < min_name_score:
+    if recip_norm and name_score < min_name_score:
         return None, "recipient_name_disagrees_with_reported_ein_identity"
 
     candidate_id = clean_text(candidate_match["candidate_id"]) if candidate_match is not None else "REPORTED_EIN"
@@ -2204,6 +2282,84 @@ def reported_ein_rule_decision_row(
     )
 
 
+
+
+def nonadjudicable_recipient_decision_row(
+    sig: sqlite3.Row,
+    candidates: Sequence[sqlite3.Row],
+    *,
+    reason: str,
+    action: str = "no_match",
+    model_label: str = "rule:nonadjudicable_recipient_no_ai",
+) -> Tuple[Optional[Tuple[Any, ...]], str]:
+    """Create a no-AI decision for attachment/list/placeholder recipient rows."""
+    recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+    reported_raw = clean_text(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    reported_validity = reported_ein_validity_reason(reported_raw)
+    shortcut_reason = f"nonadjudicable_recipient_{reason}"
+
+    if action == "ollama":
+        return None, f"{shortcut_reason}_allowed_to_ollama"
+    if action == "skip":
+        return None, f"{shortcut_reason}_skipped_no_ai"
+
+    if action == "human_review":
+        decision = "HUMAN_REVIEW"
+        confidence = 0.0
+        confidence_label = "none"
+        needs_human_review = True
+        validation_status = "ok"
+        validation_error = ""
+    else:
+        # Default: mark as a high-confidence no-match for automated EIN purposes.
+        # This does not prove no underlying recipients exist; it means the row
+        # itself lacks a single recipient identity to adjudicate.
+        decision = "NO_MATCH"
+        confidence = 1.0
+        confidence_label = "high"
+        needs_human_review = False
+        validation_status = "ok"
+        validation_error = ""
+
+    reason_codes = [
+        "recipient_name_nonadjudicable",
+        reason,
+        "attachment_or_bulk_list_not_resolved",
+        "ollama_skipped",
+    ]
+    if reported_raw:
+        reason_codes.append("reported_ein_present")
+        reason_codes.append(reported_validity)
+
+    explanation = (
+        f"Recipient name '{recip_name}' appears to reference an attachment/list, multiple recipients, "
+        f"individuals, or another non-specific recipient category ({reason}). The row does not identify "
+        "one organization for EIN adjudication, so Ollama was skipped. This can be revisited later by "
+        "reviewing attachments or source filings."
+    )
+    return reported_ein_rule_decision_row(
+        sig,
+        candidates,
+        decision=decision,
+        selected_ein="",
+        selected_name="",
+        confidence=confidence,
+        confidence_label=confidence_label,
+        reason_codes=reason_codes,
+        explanation=explanation,
+        needs_human_review=needs_human_review,
+        auto_accept=False,
+        validation_status=validation_status,
+        validation_error=validation_error,
+        model_label=model_label,
+        extra_input={
+            "shortcut_reason": shortcut_reason,
+            "nonadjudicable_reason": reason,
+            "reported_ein_raw": reported_raw,
+            "reported_ein_validity": reported_validity,
+        },
+    ), shortcut_reason
+
 def reported_ein_triage_decision_row(
     conn: sqlite3.Connection,
     sig: sqlite3.Row,
@@ -2214,19 +2370,65 @@ def reported_ein_triage_decision_row(
     unverified_action: str = "keep",
     unsafe_action: str = "human_review",
     unverified_confidence: float = 0.935,
+    invalid_ein_action: str = "ollama",
+    placeholder_action: str = "no_match",
 ) -> Tuple[Optional[Tuple[Any, ...]], str]:
     """Triage reported-EIN signatures before Ollama.
 
-    Returns a DECISION_TABLE tuple when the row should be handled without AI.
-    Default behavior:
-      * Known reported EIN in org_identity, no contradiction -> KEEP_REPORTED_EIN auto-accepted.
-      * Unknown reported EIN, real recipient name, no contradiction -> KEEP_REPORTED_EIN auto-accepted using filing name.
-      * Unknown reported EIN with blank/placeholder recipient, or known EIN with name disagreement -> HUMAN_REVIEW no-AI.
-      * Strong contradiction flags/statuses -> no row; allow Ollama adjudication unless explicitly allowed.
+    v1.13 changes:
+      * A reported EIN must pass structural validation; values like 0,
+        000000000, 999999999, repeated digits, or short/long digit strings are
+        not kept as filing-supplied EINs.
+      * Attachment/list/multi-recipient placeholders are handled in a no-AI
+        bucket by default, because there is no single organization to adjudicate.
     """
-    reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
-    if not reported_ein:
+    reported_raw = clean_text(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
+    reported_validity = reported_ein_validity_reason(reported_raw)
+    reported_ein = usable_reported_ein(reported_raw)
+
+    recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+    recip_norm = normalize_name(recip_name)
+    nonadj_reason = recipient_name_nonadjudicable_reason(recip_name)
+
+    # Do this before any reported-EIN handling.  Rows such as "See attachment",
+    # "Detailed schedule", or "Various organizations" should not be sent to the
+    # model or auto-kept merely because the filing also contains 0/999999999/etc.
+    if nonadj_reason:
+        return nonadjudicable_recipient_decision_row(
+            sig,
+            candidates,
+            reason=nonadj_reason,
+            action=placeholder_action,
+        )
+
+    if not reported_raw:
         return None, "no_reported_ein"
+
+    if reported_validity != "ok":
+        if invalid_ein_action == "ollama":
+            return None, reported_validity + "_allowed_to_ollama"
+        if invalid_ein_action == "skip":
+            return None, reported_validity + "_skipped_no_ai"
+        decision = "NO_MATCH" if invalid_ein_action == "no_match" else "HUMAN_REVIEW"
+        explanation = (
+            f"The filing-supplied recipient EIN value '{reported_raw}' is not a usable EIN "
+            f"({reported_validity}). It was not kept as a recipient EIN, and Ollama was skipped by policy."
+        )
+        return reported_ein_rule_decision_row(
+            sig,
+            candidates,
+            decision=decision,
+            selected_ein="",
+            selected_name=recip_name,
+            confidence=1.0 if decision == "NO_MATCH" else 0.0,
+            confidence_label="high" if decision == "NO_MATCH" else "none",
+            reason_codes=["reported_ein_invalid", reported_validity, "ollama_skipped"],
+            explanation=explanation,
+            needs_human_review=(decision == "HUMAN_REVIEW"),
+            auto_accept=False,
+            model_label="rule:invalid_reported_ein_no_ai",
+            extra_input={"shortcut_reason": reported_validity, "reported_ein_raw": reported_raw},
+        ), reported_validity + ("_no_match_no_ai" if decision == "NO_MATCH" else "_human_review_no_ai")
 
     has_contradiction = signature_has_reported_ein_contradiction(sig)
     if has_contradiction and not allow_contradictions:
@@ -2243,9 +2445,6 @@ def reported_ein_triage_decision_row(
     if shortcut_row is not None:
         return shortcut_row, shortcut_reason
 
-    recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
-    recip_norm = normalize_name(recip_name)
-    placeholder = recipient_name_looks_placeholder(recip_name)
     identity = best_identity_for_ein(conn, reported_ein)
 
     # If org_identity knows the EIN but the filing recipient name strongly disagrees,
@@ -2277,19 +2476,19 @@ def reported_ein_triage_decision_row(
             extra_input={"shortcut_reason": shortcut_reason, "identity_source": clean_text(identity["source"])},
         ), "reported_ein_known_name_disagrees_human_review_no_ai"
 
-    # Unknown in org_identity. If the filing supplied a valid 9-digit EIN and a
-    # real recipient name, keep the reported EIN without asking AI to choose a
+    # Unknown in org_identity. If the filing supplied a usable EIN and a real
+    # recipient name, keep the reported EIN without asking AI to choose a
     # same-address or fuzzy candidate. This follows the source-filing priority rule.
     if identity is None:
-        if placeholder or not recip_norm:
+        if not recip_norm:
             if unsafe_action == "ollama":
-                return None, "reported_ein_unknown_placeholder_allowed_to_ollama"
+                return None, "reported_ein_unknown_blank_name_allowed_to_ollama"
             if unsafe_action == "skip":
-                return None, "reported_ein_unknown_placeholder_skipped_no_ai"
+                return None, "reported_ein_unknown_blank_name_skipped_no_ai"
             explanation = (
                 f"The filing supplied recipient EIN {reported_ein}, but org_identity has no name for it and "
-                "the recipient name is blank/placeholder. Ollama was skipped to avoid selecting unrelated "
-                "same-address candidates; this should be reviewed manually."
+                "the recipient name is blank. Ollama was skipped to avoid selecting unrelated same-address candidates; "
+                "this should be reviewed manually."
             )
             return reported_ein_rule_decision_row(
                 sig,
@@ -2299,13 +2498,13 @@ def reported_ein_triage_decision_row(
                 selected_name=recip_name,
                 confidence=0.0,
                 confidence_label="none",
-                reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_blank_or_placeholder", "ollama_skipped"],
+                reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_blank", "ollama_skipped"],
                 explanation=explanation,
                 needs_human_review=True,
                 auto_accept=False,
                 model_label="rule:reported_ein_no_ai_review",
                 extra_input={"shortcut_reason": shortcut_reason},
-            ), "reported_ein_unknown_placeholder_human_review_no_ai"
+            ), "reported_ein_unknown_blank_name_human_review_no_ai"
 
         if unverified_action == "ollama":
             return None, "reported_ein_unknown_allowed_to_ollama"
@@ -2346,7 +2545,7 @@ def reported_ein_triage_decision_row(
             selected_name=recip_name,
             confidence=unverified_confidence,
             confidence_label="high" if unverified_confidence >= 0.92 else "medium",
-            reason_codes=["reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_present", "reported_ein_from_filing_unverified", "ollama_skipped"],
+            reason_codes=["reported_ein_present", "reported_ein_valid", "reported_ein_not_in_org_identity", "recipient_name_present", "reported_ein_from_filing_unverified", "ollama_skipped"],
             explanation=explanation,
             needs_human_review=False,
             auto_accept=True,
@@ -2473,7 +2672,8 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
         else:
             selected = candidate_by_id[candidate_id]
     elif decision == "KEEP_REPORTED_EIN":
-        reported_ein = digits9(sig["reported_ein"])
+        reported_raw = sig["reported_ein"]
+        reported_ein = usable_reported_ein(reported_raw)
         # If reported EIN appears in candidate list, treat that candidate as selected.
         for c in candidates:
             if digits9(c["ein"]) == reported_ein:
@@ -2481,7 +2681,7 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
                 candidate_id = clean_text(c["candidate_id"])
                 break
         if not reported_ein:
-            errors.append("keep_reported_ein_but_no_reported_ein")
+            errors.append("keep_reported_ein_but_invalid_reported_ein:" + reported_ein_validity_reason(reported_raw))
     else:
         candidate_id = ""
 
@@ -2590,10 +2790,39 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
             if not cands:
                 continue
 
-            # v1.12: triage reported-EIN signatures before Ollama.
+            # v1.13: skip attachment/list/placeholder recipient rows before any
+            # Ollama call. These rows do not identify one organization to adjudicate.
+            if not getattr(args, "no_nonadjudicable_recipient_triage", False):
+                nonadj_reason = recipient_name_nonadjudicable_reason(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+                if nonadj_reason:
+                    triage_row, triage_reason = nonadjudicable_recipient_decision_row(
+                        sig,
+                        cands,
+                        reason=nonadj_reason,
+                        action=getattr(args, "nonadjudicable_action", "no_match"),
+                    )
+                    if triage_row is not None:
+                        if writer is not None:
+                            writer.writerow([
+                                triage_row[0], triage_row[1], triage_row[2], triage_row[3], triage_row[4],
+                                triage_row[5], triage_row[10], triage_row[11], triage_row[12], triage_row[8], triage_row[18]
+                            ])
+                            if processed and processed % args.flush_every == 0:
+                                out_fh.flush()
+                        else:
+                            insert_decision(conn, triage_row)
+                            if processed and processed % args.commit_every == 0:
+                                conn.commit()
+                        processed += 1
+                        if processed % args.progress_every == 0:
+                            elapsed = max(1.0, time.time() - started)
+                            print(f"Adjudicated {processed:,} signatures at {processed/elapsed:,.2f}/sec; call_failures={call_failures:,}", flush=True)
+                        continue
+
+            # v1.12/v1.13: triage reported-EIN signatures before Ollama.
             # Non-conflicting reported EINs are either kept automatically or parked
-            # for human review, so the model is reserved for blank/malformed EINs
-            # and strong reported-EIN contradiction cases.
+            # for human review/no-match, so the model is reserved for blank/malformed
+            # EINs and strong reported-EIN contradiction cases.
             if not (getattr(args, "no_reported_ein_shortcut", False) or getattr(args, "no_reported_ein_triage", False)):
                 triage_row, triage_reason = reported_ein_triage_decision_row(
                     conn,
@@ -2604,6 +2833,8 @@ def cmd_adjudicate(args: argparse.Namespace) -> None:
                     unverified_action=getattr(args, "reported_ein_unverified_action", "keep"),
                     unsafe_action=getattr(args, "reported_ein_unsafe_action", "human_review"),
                     unverified_confidence=getattr(args, "reported_ein_unverified_confidence", 0.935),
+                    invalid_ein_action=getattr(args, "invalid_reported_ein_action", "ollama"),
+                    placeholder_action=getattr(args, "nonadjudicable_action", "no_match"),
                 )
                 if triage_row is not None:
                     if writer is not None:
@@ -2875,6 +3106,11 @@ def cmd_export_adjudication_packets(args: argparse.Namespace) -> None:
                 cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
                 if not cands:
                     continue
+                if not getattr(args, "include_nonadjudicable_placeholders", False):
+                    nonadj_reason = recipient_name_nonadjudicable_reason(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+                    if nonadj_reason:
+                        skipped_shortcut += 1
+                        continue
                 if not args.include_reported_ein_shortcut_eligible and not getattr(args, "include_reported_ein_nonconflicts", False):
                     triage_row, _triage_reason = reported_ein_triage_decision_row(
                         conn,
@@ -2885,6 +3121,8 @@ def cmd_export_adjudication_packets(args: argparse.Namespace) -> None:
                         unverified_action=getattr(args, "reported_ein_unverified_action", "keep"),
                         unsafe_action=getattr(args, "reported_ein_unsafe_action", "human_review"),
                         unverified_confidence=getattr(args, "reported_ein_unverified_confidence", 0.935),
+                        invalid_ein_action=getattr(args, "invalid_reported_ein_action", "ollama"),
+                        placeholder_action=getattr(args, "nonadjudicable_action", "no_match"),
                     )
                     if triage_row is not None:
                         skipped_shortcut += 1
@@ -3230,7 +3468,7 @@ REPORTED_EIN_SHORTCUT_AUDIT_HEADERS = [
     "signature_hash", "shortcut_reason", "decision", "selected_candidate_id", "selected_ein", "selected_name",
     "confidence", "confidence_label", "auto_accept", "validation_status", "validation_error", "needs_human_review",
     # Raw/signature recipient evidence
-    "reported_ein", "recipient_name", "recipient_name_norm", "recipient_street", "recipient_street_norm",
+    "reported_ein", "reported_ein_validity", "nonadjudicable_reason", "recipient_name", "recipient_name_norm", "recipient_street", "recipient_street_norm",
     "recipient_city", "recipient_state", "recipient_zip5", "recipient_country",
     "grant_count", "total_amount", "sample_purpose", "sample_grantor_ein", "sample_grantor_name",
     # First-pass deterministic evidence
@@ -3286,7 +3524,7 @@ def reported_ein_shortcut_audit_row(
         decision_row[0], shortcut_reason, decision_row[1], decision_row[2], decision_row[3], decision_row[4],
         decision_row[5], decision_row[6], decision_row[10], decision_row[11], decision_row[12], decision_row[9],
         # Raw/signature recipient evidence
-        sigv("reported_ein"), sigv("recipient_name"), sigv("recipient_name_norm"), sigv("street"), sigv("street_norm"),
+        sigv("reported_ein"), reported_ein_validity_reason(sigv("reported_ein")), recipient_name_nonadjudicable_reason(sigv("recipient_name")), sigv("recipient_name"), sigv("recipient_name_norm"), sigv("street"), sigv("street_norm"),
         sigv("city"), sigv("state"), sigv("zip5"), sigv("country"), sigv("grant_count"), sigv("total_amount"),
         sigv("sample_purpose"), sigv("sample_grantor_ein"), sigv("sample_grantor_name"),
         # First-pass deterministic evidence
@@ -3417,6 +3655,8 @@ def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
                 unverified_action=args.unverified_action,
                 unsafe_action=args.unsafe_action,
                 unverified_confidence=args.unverified_confidence,
+                invalid_ein_action=args.invalid_ein_action,
+                placeholder_action=args.placeholder_action,
             )
             processed += 1
             if row is None:
@@ -4202,6 +4442,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="For non-contradictory reported-EIN cases unsafe for auto-keep, such as name disagreement or placeholder with unknown EIN")
     p.add_argument("--reported-ein-unverified-confidence", type=float, default=0.935,
                    help="Confidence assigned to auto-kept filing-supplied EINs not found in org_identity")
+    p.add_argument("--invalid-reported-ein-action", choices=["ollama", "human_review", "skip", "no_match"], default="ollama",
+                   help="For malformed/placeholder reported EINs with otherwise specific recipient names: default sends to model as if EIN were missing")
+    p.add_argument("--nonadjudicable-action", choices=["no_match", "human_review", "skip", "ollama"], default="no_match",
+                   help="For attachment/list/various-recipient rows: default stores NO_MATCH and skips Ollama")
+    p.add_argument("--no-nonadjudicable-recipient-triage", action="store_true",
+                   help="Disable pre-Ollama triage for See Attachment / Various / multi-recipient placeholder rows")
     p.set_defaults(func=cmd_adjudicate)
 
     p = sub.add_parser("backfill-ein-names", help="Incrementally fill blank resolved/selected org names from org_identity without rebuilding pipeline tables")
@@ -4243,6 +4489,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review",
                    help="For non-contradictory reported-EIN cases unsafe for auto-keep, such as name disagreement or placeholder with unknown EIN")
     p.add_argument("--unverified-confidence", type=float, default=0.935)
+    p.add_argument("--invalid-ein-action", choices=["ollama", "human_review", "skip", "no_match"], default="ollama",
+                   help="For malformed/placeholder reported EINs with otherwise specific recipient names")
+    p.add_argument("--placeholder-action", choices=["no_match", "human_review", "skip", "ollama"], default="no_match",
+                   help="For See Attachment / Various / multi-recipient placeholder rows")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--csv-out", default="reported_ein_triage.csv")
     p.add_argument("--commit-every", type=int, default=5000)
@@ -4268,6 +4518,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reported-ein-unverified-action", choices=["keep", "human_review", "skip", "ollama"], default="keep")
     p.add_argument("--reported-ein-unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review")
     p.add_argument("--reported-ein-unverified-confidence", type=float, default=0.935)
+    p.add_argument("--invalid-reported-ein-action", choices=["ollama", "human_review", "skip", "no_match"], default="ollama")
+    p.add_argument("--nonadjudicable-action", choices=["no_match", "human_review", "skip", "ollama"], default="no_match")
+    p.add_argument("--include-nonadjudicable-placeholders", action="store_true",
+                   help="Export See Attachment / Various / multi-recipient placeholder rows that are normally skipped")
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_export_adjudication_packets)
 
