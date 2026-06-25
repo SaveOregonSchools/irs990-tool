@@ -3567,6 +3567,61 @@ def reported_ein_shortcut_audit_row(
     ]
 
 
+def reported_ein_skip_audit_row(
+    sig: sqlite3.Row,
+    candidates: Sequence[sqlite3.Row],
+    skip_reason: str,
+) -> List[Any]:
+    """Build a wide CSV audit row for reported-EIN triage skips.
+
+    The normal reported-ein triage dry-run CSV only contains created decisions.
+    For diagnostics, this row keeps the same header shape but records a SKIP
+    row with the reason and signature evidence so skipped buckets can be
+    inspected without changing the database.
+    """
+    values = {h: "" for h in REPORTED_EIN_SHORTCUT_AUDIT_HEADERS}
+
+    def sigv(key: str, default: Any = "") -> Any:
+        return _sqlite_row_get(sig, key, default)
+
+    recip_name = clean_text(sigv("recipient_name"))
+    values.update({
+        "signature_hash": sigv("signature_hash"),
+        "shortcut_reason": skip_reason,
+        "decision": "SKIP",
+        "validation_status": "skipped",
+        "validation_error": skip_reason,
+        "reported_ein": sigv("reported_ein"),
+        "reported_ein_validity": reported_ein_validity_reason(sigv("reported_ein")),
+        "nonadjudicable_reason": recipient_name_nonadjudicable_reason(recip_name),
+        "recipient_name": recip_name,
+        "recipient_name_norm": sigv("recipient_name_norm"),
+        "recipient_street": sigv("street"),
+        "recipient_street_norm": sigv("street_norm"),
+        "recipient_city": sigv("city"),
+        "recipient_state": sigv("state"),
+        "recipient_zip5": sigv("zip5"),
+        "recipient_country": sigv("country"),
+        "grant_count": sigv("grant_count"),
+        "total_amount": sigv("total_amount"),
+        "sample_purpose": sigv("sample_purpose"),
+        "sample_grantor_ein": sigv("sample_grantor_ein"),
+        "sample_grantor_name": sigv("sample_grantor_name"),
+        "first_pass_statuses_json": sigv("first_pass_statuses_json"),
+        "first_pass_methods_json": sigv("first_pass_methods_json"),
+        "first_pass_warning_flags": sigv("first_pass_warning_flags"),
+        "first_pass_min_confidence": sigv("first_pass_min_confidence"),
+        "first_pass_avg_confidence": sigv("first_pass_avg_confidence"),
+        "first_pass_max_confidence": sigv("first_pass_max_confidence"),
+        "queued_reason": sigv("queued_reason"),
+        "signature_candidate_count": sigv("candidate_count"),
+        "ai_queue_status": sigv("ai_queue_status"),
+        "loaded_candidate_count": len(candidates),
+        "explanation": f"Reported-EIN triage did not create a decision: {skip_reason}",
+    })
+    return [values.get(h, "") for h in REPORTED_EIN_SHORTCUT_AUDIT_HEADERS]
+
+
 def cmd_reported_ein_shortcuts(args: argparse.Namespace) -> None:
     """Create auto-accepted KEEP_REPORTED_EIN decisions from org_identity, no Ollama calls."""
     conn = connect(args.db, readonly=False, exclusive=True)
@@ -3682,6 +3737,10 @@ def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
             processed += 1
             if row is None:
                 skips[reason] += 1
+                if writer is not None and getattr(args, "include_skips_in_dry_run", False):
+                    writer.writerow(reported_ein_skip_audit_row(sig, cands, reason))
+                    if processed % args.flush_every == 0:
+                        out_fh.flush()
             else:
                 created += 1
                 by_decision[row[1]] += 1
@@ -3706,6 +3765,10 @@ def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
     if by_decision:
         print("Created decision types:", flush=True)
         for k, v in by_decision.most_common():
+            print(f"  {k}: {v:,}", flush=True)
+    if skips:
+        print("Skipped reasons:", flush=True)
+        for k, v in skips.most_common():
             print(f"  {k}: {v:,}", flush=True)
 
 
@@ -5062,6 +5125,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="For See Attachment / Various / multi-recipient placeholder rows")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--csv-out", default="reported_ein_triage.csv")
+    p.add_argument("--include-skips-in-dry-run", action="store_true",
+                   help="When using --dry-run, also write skipped signatures to the CSV with decision=SKIP and validation_error set to the skip reason")
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--flush-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=50000)
