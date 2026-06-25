@@ -3691,6 +3691,379 @@ def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
         for k, v in skips.most_common():
             print(f"  {k}: {v:,}", flush=True)
 
+# ---------------------------------------------------------------------------
+# Candidate rule diagnostics and rule-based decisions
+# ---------------------------------------------------------------------------
+
+CANDIDATE_RULES_DEFAULT = "exact_name_zip,exact_name_city_state,exact_address_zip_good_name"
+CANDIDATE_RULES_ALL = {
+    "reported_ein_candidate",
+    "single_candidate_high_score",
+    "exact_address_zip_good_name",
+    "exact_name_zip",
+    "exact_name_city_state",
+    "clear_best_candidate",
+}
+
+
+def _fnum(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _i01(value: Any) -> int:
+    try:
+        return 1 if int(value or 0) != 0 else 0
+    except Exception:
+        return 0
+
+
+def parse_rule_list(text_value: str) -> set:
+    rules = {x.strip() for x in (text_value or "").split(",") if x.strip()}
+    unknown = rules - CANDIDATE_RULES_ALL
+    if unknown:
+        raise ValueError(f"Unknown candidate rule(s): {', '.join(sorted(unknown))}. Valid: {', '.join(sorted(CANDIDATE_RULES_ALL))}")
+    return rules
+
+
+def iter_candidate_rule_best_rows(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
+    clauses = []
+    params: List[Any] = []
+    if not getattr(args, "regenerate", False):
+        clauses.append(f"NOT EXISTS (SELECT 1 FROM {DECISION_TABLE} d WHERE d.signature_hash = s.signature_hash)")
+    if getattr(args, "state", None):
+        clauses.append("s.state = ?")
+        params.append(args.state.upper())
+    if getattr(args, "min_total_amount", None) is not None:
+        clauses.append("s.total_amount >= ?")
+        params.append(float(args.min_total_amount))
+    if getattr(args, "queue_status", None):
+        clauses.append("s.ai_queue_status = ?")
+        params.append(args.queue_status)
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    limit_sql = f"LIMIT {int(args.limit)}" if getattr(args, "limit", None) else ""
+    sql = f"""
+    WITH ranked AS (
+      SELECT
+        s.signature_hash,
+        s.reported_ein,
+        s.recipient_name,
+        s.recipient_name_norm,
+        s.street,
+        s.street_norm,
+        s.city,
+        s.state,
+        s.zip5,
+        s.country,
+        s.grant_count,
+        s.total_amount,
+        s.sample_purpose,
+        s.sample_grantor_ein,
+        s.sample_grantor_name,
+        s.first_pass_statuses_json,
+        s.first_pass_methods_json,
+        s.first_pass_warning_flags,
+        s.first_pass_min_confidence,
+        s.first_pass_avg_confidence,
+        s.first_pass_max_confidence,
+        s.queued_reason,
+        s.candidate_count AS signature_candidate_count,
+        s.ai_queue_status,
+        c.candidate_id,
+        c.ein AS candidate_ein,
+        c.candidate_name,
+        c.candidate_rank,
+        c.identity_id,
+        c.source AS candidate_source,
+        c.source_rank AS candidate_source_rank,
+        c.street AS candidate_street,
+        c.city AS candidate_city,
+        c.state AS candidate_state,
+        c.zip5 AS candidate_zip5,
+        c.candidate_score,
+        c.name_score,
+        c.address_score,
+        c.exact_name,
+        c.exact_address,
+        c.reported_ein_match,
+        c.zip_match,
+        c.city_state_match,
+        c.state_match,
+        c.candidate_reason,
+        ROW_NUMBER() OVER (
+          PARTITION BY s.signature_hash
+          ORDER BY c.candidate_score DESC, c.name_score DESC, c.address_score DESC, c.candidate_rank ASC
+        ) AS rn,
+        LEAD(c.candidate_score) OVER (
+          PARTITION BY s.signature_hash
+          ORDER BY c.candidate_score DESC, c.name_score DESC, c.address_score DESC, c.candidate_rank ASC
+        ) AS second_score,
+        COUNT(*) OVER (PARTITION BY s.signature_hash) AS candidate_count
+      FROM {SIG_TABLE} s
+      JOIN {CAND_TABLE} c
+        ON c.signature_hash = s.signature_hash
+      {where_sql}
+    )
+    SELECT *, ROUND(COALESCE(candidate_score,0) - COALESCE(second_score,0), 4) AS score_gap
+    FROM ranked
+    WHERE rn = 1
+    ORDER BY total_amount DESC, grant_count DESC, signature_hash
+    {limit_sql}
+    """
+    yield from conn.execute(sql, params)
+
+
+def classify_candidate_rule(row: sqlite3.Row, args: argparse.Namespace) -> Tuple[str, str, float]:
+    recip_name = clean_text(row["recipient_name"])
+    nonadj = recipient_name_nonadjudicable_reason(recip_name)
+    if nonadj and not getattr(args, "include_nonadjudicable_placeholders", False):
+        return "", f"nonadjudicable_recipient:{nonadj}", 0.0
+
+    reported_ok = usable_reported_ein(clean_text(row["reported_ein"]))
+    if reported_ok and not getattr(args, "include_reported_ein", False):
+        return "", "reported_ein_present_excluded", 0.0
+
+    flags = clean_text(row["first_pass_warning_flags"]).lower()
+    statuses = clean_text(row["first_pass_statuses_json"]).lower()
+    if not getattr(args, "include_contradictions", False):
+        contradiction_markers = [
+            "possible_bad_ein",
+            "conflicting_ein",
+            "reported_ein_points_to",
+            "reported_ein_and_name_match_different_known_eins",
+        ]
+        if any(m in flags or m in statuses for m in contradiction_markers):
+            return "", "contradiction_flagged", 0.0
+
+    cscore = _fnum(row["candidate_score"])
+    nscore = _fnum(row["name_score"])
+    gap = _fnum(row["score_gap"], cscore)
+    count = int(row["candidate_count"] or 0)
+    exact_name = _i01(row["exact_name"])
+    exact_address = _i01(row["exact_address"])
+    reported_match = _i01(row["reported_ein_match"])
+    zip_match = _i01(row["zip_match"])
+    city_state = _i01(row["city_state_match"])
+
+    if reported_match and cscore >= float(args.reported_ein_candidate_min_score):
+        return "reported_ein_candidate", "", float(args.reported_ein_candidate_confidence)
+
+    if count == 1 and cscore >= float(args.single_candidate_min_score):
+        if exact_name or (exact_address and zip_match and nscore >= float(args.address_rule_min_name_score)) or nscore >= float(args.single_candidate_min_name_score):
+            return "single_candidate_high_score", "", float(args.single_candidate_confidence)
+
+    if exact_name and zip_match and cscore >= float(args.exact_name_zip_min_score):
+        if count == 1 or gap >= float(args.exact_name_zip_min_gap):
+            return "exact_name_zip", "", float(args.exact_name_zip_confidence)
+        return "", "exact_name_zip_gap_too_small", 0.0
+
+    if exact_name and city_state and cscore >= float(args.exact_name_city_state_min_score):
+        if count == 1 or gap >= float(args.exact_name_city_state_min_gap):
+            return "exact_name_city_state", "", float(args.exact_name_city_state_confidence)
+        return "", "exact_name_city_state_gap_too_small", 0.0
+
+    if exact_address and zip_match and nscore >= float(args.address_rule_min_name_score) and cscore >= float(args.address_rule_min_score):
+        if count == 1 or gap >= float(args.address_rule_min_gap):
+            return "exact_address_zip_good_name", "", float(args.address_rule_confidence)
+        return "", "exact_address_zip_gap_too_small", 0.0
+
+    if cscore >= float(args.clear_best_min_score) and gap >= float(args.clear_best_min_gap):
+        if nscore >= float(args.clear_best_min_name_score) or exact_name or (exact_address and zip_match):
+            return "clear_best_candidate", "", float(args.clear_best_confidence)
+
+    return "needs_ai_or_review", "", 0.0
+
+
+def candidate_rule_output(row: sqlite3.Row, bucket: str, confidence: float) -> Dict[str, Any]:
+    cscore = _fnum(row["candidate_score"])
+    gap = _fnum(row["score_gap"], cscore)
+    reason_codes = ["candidate_rule_decision", bucket]
+    if _i01(row["exact_name"]): reason_codes.append("exact_name")
+    if _i01(row["exact_address"]): reason_codes.append("exact_address")
+    if _i01(row["zip_match"]): reason_codes.append("zip_match")
+    if _i01(row["city_state_match"]): reason_codes.append("city_state_match")
+    if _i01(row["reported_ein_match"]): reason_codes.append("reported_ein_match")
+    if int(row["candidate_count"] or 0) == 1: reason_codes.append("single_candidate")
+    if gap: reason_codes.append("score_gap_" + str(round(gap, 2)))
+    explanation = (
+        f"Rule {bucket} selected candidate {row['candidate_id']} / EIN {row['candidate_ein']} "
+        f"({clean_text(row['candidate_name'])}) for recipient {clean_text(row['recipient_name'])}. "
+        f"candidate_score={round(cscore, 4)}, name_score={round(_fnum(row['name_score']), 4)}, "
+        f"address_score={round(_fnum(row['address_score']), 4)}, score_gap={round(gap, 4)}, "
+        f"candidate_count={int(row['candidate_count'] or 0)}."
+    )
+    return {
+        "decision": "SELECT_CANDIDATE",
+        "candidate_id": clean_text(row["candidate_id"]),
+        "confidence": round(confidence, 4),
+        "confidence_label": "high" if confidence >= 0.92 else "medium",
+        "reason_codes": reason_codes,
+        "explanation": explanation,
+        "needs_human_review": False,
+    }
+
+
+def candidate_rule_input_obj(row: sqlite3.Row, bucket: str, skip_reason: str = "") -> Dict[str, Any]:
+    return {
+        "task": "rule_based_candidate_decision",
+        "signature_hash": row["signature_hash"],
+        "rule_bucket": bucket,
+        "skip_reason": skip_reason,
+        "recipient_signature": {
+            "reported_ein": clean_text(row["reported_ein"]),
+            "recipient_name": clean_text(row["recipient_name"]),
+            "street": clean_text(row["street"]),
+            "city": clean_text(row["city"]),
+            "state": clean_text(row["state"]),
+            "zip5": clean_text(row["zip5"]),
+            "grant_count": int(row["grant_count"] or 0),
+            "total_amount": _fnum(row["total_amount"]),
+            "first_pass_statuses_json": clean_text(row["first_pass_statuses_json"]),
+            "first_pass_warning_flags": clean_text(row["first_pass_warning_flags"]),
+        },
+        "best_candidate": {
+            "candidate_id": clean_text(row["candidate_id"]),
+            "ein": clean_text(row["candidate_ein"]),
+            "candidate_name": clean_text(row["candidate_name"]),
+            "candidate_score": _fnum(row["candidate_score"]),
+            "name_score": _fnum(row["name_score"]),
+            "address_score": _fnum(row["address_score"]),
+            "exact_name": bool(_i01(row["exact_name"])),
+            "exact_address": bool(_i01(row["exact_address"])),
+            "reported_ein_match": bool(_i01(row["reported_ein_match"])),
+            "zip_match": bool(_i01(row["zip_match"])),
+            "city_state_match": bool(_i01(row["city_state_match"])),
+            "candidate_reason": clean_text(row["candidate_reason"]),
+            "candidate_count": int(row["candidate_count"] or 0),
+            "second_score": _fnum(row["second_score"], 0.0),
+            "score_gap": _fnum(row["score_gap"], 0.0),
+        },
+    }
+
+
+CANDIDATE_RULE_AUDIT_HEADERS = [
+    "signature_hash", "action", "rule_bucket", "skip_reason", "decision", "selected_candidate_id",
+    "selected_ein", "selected_name", "confidence", "auto_accept", "validation_status", "validation_error",
+    "reported_ein", "reported_ein_validity", "nonadjudicable_reason", "recipient_name", "city", "state", "zip5",
+    "grant_count", "total_amount", "first_pass_statuses_json", "first_pass_warning_flags", "candidate_count",
+    "candidate_id", "candidate_ein", "candidate_name", "candidate_rank", "candidate_score", "second_score", "score_gap",
+    "name_score", "address_score", "exact_name", "exact_address", "reported_ein_match", "zip_match",
+    "city_state_match", "state_match", "candidate_reason", "output_json",
+]
+
+
+def candidate_rule_audit_row(row: sqlite3.Row, action: str, bucket: str, skip_reason: str, output: Optional[Dict[str, Any]], validation: Optional[Dict[str, Any]]) -> List[Any]:
+    validation = validation or {}
+    output = output or {}
+    return [
+        row["signature_hash"], action, bucket, skip_reason, clean_text(output.get("decision")),
+        validation.get("selected_candidate_id", ""), validation.get("selected_ein", ""), validation.get("selected_name", ""),
+        validation.get("confidence", ""), validation.get("auto_accept", ""), validation.get("validation_status", ""), validation.get("validation_error", ""),
+        clean_text(row["reported_ein"]), reported_ein_validity_reason(row["reported_ein"]), recipient_name_nonadjudicable_reason(row["recipient_name"]),
+        clean_text(row["recipient_name"]), clean_text(row["city"]), clean_text(row["state"]), clean_text(row["zip5"]),
+        int(row["grant_count"] or 0), _fnum(row["total_amount"]), clean_text(row["first_pass_statuses_json"]), clean_text(row["first_pass_warning_flags"]), int(row["candidate_count"] or 0),
+        clean_text(row["candidate_id"]), clean_text(row["candidate_ein"]), clean_text(row["candidate_name"]), int(row["candidate_rank"] or 0),
+        _fnum(row["candidate_score"]), _fnum(row["second_score"], 0.0), _fnum(row["score_gap"], 0.0), _fnum(row["name_score"]), _fnum(row["address_score"]),
+        _i01(row["exact_name"]), _i01(row["exact_address"]), _i01(row["reported_ein_match"]), _i01(row["zip_match"]), _i01(row["city_state_match"]), _i01(row["state_match"]),
+        clean_text(row["candidate_reason"]), json.dumps(output, ensure_ascii=False, sort_keys=True) if output else "",
+    ]
+
+
+def cmd_candidate_rule_diagnostics(args: argparse.Namespace) -> None:
+    conn = connect(args.db, readonly=True)
+    if not table_exists(conn, SIG_TABLE) or not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE} or {CAND_TABLE}. Run build-signatures and generate-candidates first.")
+    rules = parse_rule_list(args.rules) if args.rules else CANDIDATE_RULES_ALL
+    counts: Counter = Counter(); grants: Counter = Counter(); amounts: Dict[str, float] = defaultdict(float)
+    detail_fh = None; detail_writer = None
+    if args.csv_out:
+        detail_fh = open(args.csv_out, "w", newline="", encoding="utf-8-sig")
+        detail_writer = csv.writer(detail_fh); detail_writer.writerow(CANDIDATE_RULE_AUDIT_HEADERS)
+    processed = 0
+    for row in iter_candidate_rule_best_rows(conn, args):
+        processed += 1
+        bucket, skip_reason, conf = classify_candidate_rule(row, args)
+        if bucket and bucket in rules and not skip_reason:
+            label = bucket; action = "would_decide"
+        elif bucket and bucket not in rules:
+            label = "rule_not_selected:" + bucket; action = "skip"
+        elif skip_reason:
+            label = "skip:" + skip_reason; action = "skip"
+        else:
+            label = "needs_ai_or_review"; action = "skip"
+        counts[label] += 1; grants[label] += int(row["grant_count"] or 0); amounts[label] += _fnum(row["total_amount"])
+        if detail_writer and (args.include_skipped or action == "would_decide"):
+            output = candidate_rule_output(row, bucket, conf) if action == "would_decide" else {}
+            detail_writer.writerow(candidate_rule_audit_row(row, action, bucket, skip_reason, output, None))
+        if args.progress_every and processed % args.progress_every == 0:
+            print(f"Scanned {processed:,} signatures...", flush=True)
+    if detail_fh: detail_fh.close()
+    rows = [[label, n, grants[label], round(amounts[label], 2)] for label, n in counts.most_common()]
+    if args.summary_csv:
+        with open(args.summary_csv, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh); w.writerow(["bucket_or_skip_reason", "signatures", "grants_represented", "total_amount"]); w.writerows(rows)
+    print("Candidate rule diagnostics:", flush=True)
+    for label, n, g, a in rows[:args.top_n]:
+        print(f"  {label}: {n:,} signatures; {g:,} grants; ${a:,.2f}", flush=True)
+    print(f"Scanned {processed:,} best-candidate signatures.", flush=True)
+
+
+def cmd_candidate_rule_decisions(args: argparse.Namespace) -> None:
+    conn = connect(args.db, readonly=False, exclusive=True)
+    if not table_exists(conn, SIG_TABLE) or not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE} or {CAND_TABLE}. Run build-signatures and generate-candidates first.")
+    create_decision_schema(conn, full_refresh=False)
+    rules = parse_rule_list(args.rules)
+    out_fh = None; writer = None
+    if args.dry_run:
+        out_fh = open(args.csv_out, "w", newline="", encoding="utf-8-sig")
+        writer = csv.writer(out_fh); writer.writerow(CANDIDATE_RULE_AUDIT_HEADERS)
+        print(f"Dry run enabled; writing candidate-rule audit CSV to {args.csv_out}", flush=True)
+    model_args = argparse.Namespace(model="rule:candidate_evidence", num_ctx=0, num_predict=0, think=False)
+    scanned = created = skipped = invalid = batch = 0
+    skip_counts: Counter = Counter(); bucket_counts: Counter = Counter(); started = time.time()
+    for row in iter_candidate_rule_best_rows(conn, args):
+        scanned += 1
+        bucket, skip_reason, confidence = classify_candidate_rule(row, args)
+        if bucket not in rules:
+            skip_reason = skip_reason or ("rule_not_selected:" + (bucket or "needs_ai_or_review"))
+        if skip_reason:
+            skipped += 1; skip_counts[skip_reason] += 1
+            if writer and args.include_skipped: writer.writerow(candidate_rule_audit_row(row, "skip", bucket, skip_reason, None, None))
+            continue
+        cands = candidates_for_signature(conn, row["signature_hash"], args.max_candidates)
+        output = candidate_rule_output(row, bucket, confidence)
+        validation = validate_ai_output(output, cands, row, args.auto_accept_threshold)
+        if validation["validation_status"] != "ok" or validation["auto_accept"] != 1:
+            invalid += 1; skip_counts["validation_not_auto_accept:" + validation.get("validation_error", "")] += 1
+            if writer: writer.writerow(candidate_rule_audit_row(row, "validation_skip", bucket, "validation_not_auto_accept", output, validation))
+            continue
+        input_obj = candidate_rule_input_obj(row, bucket)
+        decision_tuple = decision_row_tuple(row["signature_hash"], input_obj, cands, output, validation, model_args)
+        if writer: writer.writerow(candidate_rule_audit_row(row, "create", bucket, "", output, validation))
+        if not args.dry_run:
+            insert_decision(conn, decision_tuple); batch += 1
+            if batch >= args.commit_every:
+                conn.commit(); batch = 0
+        created += 1; bucket_counts[bucket] += 1
+        if args.flush_every and out_fh and created % args.flush_every == 0: out_fh.flush()
+        if args.progress_every and scanned % args.progress_every == 0:
+            elapsed = max(1.0, time.time() - started)
+            print(f"Candidate-rule decisions scanned {scanned:,}; created {created:,}; skipped {skipped:,}; {scanned/elapsed:,.0f}/sec", flush=True)
+    if not args.dry_run: conn.commit()
+    if out_fh: out_fh.close()
+    print(f"Candidate-rule decision pass complete: scanned {scanned:,}; created {created:,}; skipped {skipped:,}; validation_skipped {invalid:,}", flush=True)
+    if bucket_counts:
+        print("Created by rule:", flush=True)
+        for k, v in bucket_counts.most_common(): print(f"  {k}: {v:,}", flush=True)
+    if skip_counts:
+        print("Skipped reasons:", flush=True)
+        for k, v in skip_counts.most_common(25): print(f"  {k}: {v:,}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Apply decisions / final view
@@ -4537,6 +4910,83 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decisions)
+
+    p = sub.add_parser("candidate-rule-diagnostics", help="Summarize remaining candidate sets and show which can be resolved by deterministic candidate rules")
+    add_common_db(p)
+    p.add_argument("--regenerate", action="store_true", help="Include signatures that already have a decision")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--queue-status", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--rules", default=",".join(sorted(CANDIDATE_RULES_ALL)), help="Comma-separated rule buckets to consider selected")
+    p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them because reported-EIN triage handles those")
+    p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
+    p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
+    p.add_argument("--csv-out", default=None, help="Optional row-level CSV. By default includes only would-decide rows unless --include-skipped is set")
+    p.add_argument("--summary-csv", default="candidate_rule_diagnostics_summary.csv")
+    p.add_argument("--include-skipped", action="store_true")
+    p.add_argument("--top-n", type=int, default=50)
+    p.add_argument("--progress-every", type=int, default=100000)
+    p.add_argument("--reported-ein-candidate-min-score", type=float, default=120.0)
+    p.add_argument("--reported-ein-candidate-confidence", type=float, default=0.965)
+    p.add_argument("--single-candidate-min-score", type=float, default=98.0)
+    p.add_argument("--single-candidate-min-name-score", type=float, default=0.82)
+    p.add_argument("--single-candidate-confidence", type=float, default=0.955)
+    p.add_argument("--exact-name-zip-min-score", type=float, default=92.0)
+    p.add_argument("--exact-name-zip-min-gap", type=float, default=2.0)
+    p.add_argument("--exact-name-zip-confidence", type=float, default=0.975)
+    p.add_argument("--exact-name-city-state-min-score", type=float, default=90.0)
+    p.add_argument("--exact-name-city-state-min-gap", type=float, default=5.0)
+    p.add_argument("--exact-name-city-state-confidence", type=float, default=0.955)
+    p.add_argument("--address-rule-min-score", type=float, default=92.0)
+    p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
+    p.add_argument("--address-rule-min-gap", type=float, default=5.0)
+    p.add_argument("--address-rule-confidence", type=float, default=0.955)
+    p.add_argument("--clear-best-min-score", type=float, default=100.0)
+    p.add_argument("--clear-best-min-gap", type=float, default=25.0)
+    p.add_argument("--clear-best-min-name-score", type=float, default=0.80)
+    p.add_argument("--clear-best-confidence", type=float, default=0.935)
+    p.set_defaults(func=cmd_candidate_rule_diagnostics)
+
+    p = sub.add_parser("candidate-rule-decisions", help="Create rule-based SELECT_CANDIDATE decisions from high-confidence candidate evidence, without Ollama")
+    add_common_db(p)
+    p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for eligible signatures")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--queue-status", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Conservative default excludes single-candidate and reported-EIN buckets")
+    p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them")
+    p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
+    p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
+    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--csv-out", default="candidate_rule_decisions.csv")
+    p.add_argument("--include-skipped", action="store_true")
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--flush-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=50000)
+    p.add_argument("--reported-ein-candidate-min-score", type=float, default=120.0)
+    p.add_argument("--reported-ein-candidate-confidence", type=float, default=0.965)
+    p.add_argument("--single-candidate-min-score", type=float, default=98.0)
+    p.add_argument("--single-candidate-min-name-score", type=float, default=0.82)
+    p.add_argument("--single-candidate-confidence", type=float, default=0.955)
+    p.add_argument("--exact-name-zip-min-score", type=float, default=92.0)
+    p.add_argument("--exact-name-zip-min-gap", type=float, default=2.0)
+    p.add_argument("--exact-name-zip-confidence", type=float, default=0.975)
+    p.add_argument("--exact-name-city-state-min-score", type=float, default=90.0)
+    p.add_argument("--exact-name-city-state-min-gap", type=float, default=5.0)
+    p.add_argument("--exact-name-city-state-confidence", type=float, default=0.955)
+    p.add_argument("--address-rule-min-score", type=float, default=92.0)
+    p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
+    p.add_argument("--address-rule-min-gap", type=float, default=5.0)
+    p.add_argument("--address-rule-confidence", type=float, default=0.955)
+    p.add_argument("--clear-best-min-score", type=float, default=100.0)
+    p.add_argument("--clear-best-min-gap", type=float, default=25.0)
+    p.add_argument("--clear-best-min-name-score", type=float, default=0.80)
+    p.add_argument("--clear-best-confidence", type=float, default=0.935)
+    p.set_defaults(func=cmd_candidate_rule_decisions)
 
     p = sub.add_parser("apply-decisions", help="Apply auto-accepted AI decisions to separate table and final view")
     add_common_db(p)
