@@ -3864,6 +3864,8 @@ CANDIDATE_RULES_ALL = {
     "exact_name_zip",
     "exact_name_city_state",
     "exact_name_state_only",
+    "all_candidates_same_ein_high_score",
+    "all_candidates_same_ein_strong_evidence",
     "clear_best_candidate",
 }
 
@@ -4039,6 +4041,23 @@ def classify_candidate_rule(row: sqlite3.Row, args: argparse.Namespace) -> Tuple
                 if count == 1 or gap >= float(args.exact_name_state_min_gap):
                     return "exact_name_state_only", "", float(args.exact_name_state_confidence)
                 return "", "exact_name_state_gap_too_small", 0.0
+
+    # v1.20: after safer exact/address/single-candidate rules have been applied,
+    # a large remaining bucket has exactly one candidate EIN, exact normalized
+    # recipient-name agreement, and at least one geography/address signal. The
+    # candidate_score can be modest because address fields are missing or stale,
+    # but exact name + geography is strong enough to handle deterministically.
+    if count == 1 and exact_name and _i01(row["state_match"]):
+        if (zip_match or city_state or exact_address):
+            if cscore >= float(args.same_ein_strong_min_score) and nscore >= float(args.same_ein_strong_min_name_score):
+                return "all_candidates_same_ein_strong_evidence", "", float(args.same_ein_strong_confidence)
+
+    # v1.20: tiny leftover bucket of one-candidate high-score rows that were
+    # previously skipped mostly because placeholder detection was too broad
+    # around legitimate names containing MULTIPLE.
+    if count == 1 and cscore >= float(args.same_ein_high_min_score):
+        if nscore >= float(args.same_ein_high_min_name_score) and (zip_match or city_state or exact_address or _i01(row["state_match"])):
+            return "all_candidates_same_ein_high_score", "", float(args.same_ein_high_confidence)
 
     if exact_address and zip_match and nscore >= float(args.address_rule_min_name_score) and cscore >= float(args.address_rule_min_score):
         if count == 1 or gap >= float(args.address_rule_min_gap):
@@ -5138,6 +5157,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exact-name-state-confidence", type=float, default=0.94)
     p.add_argument("--exact-name-state-no-require-address", dest="exact_name_state_require_address", action="store_false", help="Allow exact-name+state matches even without exact street-address evidence. Default requires exact_address=1.")
     p.set_defaults(exact_name_state_require_address=True)
+    p.add_argument("--same-ein-strong-min-score", type=float, default=63.0, help="v1.20 all_candidates_same_ein_strong_evidence: minimum candidate score when exact_name + same-state + geo/address signal exist")
+    p.add_argument("--same-ein-strong-min-name-score", type=float, default=0.98)
+    p.add_argument("--same-ein-strong-confidence", type=float, default=0.94)
+    p.add_argument("--same-ein-high-min-score", type=float, default=95.0)
+    p.add_argument("--same-ein-high-min-name-score", type=float, default=0.80)
+    p.add_argument("--same-ein-high-confidence", type=float, default=0.955)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
@@ -5183,6 +5208,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exact-name-state-confidence", type=float, default=0.94)
     p.add_argument("--exact-name-state-no-require-address", dest="exact_name_state_require_address", action="store_false", help="Allow exact-name+state matches even without exact street-address evidence. Default requires exact_address=1.")
     p.set_defaults(exact_name_state_require_address=True)
+    p.add_argument("--same-ein-strong-min-score", type=float, default=63.0, help="v1.20 all_candidates_same_ein_strong_evidence: minimum candidate score when exact_name + same-state + geo/address signal exist")
+    p.add_argument("--same-ein-strong-min-name-score", type=float, default=0.98)
+    p.add_argument("--same-ein-strong-confidence", type=float, default=0.94)
+    p.add_argument("--same-ein-high-min-score", type=float, default=95.0)
+    p.add_argument("--same-ein-high-min-name-score", type=float, default=0.80)
+    p.add_argument("--same-ein-high-confidence", type=float, default=0.955)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
