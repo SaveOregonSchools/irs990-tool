@@ -3691,6 +3691,151 @@ def cmd_reported_ein_triage(args: argparse.Namespace) -> None:
         print("Created decision types:", flush=True)
         for k, v in by_decision.most_common():
             print(f"  {k}: {v:,}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Nonadjudicable recipient cleanup
+# ---------------------------------------------------------------------------
+
+NONADJ_AUDIT_HEADERS = [
+    "signature_hash", "action", "nonadjudicable_reason", "decision", "confidence",
+    "auto_accept", "validation_status", "recipient_name", "reported_ein",
+    "city", "state", "zip5", "grant_count", "total_amount", "sample_purpose",
+    "first_pass_statuses_json", "first_pass_warning_flags", "candidate_count",
+]
+
+
+def nonadjudicable_audit_row(sig: sqlite3.Row, action: str, reason: str, row: Optional[Tuple[Any, ...]] = None) -> List[Any]:
+    return [
+        sig["signature_hash"],
+        action,
+        reason,
+        row[1] if row else "",
+        row[5] if row else "",
+        row[10] if row else "",
+        row[11] if row else "",
+        clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else ""),
+        clean_text(sig["reported_ein"] if "reported_ein" in sig.keys() else ""),
+        clean_text(sig["city"] if "city" in sig.keys() else ""),
+        clean_text(sig["state"] if "state" in sig.keys() else ""),
+        clean_text(sig["zip5"] if "zip5" in sig.keys() else ""),
+        int(sig["grant_count"] or 0),
+        _fnum(sig["total_amount"]),
+        clean_text(sig["sample_purpose"] if "sample_purpose" in sig.keys() else ""),
+        clean_text(sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else ""),
+        clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else ""),
+        int(sig["candidate_count"] or 0) if "candidate_count" in sig.keys() else 0,
+    ]
+
+
+def iter_nonadjudicable_signatures(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
+    clauses = [f"EXISTS (SELECT 1 FROM {CAND_TABLE} c WHERE c.signature_hash = s.signature_hash)"]
+    params: List[Any] = []
+    if not args.regenerate and table_exists(conn, DECISION_TABLE):
+        clauses.append(f"NOT EXISTS (SELECT 1 FROM {DECISION_TABLE} d WHERE d.signature_hash = s.signature_hash)")
+    if args.state:
+        clauses.append("s.state=?")
+        params.append(args.state.upper())
+    if args.min_total_amount is not None:
+        clauses.append("s.total_amount >= ?")
+        params.append(float(args.min_total_amount))
+    if args.queue_status:
+        clauses.append("s.ai_queue_status=?")
+        params.append(args.queue_status)
+    where = "WHERE " + " AND ".join(clauses)
+    limit = f"LIMIT {int(args.limit)}" if args.limit else ""
+    sql = f"""
+    SELECT s.*
+    FROM {SIG_TABLE} s
+    {where}
+    ORDER BY s.total_amount DESC, s.grant_count DESC, s.signature_hash
+    {limit}
+    """
+    yield from conn.execute(sql, params)
+
+
+def cmd_nonadjudicable_recipient_triage(args: argparse.Namespace) -> None:
+    """Create no-AI decisions for attachment/list/placeholder recipient signatures.
+
+    These records are not good AI adjudication targets because the grant row does not
+    identify one specific recipient organization.  The default decision is NO_MATCH
+    with auto_accept=0, which removes the signature from the Ollama queue but does
+    not add a resolved EIN.
+    """
+    conn = connect(args.db, readonly=False, exclusive=True)
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+    if not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {CAND_TABLE}. Run generate-candidates first.")
+    create_decision_schema(conn, full_refresh=False)
+
+    out_fh = None
+    writer = None
+    if args.dry_run:
+        out_path = Path(args.csv_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_fh = out_path.open("w", newline="", encoding="utf-8-sig")
+        writer = csv.writer(out_fh)
+        writer.writerow(NONADJ_AUDIT_HEADERS)
+        print(f"Dry run enabled; writing nonadjudicable-recipient CSV to {out_path}", flush=True)
+
+    processed = created = skipped = batch = 0
+    reason_counts: Counter = Counter()
+    skipped_reasons: Counter = Counter()
+    started = time.time()
+    try:
+        for sig in iter_nonadjudicable_signatures(conn, args):
+            processed += 1
+            recip_name = clean_text(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+            reason = recipient_name_nonadjudicable_reason(recip_name)
+            if not reason:
+                skipped += 1
+                skipped_reasons["recipient_specific_or_not_placeholder"] += 1
+                continue
+            if reason == "blank_recipient_name" and not args.include_blank_recipient_name:
+                skipped += 1
+                skipped_reasons["blank_recipient_name_excluded"] += 1
+                continue
+            cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
+            row, _shortcut_reason = nonadjudicable_recipient_decision_row(
+                sig,
+                cands,
+                reason=reason,
+                action=args.action,
+            )
+            if row is None:
+                skipped += 1
+                skipped_reasons[f"action_{args.action}_returned_no_decision"] += 1
+                continue
+            created += 1
+            reason_counts[reason] += 1
+            if writer is not None:
+                writer.writerow(nonadjudicable_audit_row(sig, "create", reason, row))
+                if created % args.flush_every == 0:
+                    out_fh.flush()
+            else:
+                insert_decision(conn, row)
+                batch += 1
+                if batch >= args.commit_every:
+                    conn.commit(); batch = 0
+            if args.progress_every and processed % args.progress_every == 0:
+                elapsed = max(1.0, time.time() - started)
+                print(f"Nonadjudicable triage scanned {processed:,}; created {created:,}; skipped {skipped:,}; {processed/elapsed:,.0f}/sec", flush=True)
+        if writer is None:
+            conn.commit()
+    finally:
+        if out_fh is not None:
+            out_fh.flush(); out_fh.close()
+    print(f"Nonadjudicable-recipient triage complete: scanned {processed:,}; created {created:,}; skipped {skipped:,}", flush=True)
+    if reason_counts:
+        print("Created by reason:", flush=True)
+        for k, v in reason_counts.most_common():
+            print(f"  {k}: {v:,}", flush=True)
+    if skipped_reasons:
+        print("Skipped reasons:", flush=True)
+        for k, v in skipped_reasons.most_common(25):
+            print(f"  {k}: {v:,}", flush=True)
+
     if skips:
         print("Skipped reasons:", flush=True)
         for k, v in skips.most_common():
@@ -4929,6 +5074,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decisions)
+
+
+    p = sub.add_parser("nonadjudicable-recipient-triage", help="Create no-AI NO_MATCH/HUMAN_REVIEW decisions for See Attachment / Various / placeholder recipient signatures")
+    add_common_db(p)
+    p.add_argument("--regenerate", action="store_true", help="Overwrite/include signatures that already have a decision")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--queue-status", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--action", choices=["no_match", "human_review", "skip", "ollama"], default="no_match",
+                   help="Default no_match stores a no-AI NO_MATCH decision with auto_accept=0; use human_review to park them instead")
+    p.add_argument("--include-blank-recipient-name", action="store_true",
+                   help="Also create decisions for blank recipient-name signatures. Default skips blank names so you can inspect them separately.")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--csv-out", default="nonadjudicable_recipient_triage.csv")
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--flush-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=50000)
+    p.set_defaults(func=cmd_nonadjudicable_recipient_triage)
 
     p = sub.add_parser("candidate-rule-diagnostics", help="Summarize remaining candidate sets and show which can be resolved by deterministic candidate rules")
     add_common_db(p)
