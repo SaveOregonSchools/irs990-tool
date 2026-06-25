@@ -2700,10 +2700,15 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
     needs_review = bool(output.get("needs_human_review", True))
     auto_accept = 0
     if validation_status == "ok" and selected is not None and decision in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"}:
+        # Strong deterministic evidence that is safe enough for auto-accept.
+        # v1.16 adds exact-name + exact-street + same-state as a strong signal,
+        # covering the exact_name_state_only candidate-rule bucket where ZIP/city
+        # may be missing or inconsistent but name/street/state all agree.
         strong_signal = bool(
             selected["reported_ein_match"]
             or (selected["exact_name"] and (selected["zip_match"] or selected["city_state_match"]))
             or (selected["exact_address"] and selected["zip_match"] and float(selected["name_score"] or 0) >= 0.72)
+            or (selected["exact_name"] and selected["exact_address"] and selected["state_match"] and float(selected["candidate_score"] or 0) >= 87)
             or float(selected["candidate_score"] or 0) >= 92
         )
         if confidence_f >= auto_accept_threshold and strong_signal and not needs_review:
@@ -3702,6 +3707,7 @@ CANDIDATE_RULES_ALL = {
     "exact_address_zip_good_name",
     "exact_name_zip",
     "exact_name_city_state",
+    "exact_name_state_only",
     "clear_best_candidate",
 }
 
@@ -3866,6 +3872,18 @@ def classify_candidate_rule(row: sqlite3.Row, args: argparse.Namespace) -> Tuple
             return "exact_name_city_state", "", float(args.exact_name_city_state_confidence)
         return "", "exact_name_city_state_gap_too_small", 0.0
 
+    # v1.15: exact normalized name + exact street address + same state,
+    # but no ZIP/city-state match. This catches cases where the grant row
+    # has a bad/missing ZIP or a misspelled city, while the name/street/state
+    # evidence is strong. We require exact_address by default to keep this
+    # rule conservative.
+    if exact_name and _i01(row["state_match"]) and not zip_match and not city_state:
+        if (not getattr(args, "exact_name_state_require_address", True)) or exact_address:
+            if cscore >= float(args.exact_name_state_min_score):
+                if count == 1 or gap >= float(args.exact_name_state_min_gap):
+                    return "exact_name_state_only", "", float(args.exact_name_state_confidence)
+                return "", "exact_name_state_gap_too_small", 0.0
+
     if exact_address and zip_match and nscore >= float(args.address_rule_min_name_score) and cscore >= float(args.address_rule_min_score):
         if count == 1 or gap >= float(args.address_rule_min_gap):
             return "exact_address_zip_good_name", "", float(args.address_rule_confidence)
@@ -3886,6 +3904,7 @@ def candidate_rule_output(row: sqlite3.Row, bucket: str, confidence: float) -> D
     if _i01(row["exact_address"]): reason_codes.append("exact_address")
     if _i01(row["zip_match"]): reason_codes.append("zip_match")
     if _i01(row["city_state_match"]): reason_codes.append("city_state_match")
+    if _i01(row["state_match"]): reason_codes.append("state_match")
     if _i01(row["reported_ein_match"]): reason_codes.append("reported_ein_match")
     if int(row["candidate_count"] or 0) == 1: reason_codes.append("single_candidate")
     if gap: reason_codes.append("score_gap_" + str(round(gap, 2)))
@@ -4938,6 +4957,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exact-name-city-state-min-score", type=float, default=90.0)
     p.add_argument("--exact-name-city-state-min-gap", type=float, default=5.0)
     p.add_argument("--exact-name-city-state-confidence", type=float, default=0.955)
+    p.add_argument("--exact-name-state-min-score", type=float, default=87.0)
+    p.add_argument("--exact-name-state-min-gap", type=float, default=10.0)
+    p.add_argument("--exact-name-state-confidence", type=float, default=0.94)
+    p.add_argument("--exact-name-state-no-require-address", dest="exact_name_state_require_address", action="store_false", help="Allow exact-name+state matches even without exact street-address evidence. Default requires exact_address=1.")
+    p.set_defaults(exact_name_state_require_address=True)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
@@ -4978,6 +5002,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exact-name-city-state-min-score", type=float, default=90.0)
     p.add_argument("--exact-name-city-state-min-gap", type=float, default=5.0)
     p.add_argument("--exact-name-city-state-confidence", type=float, default=0.955)
+    p.add_argument("--exact-name-state-min-score", type=float, default=87.0)
+    p.add_argument("--exact-name-state-min-gap", type=float, default=10.0)
+    p.add_argument("--exact-name-state-confidence", type=float, default=0.94)
+    p.add_argument("--exact-name-state-no-require-address", dest="exact_name_state_require_address", action="store_false", help="Allow exact-name+state matches even without exact street-address evidence. Default requires exact_address=1.")
+    p.set_defaults(exact_name_state_require_address=True)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
