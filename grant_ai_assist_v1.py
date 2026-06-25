@@ -274,6 +274,19 @@ def clean_text(value: Optional[Any]) -> str:
 # may be interesting someday by reading attachments, but they are poor targets
 # for automated EIN adjudication because the correct recipients are not present
 # in the row itself.
+#
+# IMPORTANT: do not flag broad words like VARIOUS/MULTIPLE/NUMEROUS by
+# themselves when they occur inside a specific legal name.  Examples that should
+# stay adjudicable: NATIONAL MULTIPLE SCLEROSIS SOCIETY, MULTIPLE MYELOMA
+# RESEARCH FOUNDATION, VARIOUS SMALL FIRES FOUNDATION.  We only flag these
+# words when they clearly describe a bucket/list of recipients.
+_NON_SPECIFIC_RECIPIENT_NOUNS = (
+    r"ORGANIZATIONS|ORGS|CHARITIES|RECIPIENTS|GRANTEES|BENEFICIARIES|"
+    r"DONEES|NONPROFITS|NON\s+PROFITS|FOUNDATIONS|SCHOOLS|CHURCHES|"
+    r"FOOD\s+BANKS|AGENCIES|ENTITIES|DISTRIBUTIONS|GRANTS|"
+    r"INDIVIDUALS|PERSONS|PATIENTS|STUDENTS"
+)
+
 NONADJUDICABLE_RECIPIENT_PATTERNS: List[Tuple[str, str]] = [
     (r"^\s*$", "blank_recipient_name"),
     (r"\bSEE\s+(SCHEDULE|STATEMENT|ATTACHMENT|ATTACHED|LIST|DETAIL|DETAILS)\b", "see_schedule_or_attachment"),
@@ -285,10 +298,13 @@ NONADJUDICABLE_RECIPIENT_PATTERNS: List[Tuple[str, str]] = [
     (r"\bLIST\s+OF\s+(DISTRIBUTIONS?|GRANTS?|RECIPIENTS?|ORGANIZATIONS?)\b", "list_of_recipients"),
     (r"\bDISTRIBUTIONS?\s+(LIST|SCHEDULE|STATEMENT)\b", "distribution_list_or_schedule"),
     (r"\bELIGIBLE\s+PATIENTS?\b", "eligible_patients_placeholder"),
-    (r"\bVARIOUS\b", "various_recipients_placeholder"),
-    (r"\bMULTIPLE\b", "multiple_recipients_placeholder"),
-    (r"\bNUMEROUS\b", "numerous_recipients_placeholder"),
-    (r"\bMANY\s+(ORGANIZATIONS?|RECIPIENTS?|INDIVIDUALS?)\b", "many_recipients_placeholder"),
+    (r"^VARIOUS$", "various_recipients_placeholder"),
+    (rf"\bVARIOUS\s+(?:[A-Z0-9]+\s+){{0,3}}({_NON_SPECIFIC_RECIPIENT_NOUNS})\b", "various_recipients_placeholder"),
+    (r"^MULTIPLE$", "multiple_recipients_placeholder"),
+    (rf"\bMULTIPLE\s+(?:[A-Z0-9]+\s+){{0,3}}({_NON_SPECIFIC_RECIPIENT_NOUNS})\b", "multiple_recipients_placeholder"),
+    (r"^NUMEROUS$", "numerous_recipients_placeholder"),
+    (rf"\bNUMEROUS\s+(?:[A-Z0-9]+\s+){{0,3}}({_NON_SPECIFIC_RECIPIENT_NOUNS})\b", "numerous_recipients_placeholder"),
+    (r"\bMANY\s+(?:[A-Z0-9]+\s+){0,3}(ORGANIZATIONS|RECIPIENTS|INDIVIDUALS|CHARITIES|GRANTEES|BENEFICIARIES|PATIENTS|STUDENTS)\b", "many_recipients_placeholder"),
     (r"\bSCHOLARSHIP\s+(RECIPIENTS?|STUDENTS?)\b", "scholarship_recipient_placeholder"),
     (r"^INDIVIDUALS?$", "individuals_placeholder"),
     (r"^PATIENTS?$", "patients_placeholder"),
@@ -3834,11 +3850,6 @@ def cmd_nonadjudicable_recipient_triage(args: argparse.Namespace) -> None:
     if skipped_reasons:
         print("Skipped reasons:", flush=True)
         for k, v in skipped_reasons.most_common(25):
-            print(f"  {k}: {v:,}", flush=True)
-
-    if skips:
-        print("Skipped reasons:", flush=True)
-        for k, v in skips.most_common():
             print(f"  {k}: {v:,}", flush=True)
 
 # ---------------------------------------------------------------------------
