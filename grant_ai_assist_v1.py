@@ -2000,11 +2000,31 @@ Precision is more important than recall: a wrong EIN is worse than no match, but
 # Reported-EIN shortcut / identity-name backfill helpers
 # ---------------------------------------------------------------------------
 
-REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS = (
-    "reported_ein_name_disagrees",
+# v1.22: distinguish hard reported-EIN conflicts from soft warnings.
+#
+# Earlier versions treated reported_ein_name_disagrees and reported_ein_points_to
+# as hard contradictions. In practice those are often legal-name / campus / DBA /
+# parent-entity differences where the filing-supplied EIN should still win.
+# Keep truly stronger evidence as hard conflict:
+#   * first pass matched the recipient name/address to a different known EIN
+#   * first pass explicitly produced possible_bad_ein_corrected/conflicting_ein_match
+#
+# Soft warning examples that should NOT automatically force Ollama:
+#   * reported_ein_name_disagrees
+#   * reported_ein_points_to=<legal name>
+#   * multiple_eins_at_address
+#   * address_unique_low_name_similarity
+REPORTED_EIN_HARD_CONTRADICTION_WARNING_PATTERNS = (
     "reported_ein_and_name_match_different_known_eins",
-    "reported_ein_points_to=",
 )
+REPORTED_EIN_SOFT_WARNING_PATTERNS = (
+    "reported_ein_name_disagrees",
+    "reported_ein_points_to=",
+    "multiple_eins_at_address",
+    "address_unique_low_name_similarity",
+)
+# Backward-compatible name; use the hard-only list by default from v1.22 onward.
+REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS = REPORTED_EIN_HARD_CONTRADICTION_WARNING_PATTERNS
 REPORTED_EIN_CONTRADICTION_STATUSES = {"possible_bad_ein_corrected", "conflicting_ein_match"}
 
 
@@ -2026,16 +2046,28 @@ def _json_counter_has_any(text: Any, keys: Sequence[str]) -> bool:
 
 
 def signature_has_reported_ein_contradiction(sig: sqlite3.Row) -> bool:
-    """True when first-pass evidence suggests the reported EIN may be wrong.
+    """True when first-pass evidence gives a HARD reason to distrust the reported EIN.
+
+    v1.22 intentionally treats plain reported_ein_name_disagrees and
+    reported_ein_points_to=<name> as soft warnings, not hard contradictions.
+    Those warnings often reflect legal-name, DBA, parent/campus, or address
+    variation. A filing-supplied valid EIN should generally win unless a
+    separate name/address match points to a different known EIN or the first
+    pass explicitly classified the row as possible_bad_ein/conflicting_ein.
 
     This intentionally does NOT treat reported_ein_not_found_in_returns as a
     contradiction. That is exactly the case EO BMF/org_identity can repair.
     """
     flags = clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else "").lower()
-    if any(pat in flags for pat in REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS):
+    if any(pat in flags for pat in REPORTED_EIN_HARD_CONTRADICTION_WARNING_PATTERNS):
         return True
     statuses_json = sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else "{}"
     return _json_counter_has_any(statuses_json, sorted(REPORTED_EIN_CONTRADICTION_STATUSES))
+
+
+def signature_has_reported_ein_soft_warning(sig: sqlite3.Row) -> bool:
+    flags = clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else "").lower()
+    return any(pat in flags for pat in REPORTED_EIN_SOFT_WARNING_PATTERNS)
 
 
 def best_identity_for_ein(conn: sqlite3.Connection, ein: str) -> Optional[sqlite3.Row]:
@@ -2128,6 +2160,8 @@ def reported_ein_shortcut_decision_row(
     source = clean_text(identity["source"])
     confidence = 0.985 if name_score >= 0.72 else (0.965 if placeholder or not recip_norm else 0.94)
     reason_codes = ["reported_ein_present", "reported_ein_found_in_org_identity", source]
+    if signature_has_reported_ein_soft_warning(sig):
+        reason_codes.append("reported_ein_soft_warning_not_treated_as_hard_conflict")
     if placeholder:
         reason_codes.append("recipient_name_blank_or_placeholder")
     elif recip_norm:
