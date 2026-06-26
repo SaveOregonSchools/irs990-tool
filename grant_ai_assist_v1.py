@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_25_distinctive_exact_name.py
+grant_ai_assist_v1_26_batch_adjudication.py
 
 Fast AI-assisted and rule-assisted second-pass grant recipient matching for the
 IRS 990 SQLite database.
@@ -62,6 +62,14 @@ Deterministic candidate-rule passes:
   name is sufficiently distinctive. It intentionally excludes short acronyms,
   generic recipient labels, non-U.S./blank-state rows, reported-EIN cases,
   contradictions, and placeholders by default.
+- v1.26 adds a file-based batch adjudication workflow for running local Ollama
+  adjudication on a separate Linux AI server without copying the main SQLite
+  database. Windows exports adjudication packet JSONL batches; Linux processes
+  packets into decision JSONL files; Windows imports and validates the returned
+  decisions before applying them. The workflow supports batch-size controls,
+  manifests, resumable per-file worker output, and directory-level decision
+  import.
+
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has
 created or refreshed grant_recipient_resolved. The final view produced by this
@@ -104,7 +112,29 @@ Apply v1.24 address/name remaining at a lower 0.70 name-score threshold:
     --high-address-geo-min-name-score 0.70
 
 Check remaining AI queue:
-  sqlite3 C:\projects\irs990-tool\db\irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);"
+  sqlite3 C:\projects\irs990-tool\db\irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);
+
+Export adjudication packets in 10,000-signature JSONL batches for Linux AI worker:
+  python grant_ai_assist_v1.py export-adjudication-batches ^
+    --min-total-amount 100000 ^
+    --batch-size 10000 ^
+    --out-dir exports\ai_packets_100k_plus ^
+    --summary-csv exports\ai_packets_100k_plus_summary.csv
+
+On the Linux AI server, process packets with the standalone worker:
+  python3 grant_ai_ollama_batch_worker.py \
+    --input-dir ai_packets_100k_plus \
+    --output-dir ai_decisions_100k_plus \
+    --model gemma4:12b \
+    --ollama-url http://127.0.0.1:11434/api/chat \
+    --parallel-workers 2
+
+Back on Windows, import a directory of returned decision JSONL files:
+  python grant_ai_assist_v1.py import-adjudication-decision-dir ^
+    --in-dir imports\ai_decisions_100k_plus ^
+    --dry-run ^
+    --audit-dir imports\ai_decisions_100k_plus_audit
+"
 """
 
 from __future__ import annotations
@@ -3336,6 +3366,238 @@ def cmd_export_adjudication_packets(args: argparse.Namespace) -> None:
         print(f"Summary CSV written to {summary_path}", flush=True)
 
 
+
+def cmd_export_adjudication_batches(args: argparse.Namespace) -> None:
+    """Export adjudication packets split into multiple JSONL files for remote AI processing.
+
+    This is the Windows/source-DB side of the v1.26 batch workflow. It uses the
+    same queue and shortcut/placeholder filters as export-adjudication-packets,
+    but writes multiple files of --batch-size packets plus a manifest JSON.
+    """
+    conn = connect(args.db, readonly=True)
+    if not table_exists(conn, CAND_TABLE):
+        raise RuntimeError(f"Missing {CAND_TABLE}. Run generate-candidates first.")
+    if not table_exists(conn, SIG_TABLE):
+        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    packet_prefix = clean_text(args.prefix) or "adjudication_packets"
+    batch_size = max(1, int(args.batch_size or 10000))
+    manifest_path = Path(args.manifest) if args.manifest else out_dir / f"{packet_prefix}_manifest.json"
+    summary_path = Path(args.summary_csv) if args.summary_csv else None
+
+    existing = sorted(out_dir.glob(f"{packet_prefix}_*.jsonl"))
+    if existing and not args.overwrite:
+        raise RuntimeError(
+            f"Found existing packet files matching {out_dir / (packet_prefix + '_*.jsonl')}. "
+            "Use --overwrite or choose another --out-dir/--prefix."
+        )
+    if args.overwrite:
+        for p in existing:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
+    summary_fh = None
+    summary_writer = None
+    if summary_path:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_fh = summary_path.open("w", newline="", encoding="utf-8-sig")
+        summary_writer = csv.writer(summary_fh)
+        summary_writer.writerow([
+            "batch_file", "batch_index", "signature_hash", "reported_ein", "recipient_name", "city", "state", "zip5",
+            "grant_count", "total_amount", "candidate_count", "top_candidate_id", "top_candidate_ein",
+            "top_candidate_name", "top_candidate_score", "first_pass_statuses_json", "warning_flags",
+        ])
+
+    exported = 0
+    scanned = 0
+    skipped_shortcut = 0
+    skipped_no_candidates = 0
+    skipped_above_max = 0
+    skipped_below_min = 0
+    batch_index = int(args.start_index or 1)
+    current_count = 0
+    current_path: Optional[Path] = None
+    out_fh = None
+    batches: List[Dict[str, Any]] = []
+    started = time.time()
+
+    def close_batch() -> None:
+        nonlocal out_fh, current_path, current_count
+        if out_fh is not None:
+            out_fh.flush()
+            out_fh.close()
+            batches.append({
+                "batch_index": len(batches) + int(args.start_index or 1),
+                "file": str(current_path.name if current_path else ""),
+                "path": str(current_path) if current_path else "",
+                "records": current_count,
+            })
+        out_fh = None
+        current_path = None
+        current_count = 0
+
+    try:
+        for sig in iter_signatures_for_adjudication(conn, args):
+            scanned += 1
+            total_amount = float(sig["total_amount"] or 0)
+            if args.max_total_amount is not None and total_amount > float(args.max_total_amount):
+                skipped_above_max += 1
+                continue
+            # iter_signatures_for_adjudication already applies min_total_amount, but keep this
+            # defensive check because future changes may bypass the SQL filter.
+            if args.min_total_amount is not None and total_amount < float(args.min_total_amount):
+                skipped_below_min += 1
+                continue
+
+            cands = candidates_for_signature(conn, sig["signature_hash"], args.max_candidates)
+            if not cands:
+                skipped_no_candidates += 1
+                continue
+
+            if not getattr(args, "include_nonadjudicable_placeholders", False):
+                nonadj_reason = recipient_name_nonadjudicable_reason(sig["recipient_name"] if "recipient_name" in sig.keys() else "")
+                if nonadj_reason:
+                    skipped_shortcut += 1
+                    continue
+
+            if not args.include_reported_ein_shortcut_eligible and not getattr(args, "include_reported_ein_nonconflicts", False):
+                triage_row, _triage_reason = reported_ein_triage_decision_row(
+                    conn,
+                    sig,
+                    cands,
+                    min_name_score=args.reported_ein_shortcut_min_name_score,
+                    allow_contradictions=args.reported_ein_shortcut_allow_contradictions,
+                    unverified_action=getattr(args, "reported_ein_unverified_action", "keep"),
+                    unsafe_action=getattr(args, "reported_ein_unsafe_action", "human_review"),
+                    unverified_confidence=getattr(args, "reported_ein_unverified_confidence", 0.935),
+                    invalid_ein_action=getattr(args, "invalid_reported_ein_action", "ollama"),
+                    placeholder_action=getattr(args, "nonadjudicable_action", "no_match"),
+                )
+                if triage_row is not None:
+                    skipped_shortcut += 1
+                    continue
+
+            if out_fh is None:
+                current_path = out_dir / f"{packet_prefix}_{batch_index:06d}.jsonl"
+                if current_path.exists() and not args.overwrite:
+                    raise RuntimeError(f"Output file already exists: {current_path}; use --overwrite or change --start-index/--prefix")
+                out_fh = current_path.open("w", encoding="utf-8")
+                current_count = 0
+
+            packet = export_packet_for_signature(sig, cands, include_schema=args.include_schema)
+            packet["batch_export"] = {
+                "batch_index": batch_index,
+                "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "source_db": str(args.db),
+                "exporter": "grant_ai_assist_v1_26_batch_adjudication",
+            }
+            out_fh.write(json.dumps(packet, ensure_ascii=False, sort_keys=True) + "\n")
+            current_count += 1
+            exported += 1
+
+            if summary_writer:
+                top = cands[0]
+                summary_writer.writerow([
+                    current_path.name if current_path else "", batch_index,
+                    sig["signature_hash"], sig["reported_ein"], sig["recipient_name"], sig["city"], sig["state"], sig["zip5"],
+                    sig["grant_count"], sig["total_amount"], len(cands), top["candidate_id"], top["ein"],
+                    top["candidate_name"], top["candidate_score"], sig["first_pass_statuses_json"], sig["first_pass_warning_flags"],
+                ])
+
+            if current_count >= batch_size:
+                close_batch()
+                batch_index += 1
+
+            if exported % args.progress_every == 0:
+                elapsed = max(1.0, time.time() - started)
+                print(
+                    f"Exported {exported:,} packets in {len(batches) + (1 if out_fh else 0):,} batch file(s) "
+                    f"at {exported/elapsed:,.0f}/sec; scanned={scanned:,}; skipped={skipped_shortcut + skipped_no_candidates + skipped_above_max + skipped_below_min:,}",
+                    flush=True,
+                )
+    finally:
+        close_batch()
+        if summary_fh:
+            summary_fh.flush(); summary_fh.close()
+
+    manifest = {
+        "format": "grant_ai_adjudication_batch_manifest_v1",
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "source_db": str(args.db),
+        "out_dir": str(out_dir),
+        "prefix": packet_prefix,
+        "filters": {
+            "state": args.state,
+            "min_total_amount": args.min_total_amount,
+            "max_total_amount": args.max_total_amount,
+            "limit": args.limit,
+            "regenerate": bool(args.regenerate),
+            "max_candidates": args.max_candidates,
+        },
+        "batch_size": batch_size,
+        "scanned": scanned,
+        "exported": exported,
+        "skipped_shortcut_or_nonadjudicable": skipped_shortcut,
+        "skipped_no_candidates": skipped_no_candidates,
+        "skipped_above_max_total_amount": skipped_above_max,
+        "skipped_below_min_total_amount": skipped_below_min,
+        "batches": batches,
+        "decision_import_command_example": (
+            "python grant_ai_assist_v1.py import-adjudication-decision-dir "
+            "--in-dir imports\\ai_decisions --dry-run --audit-dir imports\\ai_decisions_audit"
+        ),
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"Batch export complete: exported {exported:,} packets in {len(batches):,} files -> {out_dir}", flush=True)
+    print(f"Manifest written to {manifest_path}", flush=True)
+    if summary_path:
+        print(f"Summary CSV written to {summary_path}", flush=True)
+    if skipped_shortcut or skipped_no_candidates or skipped_above_max or skipped_below_min:
+        print("Skipped:", flush=True)
+        print(f"  shortcut/nonadjudicable/reported-EIN triage eligible: {skipped_shortcut:,}", flush=True)
+        print(f"  no candidates: {skipped_no_candidates:,}", flush=True)
+        print(f"  above max total amount: {skipped_above_max:,}", flush=True)
+        print(f"  below min total amount: {skipped_below_min:,}", flush=True)
+
+
+def cmd_import_adjudication_decision_dir(args: argparse.Namespace) -> None:
+    """Import a directory of decision JSONL/JSON/CSV files by calling the existing importer per file."""
+    in_dir = Path(args.in_dir)
+    if not in_dir.exists():
+        raise RuntimeError(f"Input directory not found: {in_dir}")
+    files = sorted(in_dir.glob(args.glob))
+    if not files:
+        raise RuntimeError(f"No files matched {args.glob!r} in {in_dir}")
+    audit_dir = Path(args.audit_dir) if args.audit_dir else None
+    if audit_dir:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+    processed = 0
+    started = time.time()
+    for path in files:
+        audit_csv = str((audit_dir / f"{path.stem}_import_audit.csv") if audit_dir else Path(args.audit_csv or "external_decision_import_audit.csv"))
+        print(f"Importing decision file {path} ...", flush=True)
+        child = argparse.Namespace(
+            db=args.db,
+            in_file=str(path),
+            source_model=args.source_model,
+            regenerate=args.regenerate,
+            dry_run=args.dry_run,
+            audit_csv=audit_csv,
+            max_candidates=args.max_candidates,
+            auto_accept_threshold=args.auto_accept_threshold,
+            commit_every=args.commit_every,
+            progress_every=args.progress_every,
+        )
+        cmd_import_adjudication_decisions(child)
+        processed += 1
+    elapsed = max(1.0, time.time() - started)
+    print(f"Directory import complete: processed {processed:,} files in {elapsed:,.1f}s", flush=True)
+
 def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
     """Import externally adjudicated decisions, validate them, and optionally store them."""
     conn = connect(args.db, readonly=False)
@@ -5248,7 +5510,7 @@ def add_common_db(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="AI-assisted second-pass grant recipient matcher (v1.10 shortcut audit fields + v1.9 fixes)")
+    parser = argparse.ArgumentParser(description="AI/rule-assisted grant recipient matcher with v1.26 batch adjudication workflow")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("verify-bmf", help="Verify eo-bmf/eo1.csv ... eo4.csv exist")
@@ -5443,6 +5705,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_export_adjudication_packets)
 
+
+    p = sub.add_parser("export-adjudication-batches", help="Export remaining adjudication packets into many JSONL batch files for Linux/Ollama processing")
+    add_common_db(p)
+    p.add_argument("--out-dir", default="exports/ai_packets", help="Directory for packet JSONL batch files")
+    p.add_argument("--prefix", default="adjudication_packets", help="Filename prefix; files are PREFIX_000001.jsonl, etc.")
+    p.add_argument("--manifest", default=None, help="Manifest JSON path. Default: OUT_DIR/PREFIX_manifest.json")
+    p.add_argument("--summary-csv", default=None, help="Optional summary CSV of exported packets")
+    p.add_argument("--batch-size", type=int, default=10000, help="Packets per JSONL file")
+    p.add_argument("--start-index", type=int, default=1)
+    p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--format", choices=["jsonl"], default="jsonl")
+    p.add_argument("--regenerate", action="store_true", help="Include signatures that already have a decision")
+    p.add_argument("--state", default=None)
+    p.add_argument("--min-total-amount", type=float, default=None)
+    p.add_argument("--max-total-amount", type=float, default=None)
+    p.add_argument("--limit", type=int, default=None, help="Max packets to export across all batch files")
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--include-schema", action="store_true")
+    p.add_argument("--include-reported-ein-shortcut-eligible", action="store_true")
+    p.add_argument("--include-reported-ein-nonconflicts", action="store_true")
+    p.add_argument("--reported-ein-shortcut-min-name-score", type=float, default=0.35)
+    p.add_argument("--reported-ein-shortcut-allow-contradictions", action="store_true")
+    p.add_argument("--reported-ein-unverified-action", choices=["keep", "human_review", "skip", "ollama"], default="keep")
+    p.add_argument("--reported-ein-unsafe-action", choices=["human_review", "skip", "ollama"], default="human_review")
+    p.add_argument("--reported-ein-unverified-confidence", type=float, default=0.935)
+    p.add_argument("--invalid-reported-ein-action", choices=["ollama", "human_review", "skip", "no_match"], default="ollama")
+    p.add_argument("--nonadjudicable-action", choices=["no_match", "human_review", "skip", "ollama"], default="no_match")
+    p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
+    p.add_argument("--progress-every", type=int, default=10000)
+    p.set_defaults(func=cmd_export_adjudication_batches)
+
     p = sub.add_parser("import-adjudication-decisions", help="Import externally adjudicated JSONL/JSON/CSV decisions, validate, and store them")
     add_common_db(p)
     p.add_argument("--in-file", required=True, help="Decision file from external adjudication: JSONL, JSON, or CSV")
@@ -5456,6 +5749,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decisions)
 
+
+
+    p = sub.add_parser("import-adjudication-decision-dir", help="Import all decision files from a directory, validating each file with the existing importer")
+    add_common_db(p)
+    p.add_argument("--in-dir", required=True, help="Directory containing decision JSONL/JSON/CSV files returned by the AI worker")
+    p.add_argument("--glob", default="decisions_*.jsonl", help="File glob inside --in-dir")
+    p.add_argument("--source-model", default="external:linux-ollama", help="Model/source label stored in grant_recipient_ai_decision.model")
+    p.add_argument("--regenerate", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--audit-dir", default="imports/ai_decision_audits", help="Directory for per-file audit CSVs")
+    p.add_argument("--audit-csv", default="external_decision_import_audit.csv", help="Fallback audit CSV if --audit-dir is blank")
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--commit-every", type=int, default=5000)
+    p.add_argument("--progress-every", type=int, default=10000)
+    p.set_defaults(func=cmd_import_adjudication_decision_dir)
 
     p = sub.add_parser("nonadjudicable-recipient-triage", help="Create no-AI NO_MATCH/HUMAN_REVIEW decisions for See Attachment / Various / placeholder recipient signatures")
     add_common_db(p)
