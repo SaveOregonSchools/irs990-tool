@@ -1,70 +1,110 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 r"""
-grant_ai_assist_v1_12_reported_ein_triage.py
+grant_ai_assist_v1_25_distinctive_exact_name.py
 
-Fast AI-assisted second-pass grant recipient matching for the IRS 990 SQLite database.
+Fast AI-assisted and rule-assisted second-pass grant recipient matching for the
+IRS 990 SQLite database.
 
-Fast v1.5 changes
------------------
-- Defers secondary indexes during full-refresh loads for signatures, candidates, and applied AI matches.
-- Uses exclusive SQLite locking for bulk-write commands, but not during Ollama adjudication.
-- Raises safe batch/commit defaults for a 32 GB RAM workstation.
-- Skips unnecessary per-signature candidate deletes during full-refresh candidate generation.
-- Makes candidate generation much faster by defaulting to high-signal exact/name/address/EIN lookups.
-- Adds optional balanced/broad candidate modes for token/FTS fallback, with safer geo-constrained token queries.
-- Adds a stats command for raw grants, deterministic resolver results, AI signatures/candidates/decisions, and final applied results.
-- Optimizes candidate generation by staging candidate counts and bulk-updating signature status instead of updating one signature row at a time.
-- Adds Ollama diagnostics, a test-ollama command, fail-fast behavior for repeated Ollama call failures, retries, and format-mode controls.
-- v1.6 tunes the adjudication prompt so missing reported EINs and legal suffix differences do not make otherwise strong matches ambiguous.
-- v1.10 adds expanded reported-EIN shortcut audit CSV fields on top of v1.9 shortcuts/backfill.
-- v1.11 adds export/import commands for offline or ChatGPT-assisted adjudication batches.
-- v1.12 adds reported-EIN triage so non-conflicting reported EINs are kept/parked before Ollama/export.
+Version history / notable changes
+---------------------------------
+Base pipeline:
+- Builds an organization identity layer from returns + IRS EO BMF CSV files.
+- Builds unique grant-recipient signatures from deterministic resolver output.
+- Generates candidate EINs from the identity layer.
+- Uses deterministic rules, reported-EIN triage, optional external decisions,
+  and optional local Ollama adjudication to resolve signatures.
 
-This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has created
-or refreshed grant_recipient_resolved. It adds a materialized organization
-identity layer that can include IRS EO BMF CSV files, builds one row per unique
-hard-to-match grant recipient signature, generates a compact candidate EIN set,
-and optionally asks a local Ollama model to adjudicate those candidates.
+Performance and candidate-generation improvements:
+- v1.5 deferred secondary indexes during full-refresh bulk loads, used exclusive
+  SQLite locking for bulk-write stages, raised safe batch defaults for a 32 GB
+  workstation, and avoided row-by-row candidate-status updates.
+- v1.2/v1.4 introduced fast/balanced/broad candidate modes and staged candidate
+  counts so fast exact/name/address candidate generation is practical at scale.
+
+Ollama / AI adjudication improvements:
+- v1.5 added test-ollama diagnostics, raw-response logging, retry/fail-fast
+  controls, and schema/json/none format modes.
+- v1.6 tuned the prompt so blank reported EINs and legal suffix differences do
+  not make otherwise strong matches ambiguous.
+- v1.7 disables model thinking by default, preventing Gemma-style responses from
+  spending the whole output budget in hidden reasoning.
+- v1.8 normalizes percent-style confidence values and safely recovers omitted
+  candidate_id values only when unambiguous.
+
+Reported-EIN and placeholder safeguards:
+- v1.9 added reported-EIN shortcut/backfill logic.
+- v1.10 expanded shortcut dry-run audit fields.
+- v1.12 added reported-EIN triage so non-conflicting filing-supplied recipient
+  EINs are kept/parked before Ollama/export.
+- v1.13 tightened reported EIN validation and routes non-specific recipients
+  such as "see attachment" or "various recipients" away from AI.
+- v1.19 made placeholder detection more precise so real charities containing
+  words such as "Multiple" are not incorrectly flagged.
+- v1.22 treats soft warnings such as reported_ein_name_disagrees as soft rather
+  than automatically forcing AI when the filing supplied a valid EIN.
+
+Deterministic candidate-rule passes:
+- v1.14 added candidate-rule-diagnostics and candidate-rule-decisions.
+- v1.15/v1.16 added exact_name_state_only and its validator support.
+- v1.17/v1.18 added nonadjudicable-recipient triage and fixed its dry-run
+  skipped-reason reporting.
+- v1.20 added same-EIN rules for cases where multiple candidate rows all point
+  to the same EIN.
+- v1.23 added the large_safe_remaining alias for higher-impact exact/high-name
+  and clear-top candidate buckets.
+- v1.24 added address_name_remaining rules for the remaining one-candidate /
+  same-EIN bucket using strong address/geography evidence and moderate name
+  similarity.
+- v1.25 adds distinctive_exact_name_no_geo, a cautious exact-name/no-geography
+  rule for cases where there is exactly one candidate EIN, the normalized name
+  matches exactly, there is no ZIP/city/state/address evidence, and the recipient
+  name is sufficiently distinctive. It intentionally excludes short acronyms,
+  generic recipient labels, non-U.S./blank-state rows, reported-EIN cases,
+  contradictions, and placeholders by default.
+
+This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has
+created or refreshed grant_recipient_resolved. The final view produced by this
+script is grant_recipient_resolved_plus_ai_v1.
 
 Design principle
 ----------------
-Ollama is used as an adjudicator, not as a database search engine. The database
-and deterministic Python code generate the candidate list; the model may choose
-only among candidates it was given, or return NO_MATCH / AMBIGUOUS / HUMAN_REVIEW.
+Ollama is an adjudicator, not a database search engine. Database/Python logic
+creates candidates first. The model may choose only among candidates it was
+given, or return NO_MATCH / AMBIGUOUS / HUMAN_REVIEW. Most high-confidence work
+should be handled by deterministic rules before any local model call.
 
 Expected project layout
 -----------------------
-  project_root/
-    irs990.db or DB at C:\projects\irs990-tool\db\irs990.db
-    eo-bmf/
-      eo1.csv
-      eo2.csv
-      eo3.csv
-      eo4.csv
+  C:\projects\irs990-tool\
+    grant_ai_assist_v1.py
+    resolve_grant_recipients_v2_1_fast.py
+    db\irs990.db
+    eo-bmf\eo1.csv
+    eo-bmf\eo2.csv
+    eo-bmf\eo3.csv
+    eo-bmf\eo4.csv
 
-Common commands
----------------
-Verify BMF files:
-  python grant_ai_assist_v1_10_shortcut_audit.py verify-bmf --project-dir C:\projects\irs990-tool
+Common current commands
+-----------------------
+Dry-run v1.25 distinctive exact-name/no-geography rule:
+  python grant_ai_assist_v1.py candidate-rule-decisions ^
+    --dry-run ^
+    --rules distinctive_exact_name_no_geo ^
+    --csv-out exports\candidate_rule_distinctive_exact_name_no_geo_dryrun.csv
 
-Build org_identity from returns + EO BMF:
-  python grant_ai_assist_v1_10_shortcut_audit.py build-identity --db C:\projects\irs990-tool\db\irs990.db --project-dir C:\projects\irs990-tool --full-refresh
+Apply the v1.25 distinctive rule after review:
+  python grant_ai_assist_v1.py candidate-rule-decisions --rules distinctive_exact_name_no_geo
+  python grant_ai_assist_v1.py apply-decisions --full-refresh
 
-Build signatures for unresolved and low-confidence deterministic matches:
-  python grant_ai_assist_v1_10_shortcut_audit.py build-signatures --db C:\projects\irs990-tool\db\irs990.db --full-refresh
+Apply v1.24 address/name remaining at a lower 0.70 name-score threshold:
+  python grant_ai_assist_v1.py candidate-rule-decisions ^
+    --rules address_name_remaining ^
+    --addr-name-min-name-score 0.70 ^
+    --high-address-geo-min-name-score 0.70
 
-Generate top candidates for those signatures:
-  python grant_ai_assist_v1_10_shortcut_audit.py generate-candidates --db C:\projects\irs990-tool\db\irs990.db --limit 100000
-
-Dry-run Ollama adjudication to CSV:
-  python grant_ai_assist_v1_10_shortcut_audit.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 100 --dry-run --csv-out ai_decisions_sample.csv
-
-Store Ollama decisions:
-  python grant_ai_assist_v1_10_shortcut_audit.py adjudicate --db C:\projects\irs990-tool\db\irs990.db --model gemma4:12b --limit 1000
-
-Apply only auto-accepted AI decisions into a separate applied table and final view:
-  python grant_ai_assist_v1_10_shortcut_audit.py apply-decisions --db C:\projects\irs990-tool\db\irs990.db
+Check remaining AI queue:
+  sqlite3 C:\projects\irs990-tool\db\irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);"
 """
 
 from __future__ import annotations
@@ -105,6 +145,14 @@ BMF_COLUMNS = [
     "ASSET_CD", "INCOME_CD", "FILING_REQ_CD", "PF_FILING_REQ_CD", "ACCT_PD",
     "ASSET_AMT", "INCOME_AMT", "REVENUE_AMT", "NTEE_CD", "SORT_NAME",
 ]
+
+US_STATES = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "DC", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+}
 
 ORG_IDENTITY_TABLE = "org_identity"
 ORG_TOKEN_TABLE = "org_identity_token"
@@ -368,6 +416,53 @@ def name_tokens(name_norm: str) -> List[str]:
             seen.add(t)
             out.append(t)
     return out
+
+
+EXACT_NAME_NO_GEO_GENERIC_NAMES = {
+    "CASH", "DONATION", "DONATIONS", "GRANT", "GRANTS", "SCHOLARSHIP",
+    "SCHOLARSHIPS", "TUITION", "GENERAL", "MEDICAL", "MISSION", "MINISTRY",
+    "OTHER", "MISC", "MISCELLANEOUS", "VARIOUS", "UNKNOWN", "NONE", "N A",
+    "MIT", "MSI", "FARE",
+}
+
+
+def is_distinctive_exact_name_no_geo(
+    recipient_name: Any,
+    state: Any = "",
+    min_tokens: int = 3,
+    min_length: int = 18,
+    require_us_state: bool = True,
+) -> bool:
+    """Return True when exact-name/no-geo evidence is distinctive enough.
+
+    This supports v1.25's distinctive_exact_name_no_geo rule. Exact name alone
+    can be risky for acronyms, generic words, foreign organizations, or rows
+    where the EIN-bearing U.S. organization may not be the actual grantee. The
+    default rule therefore requires a U.S. state on the grant-recipient row and
+    a reasonably distinctive normalized name.
+    """
+    raw = clean_text(recipient_name)
+    norm = normalize_name(raw)
+    if not norm:
+        return False
+    if require_us_state:
+        st = clean_text(state).upper()
+        if st not in US_STATES:
+            return False
+    if norm in EXACT_NAME_NO_GEO_GENERIC_NAMES:
+        return False
+    toks = name_tokens(norm)
+    if len(norm) <= 5 and len(toks) <= 1:
+        return False
+    if len(toks) < int(min_tokens):
+        return False
+    if len(norm) < int(min_length):
+        return False
+    # Avoid very common bare institution labels where exact name without
+    # geography can still refer to many real-world branches or contexts.
+    if len(toks) <= 2 and any(t in {"CHURCH", "SCHOOL", "COLLEGE", "HOSPITAL"} for t in norm.split()):
+        return False
+    return True
 
 
 def ratio(a: str, b: str) -> float:
@@ -2790,6 +2885,10 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
             or (not single_candidate and selected_exact_name and (selected_zip_match or selected_city_state or selected_exact_address or selected_state_match) and selected_gap >= 10)
             or (not single_candidate and selected_name_score >= 0.92 and (selected_zip_match or selected_city_state or selected_exact_address) and selected_gap >= 20)
             or (not single_candidate and selected_exact_address and selected_name_score >= 0.92 and selected_gap >= 10 and selected_score >= 90)
+            # v1.25: exact-name/no-geo distinctive one-candidate rule. No
+            # geography evidence is present, so require a distinctive U.S.
+            # recipient name and a modest exact-name candidate score.
+            or (single_candidate and selected_exact_name and not selected_exact_address and not selected_zip_match and not selected_city_state and not selected_state_match and selected_score >= 55 and is_distinctive_exact_name_no_geo(sig["recipient_name"], sig["state"]))
             or selected_score >= 92
         )
         if confidence_f >= auto_accept_threshold and strong_signal and not needs_review:
@@ -4001,11 +4100,16 @@ CANDIDATE_RULES_ADDRESS_NAME_REMAINING = {
     "same_ein_exact_address_city_state_moderate_name",
     "same_ein_high_address_geo_high_name",
 }
+CANDIDATE_RULES_EXACT_NAME_NO_GEO = {
+    "distinctive_exact_name_no_geo",
+}
 CANDIDATE_RULE_ALIASES = {
     "large_safe_remaining": CANDIDATE_RULES_LARGE_SAFE_REMAINING,
     "remaining_large_safe": CANDIDATE_RULES_LARGE_SAFE_REMAINING,
     "address_name_remaining": CANDIDATE_RULES_ADDRESS_NAME_REMAINING,
     "remaining_address_name": CANDIDATE_RULES_ADDRESS_NAME_REMAINING,
+    "exact_name_no_geo_distinctive": CANDIDATE_RULES_EXACT_NAME_NO_GEO,
+    "distinctive_exact_name_no_geo_safe": CANDIDATE_RULES_EXACT_NAME_NO_GEO,
 }
 CANDIDATE_RULES_ALL = {
     "reported_ein_candidate",
@@ -4025,6 +4129,7 @@ CANDIDATE_RULES_ALL = {
     "same_ein_exact_address_city_state_moderate_name",
     "same_ein_high_address_geo_high_name",
     "same_ein_zip_city_state_high_name",
+    "distinctive_exact_name_no_geo",
     "clear_best_candidate",
 }
 
@@ -4257,6 +4362,22 @@ def classify_candidate_rule(row: sqlite3.Row, args: argparse.Namespace) -> Tuple
     if count == 1 and _fnum(row["address_score"]) >= float(args.high_address_geo_min_address_score) and (zip_match or city_state):
         if nscore >= float(args.high_address_geo_min_name_score) and cscore >= float(args.high_address_geo_min_score):
             return "same_ein_high_address_geo_high_name", "", float(args.high_address_geo_confidence)
+
+    # v1.25: distinctive exact-name/no-geography cleanup. This is intentionally
+    # cautious: exactly one candidate, exact normalized name, no ZIP/city-state/
+    # state/address match, and a distinctive U.S. recipient name. It is designed
+    # for the remaining exact-name/no-geo bucket after all stronger geography-
+    # backed rules have run.
+    if count == 1 and exact_name and not exact_address and not zip_match and not city_state and not _i01(row["state_match"]):
+        if cscore >= float(args.exact_name_no_geo_min_score) and is_distinctive_exact_name_no_geo(
+            row["recipient_name"],
+            row["state"],
+            min_tokens=int(args.exact_name_no_geo_min_tokens),
+            min_length=int(args.exact_name_no_geo_min_length),
+            require_us_state=not bool(args.exact_name_no_geo_allow_non_us),
+        ):
+            return "distinctive_exact_name_no_geo", "", float(args.exact_name_no_geo_confidence)
+        return "", "exact_name_no_geo_not_distinctive_or_score_too_low", 0.0
 
     # Optional, not part of the address_name_remaining alias by default:
     # strong name similarity plus ZIP+city/state evidence, but no address match.
@@ -5419,6 +5540,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--high-address-geo-min-name-score", type=float, default=0.75)
     p.add_argument("--high-address-geo-min-score", type=float, default=70.0)
     p.add_argument("--high-address-geo-confidence", type=float, default=0.92)
+    p.add_argument("--exact-name-no-geo-min-score", type=float, default=55.0, help="v1.25 distinctive_exact_name_no_geo: minimum exact-name/no-geography candidate score")
+    p.add_argument("--exact-name-no-geo-min-tokens", type=int, default=3, help="v1.25 distinctive_exact_name_no_geo: minimum distinctive non-stopword token count")
+    p.add_argument("--exact-name-no-geo-min-length", type=int, default=18, help="v1.25 distinctive_exact_name_no_geo: minimum normalized name length")
+    p.add_argument("--exact-name-no-geo-allow-non-us", action="store_true", help="Allow exact-name/no-geo rule for blank/non-US recipient states. Default requires a U.S. state.")
+    p.add_argument("--exact-name-no-geo-confidence", type=float, default=0.925)
     p.add_argument("--zip-city-state-name-min-name-score", type=float, default=0.80)
     p.add_argument("--zip-city-state-name-min-score", type=float, default=70.0)
     p.add_argument("--zip-city-state-name-confidence", type=float, default=0.91)
@@ -5440,7 +5566,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--queue-status", default=None)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-candidates", type=int, default=20)
-    p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Aliases: large_safe_remaining; address_name_remaining (v1.24 same-EIN address/name cleanup rules).")
+    p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Aliases include large_safe_remaining, address_name_remaining, and exact_name_no_geo_distinctive (v1.25).")
     p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them")
     p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
     p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
@@ -5499,6 +5625,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--high-address-geo-min-name-score", type=float, default=0.75)
     p.add_argument("--high-address-geo-min-score", type=float, default=70.0)
     p.add_argument("--high-address-geo-confidence", type=float, default=0.92)
+    p.add_argument("--exact-name-no-geo-min-score", type=float, default=55.0, help="v1.25 distinctive_exact_name_no_geo: minimum exact-name/no-geography candidate score")
+    p.add_argument("--exact-name-no-geo-min-tokens", type=int, default=3, help="v1.25 distinctive_exact_name_no_geo: minimum distinctive non-stopword token count")
+    p.add_argument("--exact-name-no-geo-min-length", type=int, default=18, help="v1.25 distinctive_exact_name_no_geo: minimum normalized name length")
+    p.add_argument("--exact-name-no-geo-allow-non-us", action="store_true", help="Allow exact-name/no-geo rule for blank/non-US recipient states. Default requires a U.S. state.")
+    p.add_argument("--exact-name-no-geo-confidence", type=float, default=0.925)
     p.add_argument("--zip-city-state-name-min-name-score", type=float, default=0.80)
     p.add_argument("--zip-city-state-name-min-score", type=float, default=70.0)
     p.add_argument("--zip-city-state-name-confidence", type=float, default=0.91)
