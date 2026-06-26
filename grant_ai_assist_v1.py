@@ -2754,12 +2754,43 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
         # v1.16 adds exact-name + exact-street + same-state as a strong signal,
         # covering the exact_name_state_only candidate-rule bucket where ZIP/city
         # may be missing or inconsistent but name/street/state all agree.
+        selected_score = float(selected["candidate_score"] or 0)
+        selected_name_score = float(selected["name_score"] or 0)
+        selected_address_score = float(selected["address_score"] or 0)
+        selected_exact_name = bool(selected["exact_name"])
+        selected_exact_address = bool(selected["exact_address"])
+        selected_zip_match = bool(selected["zip_match"])
+        selected_city_state = bool(selected["city_state_match"])
+        selected_state_match = bool(selected["state_match"])
+        other_scores = [float(c["candidate_score"] or 0) for c in candidates if clean_text(c["candidate_id"]) != candidate_id]
+        selected_gap = selected_score - (max(other_scores) if other_scores else 0.0)
+        single_candidate = len(candidates) == 1
         strong_signal = bool(
             selected["reported_ein_match"]
-            or (selected["exact_name"] and (selected["zip_match"] or selected["city_state_match"]))
-            or (selected["exact_address"] and selected["zip_match"] and float(selected["name_score"] or 0) >= 0.72)
-            or (selected["exact_name"] and selected["exact_address"] and selected["state_match"] and float(selected["candidate_score"] or 0) >= 87)
-            or float(selected["candidate_score"] or 0) >= 92
+            or (selected_exact_name and (selected_zip_match or selected_city_state))
+            or (selected_exact_address and selected_zip_match and selected_name_score >= 0.72)
+            # v1.24: exact street + city/state + moderate name is strong enough
+            # for same-EIN one-candidate rule rows where ZIP is missing/stale.
+            or (single_candidate and selected_exact_address and selected_city_state and selected_name_score >= 0.72)
+            # v1.24: high address similarity plus ZIP/city-state and good name
+            # similarity is also acceptable for one-candidate same-EIN rows.
+            or (single_candidate and selected_address_score >= 0.90 and (selected_zip_match or selected_city_state) and selected_name_score >= 0.75)
+            # v1.24 optional ZIP+city/state high-name rule.
+            or (single_candidate and selected_zip_match and selected_city_state and selected_name_score >= 0.80 and selected_score >= 70)
+            or (selected_exact_name and selected_exact_address and selected_state_match and selected_score >= 87)
+            # v1.23: one-candidate exact-name/state rows can be auto-accepted
+            # even when ZIP/city/address are missing or stale, because there is
+            # no competing candidate EIN.
+            or (single_candidate and selected_exact_name and selected_state_match and selected_score >= 57)
+            # v1.23: one-candidate high-name-similarity rows with geo/address
+            # evidence are also safe enough for deterministic acceptance.
+            or (single_candidate and selected_name_score >= 0.90 and (selected_zip_match or selected_city_state or selected_exact_address or selected_state_match) and selected_score >= 57)
+            # v1.23: multiple-candidate rows where the selected candidate is
+            # clearly ahead and has exact/high name evidence plus geography.
+            or (not single_candidate and selected_exact_name and (selected_zip_match or selected_city_state or selected_exact_address or selected_state_match) and selected_gap >= 10)
+            or (not single_candidate and selected_name_score >= 0.92 and (selected_zip_match or selected_city_state or selected_exact_address) and selected_gap >= 20)
+            or (not single_candidate and selected_exact_address and selected_name_score >= 0.92 and selected_gap >= 10 and selected_score >= 90)
+            or selected_score >= 92
         )
         if confidence_f >= auto_accept_threshold and strong_signal and not needs_review:
             auto_accept = 1
@@ -3954,6 +3985,28 @@ def cmd_nonadjudicable_recipient_triage(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 CANDIDATE_RULES_DEFAULT = "exact_name_zip,exact_name_city_state,exact_address_zip_good_name"
+CANDIDATE_RULES_LARGE_SAFE_REMAINING = {
+    "same_ein_exact_name_geo",
+    "same_ein_high_name_geo",
+    "clear_top_exact_name_geo",
+    "clear_top_high_name_geo",
+}
+# v1.24: next set of deterministic rules for the remaining same-EIN weak-name
+# bucket. These intentionally require strong address/geography evidence plus
+# at least moderate name similarity, and they only apply when the best-candidate
+# row is the only candidate/EIN for the signature unless the user explicitly
+# changes thresholds.
+CANDIDATE_RULES_ADDRESS_NAME_REMAINING = {
+    "same_ein_exact_address_zip_moderate_name",
+    "same_ein_exact_address_city_state_moderate_name",
+    "same_ein_high_address_geo_high_name",
+}
+CANDIDATE_RULE_ALIASES = {
+    "large_safe_remaining": CANDIDATE_RULES_LARGE_SAFE_REMAINING,
+    "remaining_large_safe": CANDIDATE_RULES_LARGE_SAFE_REMAINING,
+    "address_name_remaining": CANDIDATE_RULES_ADDRESS_NAME_REMAINING,
+    "remaining_address_name": CANDIDATE_RULES_ADDRESS_NAME_REMAINING,
+}
 CANDIDATE_RULES_ALL = {
     "reported_ein_candidate",
     "single_candidate_high_score",
@@ -3963,6 +4016,15 @@ CANDIDATE_RULES_ALL = {
     "exact_name_state_only",
     "all_candidates_same_ein_high_score",
     "all_candidates_same_ein_strong_evidence",
+    "same_ein_exact_name_geo",
+    "same_ein_high_name_geo",
+    "clear_top_exact_name_geo",
+    "clear_top_high_name_geo",
+    "exact_address_high_name_clear",
+    "same_ein_exact_address_zip_moderate_name",
+    "same_ein_exact_address_city_state_moderate_name",
+    "same_ein_high_address_geo_high_name",
+    "same_ein_zip_city_state_high_name",
     "clear_best_candidate",
 }
 
@@ -3984,10 +4046,21 @@ def _i01(value: Any) -> int:
 
 
 def parse_rule_list(text_value: str) -> set:
-    rules = {x.strip() for x in (text_value or "").split(",") if x.strip()}
-    unknown = rules - CANDIDATE_RULES_ALL
+    rules = set()
+    unknown = set()
+    for token in (text_value or "").split(","):
+        t = token.strip()
+        if not t:
+            continue
+        if t in CANDIDATE_RULE_ALIASES:
+            rules.update(CANDIDATE_RULE_ALIASES[t])
+        elif t in CANDIDATE_RULES_ALL:
+            rules.add(t)
+        else:
+            unknown.add(t)
     if unknown:
-        raise ValueError(f"Unknown candidate rule(s): {', '.join(sorted(unknown))}. Valid: {', '.join(sorted(CANDIDATE_RULES_ALL))}")
+        valid = sorted(CANDIDATE_RULES_ALL | set(CANDIDATE_RULE_ALIASES))
+        raise ValueError(f"Unknown candidate rule(s): {', '.join(sorted(unknown))}. Valid: {', '.join(valid)}")
     return rules
 
 
@@ -4138,6 +4211,64 @@ def classify_candidate_rule(row: sqlite3.Row, args: argparse.Namespace) -> Tuple
                 if count == 1 or gap >= float(args.exact_name_state_min_gap):
                     return "exact_name_state_only", "", float(args.exact_name_state_confidence)
                 return "", "exact_name_state_gap_too_small", 0.0
+
+    # v1.23: large safe remaining bucket #1. Exactly one candidate EIN remains,
+    # the normalized recipient name exactly matches, and at least state/geography
+    # evidence agrees. This handles rows where ZIP/city/address may be stale or
+    # omitted, but there is only one plausible EIN and the legal name is exact.
+    if count == 1 and exact_name and _i01(row["state_match"]):
+        if cscore >= float(args.same_ein_exact_name_geo_min_score) and nscore >= float(args.same_ein_exact_name_geo_min_name_score):
+            return "same_ein_exact_name_geo", "", float(args.same_ein_exact_name_geo_confidence)
+
+    # v1.23: large safe remaining bucket #2. Exactly one candidate EIN remains,
+    # name similarity is very high, and there is at least state/geography/address
+    # evidence. This is the high-similarity companion to exact-name same-EIN.
+    if count == 1 and nscore >= float(args.same_ein_high_name_geo_min_name_score):
+        if (zip_match or city_state or exact_address or _i01(row["state_match"])) and cscore >= float(args.same_ein_high_name_geo_min_score):
+            return "same_ein_high_name_geo", "", float(args.same_ein_high_name_geo_confidence)
+
+    # v1.23: large safe remaining bucket #3. Multiple distinct EINs exist, but
+    # the top candidate has exact normalized name plus geo/address evidence and
+    # is clearly ahead of the second candidate.
+    if count > 1 and exact_name:
+        if (zip_match or city_state or exact_address or _i01(row["state_match"])) and cscore >= float(args.clear_top_exact_name_geo_min_score) and gap >= float(args.clear_top_exact_name_geo_min_gap):
+            return "clear_top_exact_name_geo", "", float(args.clear_top_exact_name_geo_confidence)
+
+    # v1.23: large safe remaining bucket #4. Multiple distinct EINs exist, but
+    # the top candidate has very high name similarity plus stronger geo/address
+    # evidence and a wide score gap.
+    if count > 1 and nscore >= float(args.clear_top_high_name_geo_min_name_score):
+        if (zip_match or city_state or exact_address) and cscore >= float(args.clear_top_high_name_geo_min_score) and gap >= float(args.clear_top_high_name_geo_min_gap):
+            return "clear_top_high_name_geo", "", float(args.clear_top_high_name_geo_confidence)
+
+    # v1.24: same-EIN weak-name cleanup. These rules are for the remaining
+    # one-candidate/same-EIN bucket after the stronger exact-name and high-score
+    # rules have already run. They avoid broad ZIP/city-only guesses and require
+    # strong address/geography evidence plus at least moderate name similarity.
+    addr_name_min = float(args.addr_name_min_name_score)
+    addr_name_score_min = float(args.addr_name_min_score)
+
+    if count == 1 and exact_address and zip_match and nscore >= addr_name_min and cscore >= addr_name_score_min:
+        return "same_ein_exact_address_zip_moderate_name", "", float(args.addr_name_confidence)
+
+    if count == 1 and exact_address and city_state and nscore >= addr_name_min and cscore >= float(args.addr_name_city_state_min_score):
+        return "same_ein_exact_address_city_state_moderate_name", "", float(args.addr_name_city_state_confidence)
+
+    if count == 1 and _fnum(row["address_score"]) >= float(args.high_address_geo_min_address_score) and (zip_match or city_state):
+        if nscore >= float(args.high_address_geo_min_name_score) and cscore >= float(args.high_address_geo_min_score):
+            return "same_ein_high_address_geo_high_name", "", float(args.high_address_geo_confidence)
+
+    # Optional, not part of the address_name_remaining alias by default:
+    # strong name similarity plus ZIP+city/state evidence, but no address match.
+    if count == 1 and zip_match and city_state and nscore >= float(args.zip_city_state_name_min_name_score) and cscore >= float(args.zip_city_state_name_min_score):
+        return "same_ein_zip_city_state_high_name", "", float(args.zip_city_state_name_confidence)
+
+    # v1.23 optional: exact address plus high name similarity, but only when
+    # there is a strong score gap. This is not part of the large_safe_remaining
+    # alias by default because the broader bucket had a low average gap.
+    if exact_address and nscore >= float(args.exact_address_high_name_clear_min_name_score):
+        if cscore >= float(args.exact_address_high_name_clear_min_score) and gap >= float(args.exact_address_high_name_clear_min_gap):
+            return "exact_address_high_name_clear", "", float(args.exact_address_high_name_clear_confidence)
 
     # v1.20: after safer exact/address/single-candidate rules have been applied,
     # a large remaining bucket has exactly one candidate EIN, exact normalized
@@ -5262,6 +5393,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--same-ein-high-min-score", type=float, default=95.0)
     p.add_argument("--same-ein-high-min-name-score", type=float, default=0.80)
     p.add_argument("--same-ein-high-confidence", type=float, default=0.955)
+    p.add_argument("--same-ein-exact-name-geo-min-score", type=float, default=57.0)
+    p.add_argument("--same-ein-exact-name-geo-min-name-score", type=float, default=0.99)
+    p.add_argument("--same-ein-exact-name-geo-confidence", type=float, default=0.94)
+    p.add_argument("--same-ein-high-name-geo-min-score", type=float, default=57.0)
+    p.add_argument("--same-ein-high-name-geo-min-name-score", type=float, default=0.90)
+    p.add_argument("--same-ein-high-name-geo-confidence", type=float, default=0.93)
+    p.add_argument("--clear-top-exact-name-geo-min-score", type=float, default=60.0)
+    p.add_argument("--clear-top-exact-name-geo-min-gap", type=float, default=10.0)
+    p.add_argument("--clear-top-exact-name-geo-confidence", type=float, default=0.925)
+    p.add_argument("--clear-top-high-name-geo-min-score", type=float, default=65.0)
+    p.add_argument("--clear-top-high-name-geo-min-name-score", type=float, default=0.92)
+    p.add_argument("--clear-top-high-name-geo-min-gap", type=float, default=20.0)
+    p.add_argument("--clear-top-high-name-geo-confidence", type=float, default=0.92)
+    p.add_argument("--exact-address-high-name-clear-min-score", type=float, default=90.0)
+    p.add_argument("--exact-address-high-name-clear-min-name-score", type=float, default=0.92)
+    p.add_argument("--exact-address-high-name-clear-min-gap", type=float, default=10.0)
+    p.add_argument("--exact-address-high-name-clear-confidence", type=float, default=0.925)
+    p.add_argument("--addr-name-min-name-score", type=float, default=0.75, help="v1.24 address_name_remaining: minimum name_score for exact-address ZIP/city-state same-EIN rules")
+    p.add_argument("--addr-name-min-score", type=float, default=80.0)
+    p.add_argument("--addr-name-confidence", type=float, default=0.93)
+    p.add_argument("--addr-name-city-state-min-score", type=float, default=65.0)
+    p.add_argument("--addr-name-city-state-confidence", type=float, default=0.925)
+    p.add_argument("--high-address-geo-min-address-score", type=float, default=0.90)
+    p.add_argument("--high-address-geo-min-name-score", type=float, default=0.75)
+    p.add_argument("--high-address-geo-min-score", type=float, default=70.0)
+    p.add_argument("--high-address-geo-confidence", type=float, default=0.92)
+    p.add_argument("--zip-city-state-name-min-name-score", type=float, default=0.80)
+    p.add_argument("--zip-city-state-name-min-score", type=float, default=70.0)
+    p.add_argument("--zip-city-state-name-confidence", type=float, default=0.91)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
@@ -5280,7 +5440,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--queue-status", default=None)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-candidates", type=int, default=20)
-    p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Conservative default excludes single-candidate and reported-EIN buckets")
+    p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Aliases: large_safe_remaining; address_name_remaining (v1.24 same-EIN address/name cleanup rules).")
     p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them")
     p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
     p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
@@ -5313,6 +5473,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--same-ein-high-min-score", type=float, default=95.0)
     p.add_argument("--same-ein-high-min-name-score", type=float, default=0.80)
     p.add_argument("--same-ein-high-confidence", type=float, default=0.955)
+    p.add_argument("--same-ein-exact-name-geo-min-score", type=float, default=57.0)
+    p.add_argument("--same-ein-exact-name-geo-min-name-score", type=float, default=0.99)
+    p.add_argument("--same-ein-exact-name-geo-confidence", type=float, default=0.94)
+    p.add_argument("--same-ein-high-name-geo-min-score", type=float, default=57.0)
+    p.add_argument("--same-ein-high-name-geo-min-name-score", type=float, default=0.90)
+    p.add_argument("--same-ein-high-name-geo-confidence", type=float, default=0.93)
+    p.add_argument("--clear-top-exact-name-geo-min-score", type=float, default=60.0)
+    p.add_argument("--clear-top-exact-name-geo-min-gap", type=float, default=10.0)
+    p.add_argument("--clear-top-exact-name-geo-confidence", type=float, default=0.925)
+    p.add_argument("--clear-top-high-name-geo-min-score", type=float, default=65.0)
+    p.add_argument("--clear-top-high-name-geo-min-name-score", type=float, default=0.92)
+    p.add_argument("--clear-top-high-name-geo-min-gap", type=float, default=20.0)
+    p.add_argument("--clear-top-high-name-geo-confidence", type=float, default=0.92)
+    p.add_argument("--exact-address-high-name-clear-min-score", type=float, default=90.0)
+    p.add_argument("--exact-address-high-name-clear-min-name-score", type=float, default=0.92)
+    p.add_argument("--exact-address-high-name-clear-min-gap", type=float, default=10.0)
+    p.add_argument("--exact-address-high-name-clear-confidence", type=float, default=0.925)
+    p.add_argument("--addr-name-min-name-score", type=float, default=0.75, help="v1.24 address_name_remaining: minimum name_score for exact-address ZIP/city-state same-EIN rules")
+    p.add_argument("--addr-name-min-score", type=float, default=80.0)
+    p.add_argument("--addr-name-confidence", type=float, default=0.93)
+    p.add_argument("--addr-name-city-state-min-score", type=float, default=65.0)
+    p.add_argument("--addr-name-city-state-confidence", type=float, default=0.925)
+    p.add_argument("--high-address-geo-min-address-score", type=float, default=0.90)
+    p.add_argument("--high-address-geo-min-name-score", type=float, default=0.75)
+    p.add_argument("--high-address-geo-min-score", type=float, default=70.0)
+    p.add_argument("--high-address-geo-confidence", type=float, default=0.92)
+    p.add_argument("--zip-city-state-name-min-name-score", type=float, default=0.80)
+    p.add_argument("--zip-city-state-name-min-score", type=float, default=70.0)
+    p.add_argument("--zip-city-state-name-confidence", type=float, default=0.91)
     p.add_argument("--address-rule-min-score", type=float, default=92.0)
     p.add_argument("--address-rule-min-name-score", type=float, default=0.78)
     p.add_argument("--address-rule-min-gap", type=float, default=5.0)
