@@ -1,204 +1,123 @@
-# Batch AI adjudication workflow, v1.26
+# Batch AI Adjudication Workflow — v1.27
 
-This workflow lets you run the expensive remaining grant-recipient adjudication on a Linux AI server without copying the full IRS 990 SQLite database.
-
-The Windows/project machine exports self-contained JSONL packet files. The Linux server reads those packets, calls Ollama, and writes decision JSONL files. The Windows machine then imports the decisions, validates them against the local database candidate table, and applies only accepted decisions to the final enhanced grant view.
+This guide covers the Linux/Ollama batch worker for grant-recipient adjudication packets exported from the Windows IRS 990 database workflow.
 
 ## Files
 
-Use these files:
+- `grant_ai_assist_v1.py` — Windows/database-side script. Exports packets and imports decisions.
+- `grant_ai_batch_worker.py` — Linux/Ollama worker. Reads packet JSONL files and writes decision JSONL files.
+- `grant_ai_adjudicator_system_prompt_v1_27.txt` — optional standalone prompt file.
+- `Modelfile.grant-ai-adjudicator-v1_27` — optional Ollama Modelfile that embeds the system prompt.
 
-```text
-C:\projects\irs990-tool\grant_ai_assist_v1.py       # copy from grant_ai_assist_v1_26_batch_adjudication.py
-Linux AI server: grant_ai_batch_worker.py
-```
+## v1.27 worker changes
 
-The exported packet files contain:
+Compared with v1.26, the Linux worker now adds:
 
-```text
-signature_hash
-recipient signature fields
-first-pass resolver status/warnings
-candidate EIN list
-candidate scores/reasons
-response template
-```
+- `--error-retries N` to retry transient Ollama/API/JSON failures before writing to `errors_*.jsonl`.
+- `--retry-backoff-seconds` and `--retry-backoff-multiplier` for retry pacing.
+- `--candidate-id-retries N` to retry when the model tries to select a candidate but omits or garbles `candidate_id`.
+- stricter JSON schema: `candidate_id` is now required on every response.
+- stronger prompt language: `SELECT_CANDIDATE` must include an exact candidate ID such as `C1`.
+- `--system-prompt-file` for testing prompt variants without editing the script.
+- `--omit-system-message` for use with a custom Ollama Modelfile that already embeds the system prompt.
 
-They do **not** contain your whole SQLite database.
+## Recommended worker command
 
-## Recommended strategy
-
-Do not process all remaining signatures first. Start with the largest dollar bucket.
-
-From your latest amount-bucket check, the `>= $100,001` signature bucket accounted for most of the remaining dollar value. Start there.
-
-A good first production sequence is:
-
-```text
-1. Export high-dollar packets from Windows.
-2. Copy packet directory and worker script to Linux.
-3. Run a small Linux test: one file, 25 records.
-4. Run a real Linux batch with 1-2 parallel workers.
-5. Copy decision files back to Windows.
-6. Dry-run import and inspect audit CSV.
-7. Real import.
-8. apply-decisions --full-refresh.
-9. Recount remaining queue.
-```
-
-## 1. Export packet batches on Windows
-
-From PowerShell:
-
-```powershell
-cd C:\projects\irs990-tool
-
-python grant_ai_assist_v1.py export-adjudication-batches `
-  --min-total-amount 100000 `
-  --batch-size 10000 `
-  --out-dir exports\ai_packets_100k `
-  --prefix adjudication_packets `
-  --manifest exports\ai_packets_100k\adjudication_packets_manifest.json `
-  --summary-csv exports\ai_packets_100k\packet_summary.csv
-```
-
-This creates files like:
-
-```text
-exports\ai_packets_100k\adjudication_packets_000001.jsonl
-exports\ai_packets_100k\adjudication_packets_000002.jsonl
-...
-exports\ai_packets_100k\adjudication_packets_manifest.json
-exports\ai_packets_100k\packet_summary.csv
-```
-
-### Useful export flags
-
-```text
---min-total-amount 100000      Export only signatures whose aggregated signature amount is >= 100,000.
---max-total-amount 100000      Optional upper bound for a bucketed run.
---state OR                     Optional state filter.
---limit 25000                  Optional total packet limit across all output files.
---batch-size 10000             Packets per JSONL file.
---max-candidates 20            Candidate rows per signature.
---include-schema               Include JSON schema in every packet; easier to inspect, larger files.
---overwrite                    Replace existing packet files with the same prefix.
-```
-
-### Bucketed exports
-
-For the next lower bucket:
-
-```powershell
-python grant_ai_assist_v1.py export-adjudication-batches `
-  --min-total-amount 50000 `
-  --max-total-amount 100000 `
-  --batch-size 10000 `
-  --out-dir exports\ai_packets_50k_100k `
-  --prefix adjudication_packets
-```
-
-For a small test export:
-
-```powershell
-python grant_ai_assist_v1.py export-adjudication-batches `
-  --min-total-amount 100000 `
-  --limit 100 `
-  --batch-size 25 `
-  --out-dir exports\ai_packets_test `
-  --prefix adjudication_packets `
-  --overwrite
-```
-
-## 2. Copy packets and worker to Linux
-
-Example using `scp` from Windows PowerShell:
-
-```powershell
-scp grant_ai_batch_worker.py user@192.168.7.221:/data/irs990_ai/
-scp -r exports\ai_packets_100k user@192.168.7.221:/data/irs990_ai/packets_100k
-```
-
-Adjust paths/user/host as needed.
-
-## 3. Test Ollama on Linux with a tiny run
-
-On the Linux AI server:
+Use 4 workers based on the earlier benchmark where 4 workers was faster than 1, 2, or 8.
 
 ```bash
-cd /data/irs990_ai
-
 python3 grant_ai_batch_worker.py \
   --input-dir /data/irs990_ai/packets_100k \
+  --output-dir /data/irs990_ai/decisions_100k \
+  --model gemma4:12b \
+  --ollama-url http://127.0.0.1:11434/api/chat \
+  --parallel-workers 4 \
+  --error-retries 2 \
+  --candidate-id-retries 1 \
+  --retry-backoff-seconds 2 \
+  --progress-every 25
+```
+
+The default values already include:
+
+```text
+--error-retries 2
+--candidate-id-retries 1
+--retry-backoff-seconds 2
+--retry-backoff-multiplier 1.5
+--think disabled
+--format-mode schema
+```
+
+## Testing a single packet file
+
+```bash
+python3 grant_ai_batch_worker.py \
+  --input-file /data/irs990_ai/packets_100k/adjudication_packets_000001.jsonl \
   --output-dir /data/irs990_ai/decisions_test \
   --model gemma4:12b \
   --ollama-url http://127.0.0.1:11434/api/chat \
-  --parallel-workers 1 \
-  --max-files 1 \
+  --parallel-workers 4 \
   --limit 25 \
   --overwrite \
   --progress-every 1
 ```
 
-This writes:
+## Retry behavior
 
-```text
-/data/irs990_ai/decisions_test/decisions_000001.jsonl
-/data/irs990_ai/decisions_test/errors_000001.jsonl
+### `--error-retries`
+
+Retries failures such as:
+
+- Ollama HTTP/API errors.
+- empty `message.content`.
+- invalid JSON returned by Ollama.
+- malformed structured output that cannot be parsed.
+
+Example:
+
+```bash
+--error-retries 2 --retry-backoff-seconds 2 --retry-backoff-multiplier 1.5
 ```
 
-If the error file is empty or very small and the decisions look valid, proceed.
+This gives each packet up to three total tries: the initial call plus two retries.
 
-## 4. Run production processing on Linux
+### `--candidate-id-retries`
 
-Single-worker conservative run:
+Retries when the model appears to select a candidate but fails to return a valid `candidate_id`.
+
+The retry message gives the model an explicit list such as:
+
+```text
+C1 = EIN 123456789, name Example Org; C2 = EIN 987654321, name Example Foundation
+```
+
+If the retry still fails, the worker safely converts the row to:
+
+```json
+{
+  "decision": "HUMAN_REVIEW",
+  "reason_codes": ["worker_missing_or_invalid_candidate_id"]
+}
+```
+
+## Resuming interrupted runs
+
+The worker is resumable by default. If a decision file already contains a `signature_hash`, that signature is skipped on rerun.
 
 ```bash
 python3 grant_ai_batch_worker.py \
   --input-dir /data/irs990_ai/packets_100k \
   --output-dir /data/irs990_ai/decisions_100k \
   --model gemma4:12b \
-  --ollama-url http://127.0.0.1:11434/api/chat \
-  --parallel-workers 1 \
-  --progress-every 25
+  --parallel-workers 4
 ```
 
-Two-worker run, if your server handles parallel Gemma requests well:
+Use `--overwrite` only when you intentionally want to delete and recreate the decision/error files.
 
-```bash
-python3 grant_ai_batch_worker.py \
-  --input-dir /data/irs990_ai/packets_100k \
-  --output-dir /data/irs990_ai/decisions_100k \
-  --model gemma4:12b \
-  --ollama-url http://127.0.0.1:11434/api/chat \
-  --parallel-workers 2 \
-  --progress-every 25
-```
+## Error files
 
-### Worker flags
-
-```text
---parallel-workers 2           Number of concurrent Ollama calls from this worker.
---num-predict 700              Output token budget. Lower can be faster; too low may truncate JSON.
---num-ctx 8192                 Context window.
---timeout 180                  Seconds before one Ollama request fails.
---format-mode schema           Use Ollama structured schema output.
---think                        Enable model thinking. Default is off and recommended.
---resume / --no-resume          Default resume skips signatures already written to the output decision file.
---overwrite                    Delete output/error files for the selected input and rerun.
---write-failures-as-human-review
-                               Optional. Default writes failed calls only to errors_*.jsonl so they can be retried.
-```
-
-## 5. Resuming failed or interrupted Linux runs
-
-The worker is resumable by default.
-
-If a run stops halfway, rerun the same command with the same output directory. It reads existing `decisions_*.jsonl` files and skips signatures already processed.
-
-Do **not** use `--overwrite` unless you want to redo a batch from scratch.
-
-Errors go to:
+Rows that still fail after all retries are written to:
 
 ```text
 errors_000001.jsonl
@@ -206,23 +125,54 @@ errors_000002.jsonl
 ...
 ```
 
-If errors are due to transient network/model problems, rerun the worker. It will skip already completed decisions and try unfinished packet records again.
+By default, failed calls are not written as decisions. That means they can be retried later. If you want failures to become explicit human-review decisions, use:
 
-## 6. Copy decisions back to Windows
-
-From Windows PowerShell:
-
-```powershell
-cd C:\projects\irs990-tool
-mkdir imports\ai_decisions_100k -Force
-scp -r user@192.168.7.221:/data/irs990_ai/decisions_100k/* imports\ai_decisions_100k\
+```bash
+--write-failures-as-human-review
 ```
 
-You only need the `decisions_*.jsonl` files for import. Keep `errors_*.jsonl` for troubleshooting.
+Usually, leave that off.
 
-## 7. Dry-run import on Windows
+## Optional: custom Ollama model with embedded system prompt
 
-Always validate before real import:
+The worker normally sends a system prompt with every request. You can instead create a custom Ollama model that embeds the system prompt using the provided Modelfile.
+
+On the Linux server:
+
+```bash
+ollama create grant-ai-adjudicator:gemma4-12b -f Modelfile.grant-ai-adjudicator-v1_27
+```
+
+Then run the worker with the custom model and omit the system message:
+
+```bash
+python3 grant_ai_batch_worker.py \
+  --input-dir /data/irs990_ai/packets_100k \
+  --output-dir /data/irs990_ai/decisions_100k \
+  --model grant-ai-adjudicator:gemma4-12b \
+  --ollama-url http://127.0.0.1:11434/api/chat \
+  --parallel-workers 4 \
+  --omit-system-message
+```
+
+This may reduce repeated prompt tokens slightly, but it will not eliminate per-request input because the grant-recipient packet and candidate list must still be sent for each signature.
+
+## Alternative: prompt file
+
+If you want to test prompt changes without editing the script:
+
+```bash
+python3 grant_ai_batch_worker.py \
+  --input-dir /data/irs990_ai/packets_100k \
+  --output-dir /data/irs990_ai/decisions_100k \
+  --model gemma4:12b \
+  --system-prompt-file grant_ai_adjudicator_system_prompt_v1_27.txt \
+  --parallel-workers 4
+```
+
+## Windows import workflow
+
+After copying decisions back to Windows, always dry-run import first:
 
 ```powershell
 python grant_ai_assist_v1.py import-adjudication-decision-dir `
@@ -233,25 +183,7 @@ python grant_ai_assist_v1.py import-adjudication-decision-dir `
   --audit-dir imports\ai_decisions_100k_audit
 ```
 
-Review the audit CSVs in:
-
-```text
-imports\ai_decisions_100k_audit\
-```
-
-Look for:
-
-```text
-validation_status
-validation_error
-auto_accept
-selected_ein
-selected_name
-```
-
-If validation errors are high, do not real-import yet. Inspect the reasons.
-
-## 8. Real import on Windows
+If the audit looks good:
 
 ```powershell
 python grant_ai_assist_v1.py import-adjudication-decision-dir `
@@ -261,64 +193,30 @@ python grant_ai_assist_v1.py import-adjudication-decision-dir `
   --audit-dir imports\ai_decisions_100k_audit_real
 ```
 
-This writes validated decisions to:
-
-```text
-grant_recipient_ai_decision
-```
-
-The import stores all validated decisions, but only decisions with `auto_accept=1` and sufficient confidence are applied into the final enhanced view by the next step.
-
-## 9. Apply decisions
+Then rebuild the applied/final layer:
 
 ```powershell
 python grant_ai_assist_v1.py apply-decisions --full-refresh
 ```
 
-This rebuilds:
+## What to monitor in import audit CSVs
+
+Look at:
 
 ```text
-grant_recipient_ai_applied
-grant_recipient_resolved_plus_ai_v1
+validation_status
+validation_error
+auto_accept
+decision
+selected_ein
+selected_name
+reason_codes_json
+explanation
 ```
 
-It does not rebuild identity/candidates/signatures.
-
-## 10. Recount remaining queue
-
-```powershell
-sqlite3 C:\projects\irs990-tool\db\irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);"
-```
-
-## Suggested operating pattern
-
-Start with high-dollar signatures:
+The safest production rule remains:
 
 ```text
->= $100,001
-$50,001-$100,000
-$10,001-$50,000
+Import all valid decisions if desired, but only apply rows where the Windows importer marks auto_accept = 1.
 ```
 
-Do the low-dollar buckets later, or only if needed.
-
-## Database size note
-
-Your DB object-size report showed large working tables, especially:
-
-```text
-grant_recipient_ai_decision      ~6.8 GB
-grant_recipient_resolved         ~5.7 GB
-grants                           ~3.6 GB
-grant_recipient_ai_candidate     ~3.1 GB
-org_identity                     ~2.9 GB
-grant_recipient_signature        ~1.9 GB
-```
-
-This is mostly real working data, not junk. After the matching project is stable, you can consider archiving/rebuilding some working tables, but do not drop them while you are still generating candidates or importing AI decisions.
-
-Periodically checkpoint WAL files:
-
-```powershell
-sqlite3 C:\projects\irs990-tool\db\irs990.db "PRAGMA wal_checkpoint(TRUNCATE);"
-```
