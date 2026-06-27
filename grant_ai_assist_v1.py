@@ -69,6 +69,14 @@ Deterministic candidate-rule passes:
   decisions before applying them. The workflow supports batch-size controls,
   manifests, resumable per-file worker output, and directory-level decision
   import.
+- v1.28 changes import/apply behavior so every structurally valid AI
+  SELECT_CANDIDATE decision is automatically marked auto_accept=1. This keeps
+  core safety validation (valid signature, valid candidate_id, candidate from
+  the supplied list, confidence parsable, placeholder/grantor guardrails) but
+  no longer requires extra deterministic evidence before applying an AI-selected
+  candidate. apply-decisions now defaults to no additional minimum-confidence
+  filter. Use query-module audit fields to identify and spot-check AI-adjudicated
+  matches later.
 
 
 This script is intended to run AFTER resolve_grant_recipients_v2_1_fast.py has
@@ -2875,54 +2883,15 @@ def validate_ai_output(output: Dict[str, Any], candidates: Sequence[sqlite3.Row]
     needs_review = bool(output.get("needs_human_review", True))
     auto_accept = 0
     if validation_status == "ok" and selected is not None and decision in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"}:
-        # Strong deterministic evidence that is safe enough for auto-accept.
-        # v1.16 adds exact-name + exact-street + same-state as a strong signal,
-        # covering the exact_name_state_only candidate-rule bucket where ZIP/city
-        # may be missing or inconsistent but name/street/state all agree.
-        selected_score = float(selected["candidate_score"] or 0)
-        selected_name_score = float(selected["name_score"] or 0)
-        selected_address_score = float(selected["address_score"] or 0)
-        selected_exact_name = bool(selected["exact_name"])
-        selected_exact_address = bool(selected["exact_address"])
-        selected_zip_match = bool(selected["zip_match"])
-        selected_city_state = bool(selected["city_state_match"])
-        selected_state_match = bool(selected["state_match"])
-        other_scores = [float(c["candidate_score"] or 0) for c in candidates if clean_text(c["candidate_id"]) != candidate_id]
-        selected_gap = selected_score - (max(other_scores) if other_scores else 0.0)
-        single_candidate = len(candidates) == 1
-        strong_signal = bool(
-            selected["reported_ein_match"]
-            or (selected_exact_name and (selected_zip_match or selected_city_state))
-            or (selected_exact_address and selected_zip_match and selected_name_score >= 0.72)
-            # v1.24: exact street + city/state + moderate name is strong enough
-            # for same-EIN one-candidate rule rows where ZIP is missing/stale.
-            or (single_candidate and selected_exact_address and selected_city_state and selected_name_score >= 0.72)
-            # v1.24: high address similarity plus ZIP/city-state and good name
-            # similarity is also acceptable for one-candidate same-EIN rows.
-            or (single_candidate and selected_address_score >= 0.90 and (selected_zip_match or selected_city_state) and selected_name_score >= 0.75)
-            # v1.24 optional ZIP+city/state high-name rule.
-            or (single_candidate and selected_zip_match and selected_city_state and selected_name_score >= 0.80 and selected_score >= 70)
-            or (selected_exact_name and selected_exact_address and selected_state_match and selected_score >= 87)
-            # v1.23: one-candidate exact-name/state rows can be auto-accepted
-            # even when ZIP/city/address are missing or stale, because there is
-            # no competing candidate EIN.
-            or (single_candidate and selected_exact_name and selected_state_match and selected_score >= 57)
-            # v1.23: one-candidate high-name-similarity rows with geo/address
-            # evidence are also safe enough for deterministic acceptance.
-            or (single_candidate and selected_name_score >= 0.90 and (selected_zip_match or selected_city_state or selected_exact_address or selected_state_match) and selected_score >= 57)
-            # v1.23: multiple-candidate rows where the selected candidate is
-            # clearly ahead and has exact/high name evidence plus geography.
-            or (not single_candidate and selected_exact_name and (selected_zip_match or selected_city_state or selected_exact_address or selected_state_match) and selected_gap >= 10)
-            or (not single_candidate and selected_name_score >= 0.92 and (selected_zip_match or selected_city_state or selected_exact_address) and selected_gap >= 20)
-            or (not single_candidate and selected_exact_address and selected_name_score >= 0.92 and selected_gap >= 10 and selected_score >= 90)
-            # v1.25: exact-name/no-geo distinctive one-candidate rule. No
-            # geography evidence is present, so require a distinctive U.S.
-            # recipient name and a modest exact-name candidate score.
-            or (single_candidate and selected_exact_name and not selected_exact_address and not selected_zip_match and not selected_city_state and not selected_state_match and selected_score >= 55 and is_distinctive_exact_name_no_geo(sig["recipient_name"], sig["state"]))
-            or selected_score >= 92
-        )
-        if confidence_f >= auto_accept_threshold and strong_signal and not needs_review:
-            auto_accept = 1
+        # v1.28: user-selected policy change.
+        #
+        # A valid AI SELECT_CANDIDATE decision now means: apply the selected
+        # candidate. We still require the candidate_id to exist in the supplied
+        # candidate list and retain the placeholder/grantor safety guardrail
+        # above, but we no longer require an additional deterministic strong
+        # signal before setting auto_accept=1. Query-module audit columns should
+        # be used downstream to identify AI-adjudicated matches for spot checks.
+        auto_accept = 1
     return {
         "validation_status": validation_status,
         "validation_error": ";".join(errors),
@@ -5589,7 +5558,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-total-amount", type=float, default=None)
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--max-candidates", type=int, default=20)
-    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.0, help="Deprecated for AI SELECT_CANDIDATE in v1.28; valid SELECT_CANDIDATE rows auto-accept regardless of confidence. Kept for compatibility.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--csv-out", default="ai_grant_decisions.csv")
     p.add_argument("--commit-every", type=int, default=50)
@@ -5744,7 +5713,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Validate import and write audit CSV, but do not insert decisions")
     p.add_argument("--audit-csv", default="external_decision_import_audit.csv")
     p.add_argument("--max-candidates", type=int, default=20)
-    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.0, help="Deprecated for AI SELECT_CANDIDATE in v1.28; valid SELECT_CANDIDATE rows auto-accept regardless of confidence. Kept for compatibility.")
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decisions)
@@ -5761,7 +5730,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audit-dir", default="imports/ai_decision_audits", help="Directory for per-file audit CSVs")
     p.add_argument("--audit-csv", default="external_decision_import_audit.csv", help="Fallback audit CSV if --audit-dir is blank")
     p.add_argument("--max-candidates", type=int, default=20)
-    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.0, help="Deprecated for AI SELECT_CANDIDATE in v1.28; valid SELECT_CANDIDATE rows auto-accept regardless of confidence. Kept for compatibility.")
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decision_dir)
@@ -5879,7 +5848,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them")
     p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
     p.add_argument("--include-nonadjudicable-placeholders", action="store_true")
-    p.add_argument("--auto-accept-threshold", type=float, default=0.92)
+    p.add_argument("--auto-accept-threshold", type=float, default=0.0, help="Deprecated for AI SELECT_CANDIDATE in v1.28; valid SELECT_CANDIDATE rows auto-accept regardless of confidence. Kept for compatibility.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--csv-out", default="candidate_rule_decisions.csv")
     p.add_argument("--include-skipped", action="store_true")
@@ -5952,10 +5921,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clear-best-confidence", type=float, default=0.935)
     p.set_defaults(func=cmd_candidate_rule_decisions)
 
-    p = sub.add_parser("apply-decisions", help="Apply auto-accepted AI decisions to separate table and final view")
+    p = sub.add_parser("apply-decisions", help="Apply accepted decisions to separate table and final view")
     add_common_db(p)
     p.add_argument("--full-refresh", action="store_true")
-    p.add_argument("--min-confidence", type=float, default=0.92)
+    p.add_argument("--min-confidence", type=float, default=0.0, help="Optional minimum confidence for applying auto-accepted decisions. v1.28 default is 0.0 because valid AI SELECT_CANDIDATE decisions are accepted by policy.")
     p.add_argument("--batch-size", type=int, default=50000)
     p.set_defaults(func=cmd_apply_decisions)
 

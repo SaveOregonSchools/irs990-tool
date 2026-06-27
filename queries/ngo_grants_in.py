@@ -3,6 +3,14 @@
 #
 # Drop-in replacement with an optional enhanced matching mode.
 #
+# v1.28 audit update:
+# - Enhanced mode now exposes explicit reported-recipient address/location fields.
+# - Enhanced mode joins grant_recipient_ai_decision so exports show AI model,
+#   selected candidate id, reason codes, explanation, validation status, and
+#   auto_accept.
+# - Adds match_reliability_bucket and match_needs_spot_check so AI-adjudicated
+#   matches can be filtered and spot-checked downstream.
+#
 # Legacy mode (default):
 #   Uses grants_compat_v1.recipient_ein exactly as before.
 #
@@ -54,16 +62,35 @@ BASE_HEADERS = [
 ]
 
 ENHANCED_AUDIT_HEADERS = [
+    "match_reliability_bucket",
+    "match_needs_spot_check",
     "grant_id",
     "reported_recipient_ein",
     "reported_recipient_name",
+    "reported_recipient_address1",
+    "reported_recipient_address2",
+    "reported_recipient_city",
+    "reported_recipient_state",
+    "reported_recipient_zip",
+    "reported_recipient_country",
     "final_match_source",
     "final_confidence",
     "deterministic_match_status",
     "deterministic_match_method",
     "deterministic_confidence",
+    "deterministic_name_score",
+    "deterministic_address_score",
+    "deterministic_warning_flags",
+    "ai_model",
     "ai_decision",
+    "ai_selected_candidate_id",
     "ai_confidence",
+    "ai_reason_codes",
+    "ai_explanation",
+    "ai_needs_human_review",
+    "ai_auto_accept",
+    "ai_validation_status",
+    "ai_validation_error",
 ]
 
 HEADERS = BASE_HEADERS
@@ -78,6 +105,7 @@ US_STATES = [
 ENHANCED_REQUIRED_OBJECTS = [
     "grant_recipient_resolved",
     "grant_recipient_ai_applied",
+    "grant_recipient_ai_decision",
     "grant_recipient_resolved_plus_ai_v1",
 ]
 
@@ -274,16 +302,50 @@ SELECT
   gsrc.purpose               AS purpose,
 
   -- Enhanced match audit columns
+  CASE
+    WHEN gsrc.final_match_source = 'ai_adjudicated' THEN 'ai_adjudicated_accepted_spot_check'
+    WHEN gsrc.final_match_source = 'deterministic_rule' THEN 'deterministic_rule_high_confidence'
+    WHEN gsrc.final_match_source LIKE 'reported_ein%' THEN 'reported_ein_based'
+    WHEN gsrc.final_match_source = 'deterministic' AND COALESCE(gsrc.final_confidence,0) >= 0.95 THEN 'deterministic_high_confidence'
+    WHEN gsrc.final_match_source = 'deterministic' THEN 'deterministic_lower_confidence'
+    ELSE COALESCE(gsrc.final_match_source, 'unknown')
+  END AS match_reliability_bucket,
+  CASE
+    WHEN gsrc.final_match_source = 'ai_adjudicated' THEN 'YES'
+    WHEN COALESCE(gsrc.final_confidence,0) < 0.95 THEN 'YES'
+    WHEN COALESCE(gsrc.ai_needs_human_review,0) = 1 THEN 'YES'
+    ELSE 'NO'
+  END AS match_needs_spot_check,
   gsrc.grant_id                  AS grant_id,
   gsrc.recipient_reported_ein    AS reported_recipient_ein,
   gsrc.recipient_reported_name   AS reported_recipient_name,
+  COALESCE(g.us_address_line1_txt, g.foreign_address_line1_txt) AS reported_recipient_address1,
+  g.us_address_line2_txt         AS reported_recipient_address2,
+  gsrc.recipient_city            AS reported_recipient_city,
+  gsrc.recipient_state           AS reported_recipient_state,
+  gsrc.recipient_zip             AS reported_recipient_zip,
+  CASE
+    WHEN COALESCE(NULLIF(TRIM(g.us_state_abbreviation_cd), ''), NULLIF(TRIM(gsrc.recipient_state), '')) IS NOT NULL THEN 'US'
+    ELSE g.foreign_country_cd
+  END AS reported_recipient_country,
   gsrc.final_match_source        AS final_match_source,
   gsrc.final_confidence          AS final_confidence,
   gsrc.match_status              AS deterministic_match_status,
   gsrc.match_method              AS deterministic_match_method,
   gsrc.deterministic_confidence  AS deterministic_confidence,
+  gsrc.name_score                AS deterministic_name_score,
+  gsrc.address_score             AS deterministic_address_score,
+  gsrc.warning_flags             AS deterministic_warning_flags,
+  gsrc.ai_model                  AS ai_model,
   gsrc.ai_decision               AS ai_decision,
-  gsrc.ai_confidence             AS ai_confidence
+  gsrc.ai_selected_candidate_id  AS ai_selected_candidate_id,
+  gsrc.ai_confidence             AS ai_confidence,
+  gsrc.ai_reason_codes           AS ai_reason_codes,
+  gsrc.ai_explanation            AS ai_explanation,
+  gsrc.ai_needs_human_review     AS ai_needs_human_review,
+  gsrc.ai_auto_accept            AS ai_auto_accept,
+  gsrc.ai_validation_status      AS ai_validation_status,
+  gsrc.ai_validation_error       AS ai_validation_error
 FROM gsrc
 JOIN canonical_by_ein_year c ON c.filing_id = gsrc.filing_id
 JOIN returns rf              ON rf.filing_id = c.filing_id
@@ -301,6 +363,7 @@ WITH gsrc AS (
     rr.recipient_reported_name,
     rr.recipient_city,
     rr.recipient_state,
+    rr.recipient_zip,
     rr.cash_amount,
     rr.noncash_amount,
     rr.purpose,
@@ -309,18 +372,31 @@ WITH gsrc AS (
     CASE
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
-      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'reported_ein_rule'
-      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_assisted'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:reported_ein%' THEN 'reported_ein_rule'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'deterministic_rule'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_adjudicated'
       ELSE 'deterministic'
     END AS final_match_source,
     CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.ai_confidence ELSE rr.confidence END AS final_confidence,
     rr.match_status,
     rr.match_method,
     rr.confidence AS deterministic_confidence,
-    aa.ai_decision,
-    aa.ai_confidence
+    rr.name_score,
+    rr.address_score,
+    rr.warning_flags,
+    aa.model AS ai_model,
+    d.decision AS ai_decision,
+    d.selected_candidate_id AS ai_selected_candidate_id,
+    d.confidence AS ai_confidence,
+    d.reason_codes_json AS ai_reason_codes,
+    d.explanation AS ai_explanation,
+    d.needs_human_review AS ai_needs_human_review,
+    d.auto_accept AS ai_auto_accept,
+    d.validation_status AS ai_validation_status,
+    d.validation_error AS ai_validation_error
   FROM grant_recipient_resolved rr
   LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id
+  LEFT JOIN grant_recipient_ai_decision d ON d.signature_hash = aa.signature_hash
   {rr_where_clause}
 )
 """
@@ -335,6 +411,7 @@ WITH gsrc AS (
     rr.recipient_reported_name,
     rr.recipient_city,
     rr.recipient_state,
+    rr.recipient_zip,
     rr.cash_amount,
     rr.noncash_amount,
     rr.purpose,
@@ -343,17 +420,30 @@ WITH gsrc AS (
     CASE
       WHEN aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
       WHEN aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
-      WHEN aa.model LIKE 'rule:%' THEN 'reported_ein_rule'
-      ELSE 'ai_assisted'
+      WHEN aa.model LIKE 'rule:reported_ein%' THEN 'reported_ein_rule'
+      WHEN aa.model LIKE 'rule:%' THEN 'deterministic_rule'
+      ELSE 'ai_adjudicated'
     END AS final_match_source,
     aa.ai_confidence AS final_confidence,
     rr.match_status,
     rr.match_method,
     rr.confidence AS deterministic_confidence,
-    aa.ai_decision,
-    aa.ai_confidence
+    rr.name_score,
+    rr.address_score,
+    rr.warning_flags,
+    aa.model AS ai_model,
+    d.decision AS ai_decision,
+    d.selected_candidate_id AS ai_selected_candidate_id,
+    d.confidence AS ai_confidence,
+    d.reason_codes_json AS ai_reason_codes,
+    d.explanation AS ai_explanation,
+    d.needs_human_review AS ai_needs_human_review,
+    d.auto_accept AS ai_auto_accept,
+    d.validation_status AS ai_validation_status,
+    d.validation_error AS ai_validation_error
   FROM grant_recipient_ai_applied aa
   JOIN grant_recipient_resolved rr ON rr.grant_id = aa.grant_id
+  LEFT JOIN grant_recipient_ai_decision d ON d.signature_hash = aa.signature_hash
   WHERE aa.selected_ein IN ({placeholders})
   {applied_rr_extra_where}
 
@@ -367,6 +457,7 @@ WITH gsrc AS (
     rr.recipient_reported_name,
     rr.recipient_city,
     rr.recipient_state,
+    rr.recipient_zip,
     rr.cash_amount,
     rr.noncash_amount,
     rr.purpose,
@@ -377,8 +468,19 @@ WITH gsrc AS (
     rr.match_status,
     rr.match_method,
     rr.confidence AS deterministic_confidence,
+    rr.name_score,
+    rr.address_score,
+    rr.warning_flags,
+    CAST(NULL AS TEXT) AS ai_model,
     CAST(NULL AS TEXT) AS ai_decision,
-    CAST(NULL AS NUMERIC) AS ai_confidence
+    CAST(NULL AS TEXT) AS ai_selected_candidate_id,
+    CAST(NULL AS NUMERIC) AS ai_confidence,
+    CAST(NULL AS TEXT) AS ai_reason_codes,
+    CAST(NULL AS TEXT) AS ai_explanation,
+    CAST(NULL AS INTEGER) AS ai_needs_human_review,
+    CAST(NULL AS INTEGER) AS ai_auto_accept,
+    CAST(NULL AS TEXT) AS ai_validation_status,
+    CAST(NULL AS TEXT) AS ai_validation_error
   FROM grant_recipient_resolved rr
   LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id
   WHERE aa.grant_id IS NULL
