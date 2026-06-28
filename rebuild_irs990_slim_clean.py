@@ -1248,22 +1248,22 @@ def extract_file(file_path: str) -> Dict[str, Any]:
 
     books_990 = {
         'filing_id': filing_id,
-        'address_line1_txt': one_of(fns['990'] or root, ['AddressLine1Txt']),
-        'city_nm': one_of(fns['990'] or root, ['CityNm']),
-        'state_abbreviation_cd': one_of(fns['990'] or root, ['StateAbbreviationCd']),
-        'zipcd': one_of(fns['990'] or root, ['ZIPCd', 'ZipCd']),
-        'phone_num': one_of(fns['990'] or root, ['PhoneNum']),
-        'person_nm': one_of(fns['990'] or root, ['IndividualWithBooksNm', 'PersonNm'])
+        'address_line1_txt': one_of(fns['990'] if fns['990'] is not None else root, ['AddressLine1Txt']),
+        'city_nm': one_of(fns['990'] if fns['990'] is not None else root, ['CityNm']),
+        'state_abbreviation_cd': one_of(fns['990'] if fns['990'] is not None else root, ['StateAbbreviationCd']),
+        'zipcd': one_of(fns['990'] if fns['990'] is not None else root, ['ZIPCd', 'ZipCd']),
+        'phone_num': one_of(fns['990'] if fns['990'] is not None else root, ['PhoneNum']),
+        'person_nm': one_of(fns['990'] if fns['990'] is not None else root, ['IndividualWithBooksNm', 'PersonNm'])
     }
 
     books_ez = {
         'filing_id': filing_id,
-        'address_line1_txt': one_of(fns['990EZ'] or root, ['AddressLine1Txt']),
-        'city_nm': one_of(fns['990EZ'] or root, ['CityNm']),
-        'state_abbreviation_cd': one_of(fns['990EZ'] or root, ['StateAbbreviationCd']),
-        'zipcd': one_of(fns['990EZ'] or root, ['ZIPCd', 'ZipCd']),
-        'phone_num': one_of(fns['990EZ'] or root, ['PhoneNum']),
-        'person_nm': one_of(fns['990EZ'] or root, ['IndividualWithBooksNm', 'PersonNm'])
+        'address_line1_txt': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['AddressLine1Txt']),
+        'city_nm': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['CityNm']),
+        'state_abbreviation_cd': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['StateAbbreviationCd']),
+        'zipcd': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['ZIPCd', 'ZipCd']),
+        'phone_num': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['PhoneNum']),
+        'person_nm': one_of(fns['990EZ'] if fns['990EZ'] is not None else root, ['IndividualWithBooksNm', 'PersonNm'])
     }
 
     grants = []
@@ -1629,12 +1629,27 @@ PREFLIGHT_SUPPORTED_RETURN_TYPES = {'990', '990EZ', '990PF'}
 # The actual compatibility check is whether extract_file() can parse and extract
 # the fields this slim database depends on.
 PREFLIGHT_KNOWN_GOOD_COMBOS = {
+    # Observed in 2017 bulk-download files / older return tax years.
+    ('990', '2014v6.0'),
+    ('990EZ', '2014v6.0'),
+    ('990PF', '2014v6.0'),
+
     ('990', '2015v3.0'),
     ('990EZ', '2015v3.0'),
     ('990PF', '2015v3.0'),
+
+    ('990', '2016v3.0'),
+    ('990EZ', '2016v3.0'),
     ('990PF', '2016v3.0'),
     ('990PF', '2016v3.1'),
+
+    # Observed or expected in 2018 bulk-download files / 2017 return tax year.
+    # These are warning-suppression inventory entries, not hard allow/deny rules.
+    ('990', '2017v2.2'),
     ('990EZ', '2017v2.2'),
+    ('990PF', '2017v2.2'),
+
+    ('990', '2017v2.3'),
     ('990EZ', '2017v2.3'),
     ('990PF', '2017v2.3'),
 }
