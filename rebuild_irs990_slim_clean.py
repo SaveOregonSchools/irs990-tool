@@ -1842,35 +1842,54 @@ def preflight_file(file_path: str) -> Dict[str, Any]:
             'Filer/InCareOfNm exists, but the current header extraction did not capture in_care_of_name.',
         )
 
-    grant_signal = (
-        any_truthy_descendant(root, [
-            'GrantsToOrganizationsInd',
-            'GrantsToIndividualsInd',
-            'MoreThan5000KToOrgInd',
-            'MoreThan5000KToIndividualsInd',
-        ])
-        or any_positive_descendant(root, [
-            'ContriPaidRevAndExpnssAmt',
-            'ContriPaidDsbrsChrtblAmt',
-            'CYGrantsAndSimilarPaidAmt',
-            'GrantsAndSimilarAmountsPaidAmt',
-            'GrantAmt',
-            'GrantsAndAllocationsAmt',
-        ])
+    org_grant_indicator = any_truthy_descendant(root, [
+        'GrantsToOrganizationsInd',
+        'MoreThan5000KToOrgInd',
+    ])
+    individual_grant_indicator = any_truthy_descendant(root, [
+        'GrantsToIndividualsInd',
+        'MoreThan5000KToIndividualsInd',
+    ])
+    grant_amount_signal = any_positive_descendant(root, [
+        'ContriPaidRevAndExpnssAmt',
+        'ContriPaidDsbrsChrtblAmt',
+        'CYGrantsAndSimilarPaidAmt',
+        'GrantsAndSimilarAmountsPaidAmt',
+        'GrantAmt',
+        'GrantsAndAllocationsAmt',
+    ])
+
+    # For this research workflow, warnings should be organization-grant focused.
+    # A filing that explicitly reports individual grants but not organization
+    # grants should not be treated as a missing org-recipient-detail problem.
+    org_relevant_grant_signal = org_grant_indicator or (
+        grant_amount_signal and not individual_grant_indicator
     )
-    if grant_signal and row['grant_rows'] == 0:
+
+    if org_relevant_grant_signal and row['grant_rows'] == 0:
         preflight_add_caveat(
             row,
             'grant_signal_without_detail_rows',
-            'The XML has grant/contribution indicators or amounts, but no detailed grant recipient rows were extracted. This may be legitimate for below-threshold detail, but should be spot-checked.',
+            'The XML has organization-grant indicators or ambiguous grant amounts, but no detailed organization grant recipient rows were extracted. This may be legitimate for below-threshold detail, but should be spot-checked.',
             'warning',
         )
 
-    if rtype == '990PF' and row['grant_rows'] == 0 and any_positive_descendant(root, ['ContriPaidRevAndExpnssAmt', 'ContriPaidDsbrsChrtblAmt']):
+    pf_contrib_paid_signal = any_positive_descendant(root, [
+        'ContriPaidRevAndExpnssAmt',
+        'ContriPaidDsbrsChrtblAmt',
+    ])
+    pf_individual_only_signal = individual_grant_indicator and not org_grant_indicator
+
+    if (
+        rtype == '990PF'
+        and row['grant_rows'] == 0
+        and pf_contrib_paid_signal
+        and not pf_individual_only_signal
+    ):
         preflight_add_caveat(
             row,
             'pf_contributions_paid_without_detail_rows',
-            '990PF reports contributions paid, but no GrantOrContributionPdDurYrGrp detail rows were extracted.',
+            '990PF reports contributions paid that are not clearly individual-only, but no GrantOrContributionPdDurYrGrp detail rows were extracted.',
             'warning',
         )
 
