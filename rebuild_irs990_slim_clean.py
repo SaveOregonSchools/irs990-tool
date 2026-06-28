@@ -10,6 +10,7 @@ Patched version:
   address, website, return_ts, amended flag, etc.
 - Fixes issues with missing data for 990PFs due to different XML file structure
 - Adds safe append/incremental-load mode that skips XML filings already present in returns
+- Adds preflight mode for XML compatibility checks; filename-year vs TaxYr warnings removed
 """
 
 from __future__ import annotations
@@ -1641,10 +1642,18 @@ PREFLIGHT_KNOWN_GOOD_COMBOS = {
     ('990', '2016v3.0'),
     ('990EZ', '2016v3.0'),
     ('990PF', '2016v3.0'),
+
+    # Observed in 2018 bulk-download preflight samples for prior-year filings.
+    ('990', '2016v3.1'),
+    ('990EZ', '2016v3.1'),
     ('990PF', '2016v3.1'),
 
-    # Observed or expected in 2018 bulk-download files / 2017 return tax year.
+    # Observed in 2018 bulk-download files / 2017 return tax year.
     # These are warning-suppression inventory entries, not hard allow/deny rules.
+    ('990', '2017v2.0'),
+    ('990EZ', '2017v2.0'),
+    ('990PF', '2017v2.0'),
+
     ('990', '2017v2.2'),
     ('990EZ', '2017v2.2'),
     ('990PF', '2017v2.2'),
@@ -1785,17 +1794,6 @@ def preflight_file(file_path: str) -> Dict[str, Any]:
             'unknown_form_version_combo',
             f'{rtype} / {schema} is not in the known-good combo inventory. Extraction may still be fine; review coverage.',
         )
-
-    # Helpful inventory signal: IRS bulk download year often differs from TaxYr.
-    if len(p.stem) >= 4 and p.stem[:4].isdigit() and row['tax_year']:
-        filename_year = int(p.stem[:4])
-        if filename_year != int(row['tax_year']):
-            preflight_add_caveat(
-                row,
-                'filename_year_tax_year_mismatch',
-                f'Filename begins with {filename_year}, but TaxYr is {row["tax_year"]}. This is common in IRS bulk downloads.',
-                'info',
-            )
 
     # Confirm whether the actual extractor succeeds.
     extracted = extract_file(str(p))
