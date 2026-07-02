@@ -17,6 +17,18 @@ PLUGIN_DIR = Path(__file__).parent / "queries"
 
 # In-memory registry {key: module}
 REGISTRY = {}
+PLUGIN_FINGERPRINT = None
+
+
+def plugin_fingerprint():
+    """Return a cheap signature of query plugin files for auto-reload."""
+    return tuple(
+        sorted(
+            (path.name, path.stat().st_mtime_ns)
+            for path in PLUGIN_DIR.glob("*.py")
+            if not path.name.startswith("_")
+        )
+    )
 
 
 def load_plugins():
@@ -43,9 +55,11 @@ def load_plugins():
 
 
 def ensure_registry():
-    global REGISTRY
-    if not REGISTRY:
+    global REGISTRY, PLUGIN_FINGERPRINT
+    current_fingerprint = plugin_fingerprint()
+    if not REGISTRY or current_fingerprint != PLUGIN_FINGERPRINT:
         REGISTRY = load_plugins()
+        PLUGIN_FINGERPRINT = current_fingerprint
 
 
 BASE_CSS = """
@@ -371,14 +385,11 @@ QUERY_HTML = LAYOUT_START + """
     <label for="qkey"><b>Query:</b></label>
 
     <select name="qkey" id="qkey"
-            onchange="this.form.requestSubmit(document.getElementById('loadBtn'))">
+            onchange="this.form.submit()">
       {% for key, mod in registry.items() %}
         <option value="{{ key }}" {% if key == qkey %}selected{% endif %}>{{ mod.META["name"] }}</option>
       {% endfor %}
     </select>
-
-    <button id="loadBtn" type="submit">Load</button>
-    <button class="secondary" formaction="{{ url_for('refresh') }}" formmethod="post" type="submit">Refresh Queries</button>
   </div>
 </form>
 

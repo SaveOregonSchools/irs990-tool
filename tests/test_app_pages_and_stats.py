@@ -108,6 +108,9 @@ def build_stats_fixture(path: Path) -> None:
 class AppPagesAndStatsTests(unittest.TestCase):
     def setUp(self):
         self.original_registry = app_module.REGISTRY
+        self.original_plugin_fingerprint = app_module.PLUGIN_FINGERPRINT
+        self.original_plugin_fingerprint_func = app_module.plugin_fingerprint
+        self.original_load_plugins = app_module.load_plugins
         self.original_db_path = app_module.DB_PATH
         self.original_connect_ro = app_module.connect_ro
         fake_query = SimpleNamespace(
@@ -131,10 +134,14 @@ class AppPagesAndStatsTests(unittest.TestCase):
             export_rows=lambda form: [("ask",)],
         )
         app_module.REGISTRY = {"ask_database": fake_ask_query, "fixture_query": fake_query}
+        app_module.PLUGIN_FINGERPRINT = app_module.plugin_fingerprint()
         app_module.app.config.update(TESTING=True)
 
     def tearDown(self):
         app_module.REGISTRY = self.original_registry
+        app_module.PLUGIN_FINGERPRINT = self.original_plugin_fingerprint
+        app_module.plugin_fingerprint = self.original_plugin_fingerprint_func
+        app_module.load_plugins = self.original_load_plugins
         app_module.DB_PATH = self.original_db_path
         app_module.connect_ro = self.original_connect_ro
 
@@ -170,10 +177,25 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('aria-label="Home"', body)
         self.assertIn("Preview row limit", body)
+        self.assertIn('onchange="this.form.submit()"', body)
+        self.assertNotIn("loadBtn", body)
+        self.assertNotIn(">Load<", body)
+        self.assertNotIn("Refresh Queries", body)
 
         run_response = client.post("/run", data={"qkey": "fixture_query", "_limit": "5"})
         run_body = run_response.get_data(as_text=True)
         self.assertIn("value", run_body)
+
+    def test_registry_auto_reloads_when_query_files_change(self):
+        app_module.REGISTRY = {"old": object()}
+        app_module.PLUGIN_FINGERPRINT = (("old.py", 1),)
+        app_module.plugin_fingerprint = lambda: (("new.py", 2),)
+        app_module.load_plugins = lambda: {"new": object()}
+
+        app_module.ensure_registry()
+
+        self.assertIn("new", app_module.REGISTRY)
+        self.assertEqual(app_module.PLUGIN_FINGERPRINT, (("new.py", 2),))
 
     def test_stats_page_reads_cached_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
