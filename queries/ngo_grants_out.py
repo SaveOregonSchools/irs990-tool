@@ -13,6 +13,9 @@
 # canonical_by_ein_year: ein, tax_year, filing_id, return_type, return_ts, period_end
 # returns: filing_id, ein, org_name, dba_name, city, state, zip
 # grants_compat_v1: filing_id, recipient_ein, recipient_name, city, state, country, cash_amount, noncash_amount, purpose
+#
+# Optional enhanced mode keeps filer-EIN search semantics, but displays final
+# resolved grant-recipient identity and match audit fields.
 
 from typing import List, Tuple, Iterable, Optional
 from common import connect_ro, normalize_eins
@@ -28,7 +31,7 @@ META = {
     ),
 }
 
-HEADERS = [
+BASE_HEADERS = [
     # Filer (grant maker)
     "filer_ein", "filer_org_name", "filer_dba_name",
     "filer_city", "filer_state", "filer_zip",
@@ -39,6 +42,40 @@ HEADERS = [
     "cash_amount", "noncash_amount", "total_amount",
     "purpose",
 ]
+
+ENHANCED_AUDIT_HEADERS = [
+    "match_reliability_bucket",
+    "match_needs_spot_check",
+    "grant_id",
+    "reported_recipient_ein",
+    "reported_recipient_name",
+    "reported_recipient_address1",
+    "reported_recipient_address2",
+    "reported_recipient_city",
+    "reported_recipient_state",
+    "reported_recipient_zip",
+    "reported_recipient_country",
+    "final_match_source",
+    "final_confidence",
+    "deterministic_match_status",
+    "deterministic_match_method",
+    "deterministic_confidence",
+    "deterministic_name_score",
+    "deterministic_address_score",
+    "deterministic_warning_flags",
+    "ai_model",
+    "ai_decision",
+    "ai_selected_candidate_id",
+    "ai_confidence",
+    "ai_reason_codes",
+    "ai_explanation",
+    "ai_needs_human_review",
+    "ai_auto_accept",
+    "ai_validation_status",
+    "ai_validation_error",
+]
+
+HEADERS = BASE_HEADERS
 META["headers"] = HEADERS
 
 US_STATES = [
@@ -47,14 +84,30 @@ US_STATES = [
     "NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
 ]
 
+ENHANCED_REQUIRED_OBJECTS = [
+    "grant_recipient_resolved",
+    "grant_recipient_ai_applied",
+    "grant_recipient_ai_decision",
+    "grant_recipient_resolved_plus_ai_v1",
+]
+
 def _val_js(val: str) -> str:
     # Safe JS string (basic)
     return repr(val)
+
+def _truthy(form, key: str, default: bool = False) -> bool:
+    f = form or {}
+    val = f.get(key)
+    return default if val is None else val in (True, "true", "on", "1", "yes", "y")
+
+def _checked(form, key: str, default: bool = False) -> str:
+    return "checked" if _truthy(form, key, default) else ""
 
 def render_fields(form) -> str:
     f = form or {}
     val_eins = f.get("ein_list", "")
     return_all = "checked" if f.get("return_all") in (True, "true", "on", "1") else ""
+    use_resolved = _checked(f, "use_resolved_grants")
     state_val = (f.get("state") or "").upper()
     min_year = str(f.get("min_year") or "")
     max_year = str(f.get("max_year") or "")
@@ -75,6 +128,14 @@ def render_fields(form) -> str:
         </label>
         <div style="color:#666; font-size: 90%; margin-top:4px;">
           If checked, the EIN list is ignored; results are optionally filtered by filer state and/or tax year. For each EIN, the most recent filing is used.
+        </div>
+      </div>
+      <div style="flex:0 1 260px;">
+        <label><input type="checkbox" id="use_resolved_grants" name="use_resolved_grants" {use_resolved}>
+          <b>Use enhanced grant-recipient matching</b>
+        </label>
+        <div style="color:#666; font-size: 90%; margin-top:4px;">
+          When checked, recipient columns use resolved grant-recipient matches and exports include match audit fields.
         </div>
       </div>
       <div style="flex:0 1 200px;">
@@ -164,14 +225,150 @@ JOIN grants_compat_v1 g
 ORDER BY rf.ein, c.tax_year DESC, total_amount DESC, g.recipient_name, g.recipient_ein
 """
 
+_SQL_ENHANCED = """
+WITH candidates AS (
+  SELECT
+    c.ein,
+    c.tax_year,
+    c.filing_id,
+    c.return_type,
+    c.return_ts,
+    c.period_end
+  FROM canonical_by_ein_year c
+  JOIN returns r ON r.filing_id = c.filing_id
+  {where_clause}
+),
+candidates_with_grants AS (
+  SELECT DISTINCT c.*
+  FROM candidates c
+  JOIN grant_recipient_resolved rr ON rr.filing_id = c.filing_id
+),
+gsrc AS (
+  SELECT
+    rr.grant_id,
+    rr.filing_id,
+    rr.recipient_reported_ein,
+    rr.recipient_reported_name,
+    rr.recipient_city,
+    rr.recipient_state,
+    rr.recipient_zip,
+    rr.cash_amount,
+    rr.noncash_amount,
+    rr.purpose,
+    CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_ein ELSE rr.resolved_ein END AS final_resolved_ein,
+    CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
+    CASE
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:reported_ein%' THEN 'reported_ein_rule'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'deterministic_rule'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_adjudicated'
+      ELSE 'deterministic'
+    END AS final_match_source,
+    CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.ai_confidence ELSE rr.confidence END AS final_confidence,
+    rr.match_status,
+    rr.match_method,
+    rr.confidence AS deterministic_confidence,
+    rr.name_score,
+    rr.address_score,
+    rr.warning_flags,
+    aa.model AS ai_model,
+    d.decision AS ai_decision,
+    d.selected_candidate_id AS ai_selected_candidate_id,
+    d.confidence AS ai_confidence,
+    d.reason_codes_json AS ai_reason_codes,
+    d.explanation AS ai_explanation,
+    d.needs_human_review AS ai_needs_human_review,
+    d.auto_accept AS ai_auto_accept,
+    d.validation_status AS ai_validation_status,
+    d.validation_error AS ai_validation_error
+  FROM grant_recipient_resolved rr
+  LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id
+  LEFT JOIN grant_recipient_ai_decision d ON d.signature_hash = aa.signature_hash
+)
+SELECT
+  rf.ein              AS filer_ein,
+  rf.org_name         AS filer_org_name,
+  rf.dba_name         AS filer_dba_name,
+  rf.city             AS filer_city,
+  rf.state            AS filer_state,
+  rf.zip              AS filer_zip,
+  c.tax_year          AS tax_year,
+  c.return_type       AS return_type,
+  c.period_end        AS period_end,
+  c.filing_id         AS filing_id,
+  gsrc.final_resolved_ein AS recipient_ein,
+  COALESCE(NULLIF(gsrc.final_resolved_org_name,''), NULLIF(gsrc.recipient_reported_name,'')) AS recipient_name,
+  gsrc.recipient_city AS recipient_city,
+  gsrc.recipient_state AS recipient_state,
+  CASE
+    WHEN COALESCE(NULLIF(TRIM(g.us_state_abbreviation_cd), ''), NULLIF(TRIM(gsrc.recipient_state), '')) IS NOT NULL THEN 'US'
+    ELSE g.foreign_country_cd
+  END AS recipient_country,
+  gsrc.cash_amount    AS cash_amount,
+  gsrc.noncash_amount AS noncash_amount,
+  (COALESCE(gsrc.cash_amount,0) + COALESCE(gsrc.noncash_amount,0)) AS total_amount,
+  gsrc.purpose        AS purpose,
+  CASE
+    WHEN gsrc.final_match_source = 'ai_adjudicated' THEN 'ai_adjudicated_accepted_spot_check'
+    WHEN gsrc.final_match_source = 'deterministic_rule' THEN 'deterministic_rule_high_confidence'
+    WHEN gsrc.final_match_source LIKE 'reported_ein%' THEN 'reported_ein_based'
+    WHEN gsrc.final_match_source = 'deterministic' AND COALESCE(gsrc.final_confidence,0) >= 0.95 THEN 'deterministic_high_confidence'
+    WHEN gsrc.final_match_source = 'deterministic' THEN 'deterministic_lower_confidence'
+    ELSE COALESCE(gsrc.final_match_source, 'unknown')
+  END AS match_reliability_bucket,
+  CASE
+    WHEN gsrc.final_match_source = 'ai_adjudicated' THEN 'YES'
+    WHEN COALESCE(gsrc.final_confidence,0) < 0.95 THEN 'YES'
+    WHEN COALESCE(gsrc.ai_needs_human_review,0) = 1 THEN 'YES'
+    ELSE 'NO'
+  END AS match_needs_spot_check,
+  gsrc.grant_id                  AS grant_id,
+  gsrc.recipient_reported_ein    AS reported_recipient_ein,
+  gsrc.recipient_reported_name   AS reported_recipient_name,
+  COALESCE(g.us_address_line1_txt, g.foreign_address_line1_txt) AS reported_recipient_address1,
+  g.us_address_line2_txt         AS reported_recipient_address2,
+  gsrc.recipient_city            AS reported_recipient_city,
+  gsrc.recipient_state           AS reported_recipient_state,
+  gsrc.recipient_zip             AS reported_recipient_zip,
+  CASE
+    WHEN COALESCE(NULLIF(TRIM(g.us_state_abbreviation_cd), ''), NULLIF(TRIM(gsrc.recipient_state), '')) IS NOT NULL THEN 'US'
+    ELSE g.foreign_country_cd
+  END AS reported_recipient_country,
+  gsrc.final_match_source        AS final_match_source,
+  gsrc.final_confidence          AS final_confidence,
+  gsrc.match_status              AS deterministic_match_status,
+  gsrc.match_method              AS deterministic_match_method,
+  gsrc.deterministic_confidence  AS deterministic_confidence,
+  gsrc.name_score                AS deterministic_name_score,
+  gsrc.address_score             AS deterministic_address_score,
+  gsrc.warning_flags             AS deterministic_warning_flags,
+  gsrc.ai_model                  AS ai_model,
+  gsrc.ai_decision               AS ai_decision,
+  gsrc.ai_selected_candidate_id  AS ai_selected_candidate_id,
+  gsrc.ai_confidence             AS ai_confidence,
+  gsrc.ai_reason_codes           AS ai_reason_codes,
+  gsrc.ai_explanation            AS ai_explanation,
+  gsrc.ai_needs_human_review     AS ai_needs_human_review,
+  gsrc.ai_auto_accept            AS ai_auto_accept,
+  gsrc.ai_validation_status      AS ai_validation_status,
+  gsrc.ai_validation_error       AS ai_validation_error
+FROM candidates_with_grants c
+JOIN returns rf ON rf.filing_id = c.filing_id
+JOIN gsrc       ON gsrc.filing_id = c.filing_id
+LEFT JOIN grants g ON g.id = gsrc.grant_id
+ORDER BY rf.ein, c.tax_year DESC, total_amount DESC, recipient_name, recipient_ein
+"""
+
 
 def _parse_eins(form) -> List[str]:
     text = (form or {}).get("ein_list", "")
     return normalize_eins(text)
 
-def _parse_filters(form) -> Tuple[bool, Optional[str], Optional[int], Optional[int]]:
+def _parse_filters(form) -> Tuple[bool, bool, Optional[str], Optional[int], Optional[int]]:
     f = form or {}
     return_all = f.get("return_all") in (True, "true", "on", "1")
+    use_resolved = _truthy(f, "use_resolved_grants")
     state = (f.get("state") or "").strip().upper()
     if state and state not in US_STATES:
         state = None
@@ -190,7 +387,30 @@ def _parse_filters(form) -> Tuple[bool, Optional[str], Optional[int], Optional[i
     # Swap if reversed
     if min_year and max_year and min_year > max_year:
         min_year, max_year = max_year, min_year
-    return return_all, (state if state else None), min_year, max_year
+    return return_all, use_resolved, (state if state else None), min_year, max_year
+
+def headers_for_form(form) -> List[str]:
+    _, use_resolved, _, _, _ = _parse_filters(form)
+    return BASE_HEADERS + ENHANCED_AUDIT_HEADERS if use_resolved else BASE_HEADERS
+
+def export_headers(form) -> List[str]:
+    return headers_for_form(form)
+
+def _object_exists(conn, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    return bool(row)
+
+def _ensure_enhanced_objects(conn) -> None:
+    missing = [name for name in ENHANCED_REQUIRED_OBJECTS if not _object_exists(conn, name)]
+    if missing:
+        raise RuntimeError(
+            "Enhanced grant matching was selected, but required object(s) are missing: "
+            + ", ".join(missing)
+            + ". Run the grant resolver and then `python grant_ai_assist_v1.py apply-decisions --full-refresh`."
+        )
 
 def _build_where_for_candidates(return_all: bool, eins: List[str], state: Optional[str], min_year: Optional[int], max_year: Optional[int]):
     clauses = []
@@ -215,8 +435,10 @@ def _build_where_for_candidates(return_all: bool, eins: List[str], state: Option
     where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
     return where_sql, params
 
-def _query(return_all: bool, eins: List[str], state: Optional[str], min_year: Optional[int], max_year: Optional[int]) -> List[Tuple]:
+def _query(return_all: bool, use_resolved: bool, eins: List[str], state: Optional[str], min_year: Optional[int], max_year: Optional[int]) -> List[Tuple]:
     conn = connect_ro()
+    if use_resolved:
+        _ensure_enhanced_objects(conn)
     rows: List[Tuple] = []
 
     def _run_one(ein_subset: Optional[List[str]]):
@@ -227,7 +449,8 @@ def _query(return_all: bool, eins: List[str], state: Optional[str], min_year: Op
             min_year,
             max_year,
         )
-        sql = _SQL_BASE.format(where_clause=("\n" + where_clause if where_clause else ""))
+        template = _SQL_ENHANCED if use_resolved else _SQL_BASE
+        sql = template.format(where_clause=("\n" + where_clause if where_clause else ""))
         cur = conn.execute(sql, params)
         return cur.fetchall()
 
@@ -242,12 +465,12 @@ def _query(return_all: bool, eins: List[str], state: Optional[str], min_year: Op
     return rows
 
 def run(form) -> Tuple[List[str], List[Tuple]]:
-    return_all, state, min_year, max_year = _parse_filters(form)
+    return_all, use_resolved, state, min_year, max_year = _parse_filters(form)
     eins = [] if return_all else _parse_eins(form)
-    return HEADERS, _query(return_all, eins, state, min_year, max_year)
+    return headers_for_form(form), _query(return_all, use_resolved, eins, state, min_year, max_year)
 
 def export_rows(form) -> Iterable[Tuple]:
     # For CSV export streams
-    return_all, state, min_year, max_year = _parse_filters(form)
+    return_all, use_resolved, state, min_year, max_year = _parse_filters(form)
     eins = [] if return_all else _parse_eins(form)
-    return _query(return_all, eins, state, min_year, max_year)
+    return _query(return_all, use_resolved, eins, state, min_year, max_year)
