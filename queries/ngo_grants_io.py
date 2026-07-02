@@ -448,6 +448,14 @@ _ENHANCED_GSRC_CTE_BODY = """
   LEFT JOIN grant_recipient_ai_decision d ON d.signature_hash = aa.signature_hash
 """
 
+_ENHANCED_PAID_GSRC_CTE_BODY = _ENHANCED_GSRC_CTE_BODY.replace(
+    "  FROM grant_recipient_resolved rr\n"
+    "  LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id",
+    "  FROM grant_recipient_resolved rr\n"
+    "  JOIN candidate_grants cg ON cg.grant_id = rr.grant_id\n"
+    "  LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id",
+)
+
 _ENHANCED_AUDIT_SELECT = """
   CASE
     WHEN {alias}.final_match_source = 'ai_adjudicated' THEN 'ai_adjudicated_accepted_spot_check'
@@ -502,14 +510,23 @@ WITH candidates AS (
   JOIN returns r ON r.filing_id = c.filing_id
   {where_clause}
 ),
-candidates_with_grants AS (
-  SELECT DISTINCT c.*
+candidate_grants AS (
+  SELECT DISTINCT
+    c.ein,
+    c.tax_year,
+    c.filing_id,
+    c.return_type,
+    c.period_end,
+    c.return_ts,
+    rr.grant_id
   FROM candidates c
-  JOIN grant_recipient_resolved rr ON rr.filing_id = c.filing_id
+  JOIN grant_recipient_resolved rr
+    ON rr.grantor_ein = c.ein
+   AND rr.filing_id = c.filing_id
 ),
 ein_pool AS (
   SELECT DISTINCT rf.ein AS ein
-  FROM candidates_with_grants c
+  FROM candidate_grants c
   JOIN returns rf ON rf.filing_id = c.filing_id
 ),
 latest_names AS (
@@ -524,7 +541,7 @@ latest_names AS (
   ) t WHERE rn = 1
 ),
 gsrc AS (
-{gsrc_cte_body}
+{paid_gsrc_cte_body}
 )
 SELECT
   rf.ein              AS filer_ein,
@@ -551,10 +568,10 @@ SELECT
   (COALESCE(gsrc.cash_amount,0) + COALESCE(gsrc.noncash_amount,0)) AS total_amount,
   gsrc.purpose        AS purpose,
 {audit_select}
-FROM candidates_with_grants c
+FROM candidate_grants c
 JOIN returns rf      ON rf.filing_id = c.filing_id
 JOIN latest_names ln ON ln.ln_ein    = rf.ein
-JOIN gsrc            ON gsrc.filing_id = c.filing_id
+JOIN gsrc            ON gsrc.grant_id = c.grant_id
 LEFT JOIN grants g   ON g.id = gsrc.grant_id
 ORDER BY rf.ein, c.tax_year DESC, total_amount DESC, recipient_name, recipient_ein
 """
@@ -826,7 +843,7 @@ def _query(return_all: bool, mode: str, eins: List[str],
         if use_resolved:
             sql = _SQL_PAID_ENHANCED.format(
                 where_clause=("\n" + where_clause if where_clause else ""),
-                gsrc_cte_body=_ENHANCED_GSRC_CTE_BODY,
+                paid_gsrc_cte_body=_ENHANCED_PAID_GSRC_CTE_BODY,
                 audit_select=_ENHANCED_AUDIT_SELECT.format(alias="gsrc"),
             )
         else:

@@ -238,10 +238,19 @@ WITH candidates AS (
   JOIN returns r ON r.filing_id = c.filing_id
   {where_clause}
 ),
-candidates_with_grants AS (
-  SELECT DISTINCT c.*
+candidate_grants AS (
+  SELECT DISTINCT
+    c.ein,
+    c.tax_year,
+    c.filing_id,
+    c.return_type,
+    c.return_ts,
+    c.period_end,
+    rr.grant_id
   FROM candidates c
-  JOIN grant_recipient_resolved rr ON rr.filing_id = c.filing_id
+  JOIN grant_recipient_resolved rr
+    ON rr.grantor_ein = c.ein
+   AND rr.filing_id = c.filing_id
 ),
 gsrc AS (
   SELECT
@@ -283,6 +292,7 @@ gsrc AS (
     d.validation_status AS ai_validation_status,
     d.validation_error AS ai_validation_error
   FROM grant_recipient_resolved rr
+  JOIN candidate_grants cg ON cg.grant_id = rr.grant_id
   LEFT JOIN grant_recipient_ai_applied aa ON aa.grant_id = rr.grant_id
   LEFT JOIN grant_recipient_ai_decision d ON d.signature_hash = aa.signature_hash
 )
@@ -353,9 +363,9 @@ SELECT
   gsrc.ai_auto_accept            AS ai_auto_accept,
   gsrc.ai_validation_status      AS ai_validation_status,
   gsrc.ai_validation_error       AS ai_validation_error
-FROM candidates_with_grants c
+FROM candidate_grants c
 JOIN returns rf ON rf.filing_id = c.filing_id
-JOIN gsrc       ON gsrc.filing_id = c.filing_id
+JOIN gsrc       ON gsrc.grant_id = c.grant_id
 LEFT JOIN grants g ON g.id = gsrc.grant_id
 ORDER BY rf.ein, c.tax_year DESC, total_amount DESC, recipient_name, recipient_ein
 """

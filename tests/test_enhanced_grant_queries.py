@@ -239,6 +239,17 @@ class EnhancedGrantQueryTests(unittest.TestCase):
         self.assertEqual({row[11] for row in rows}, {TARGET_EIN})
         self.assertIn("ai_adjudicated", {row[headers.index("final_match_source")] for row in rows})
 
+    def test_paid_enhanced_sql_keeps_resolved_lookup_candidate_scoped(self):
+        self.assertIn("candidate_grants AS", ngo_grants_io._SQL_PAID_ENHANCED)
+        self.assertIn("JOIN candidate_grants cg ON cg.grant_id = rr.grant_id", ngo_grants_io._ENHANCED_PAID_GSRC_CTE_BODY)
+        self.assertIn("JOIN gsrc            ON gsrc.grant_id = c.grant_id", ngo_grants_io._SQL_PAID_ENHANCED)
+        self.assertNotIn("JOIN gsrc            ON gsrc.filing_id = c.filing_id", ngo_grants_io._SQL_PAID_ENHANCED)
+
+        self.assertIn("candidate_grants AS", ngo_grants_out._SQL_ENHANCED)
+        self.assertIn("JOIN candidate_grants cg ON cg.grant_id = rr.grant_id", ngo_grants_out._SQL_ENHANCED)
+        self.assertIn("JOIN gsrc       ON gsrc.grant_id = c.grant_id", ngo_grants_out._SQL_ENHANCED)
+        self.assertNotIn("JOIN gsrc       ON gsrc.filing_id = c.filing_id", ngo_grants_out._SQL_ENHANCED)
+
 
 if __name__ == "__main__":
     unittest.main()
