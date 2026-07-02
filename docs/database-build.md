@@ -1,4 +1,4 @@
-# IRS 990 slim database rebuild script
+# Database Build Guide
 
 This document explains how to use `rebuild_irs990_slim_clean.py` to build or update the slim IRS 990 SQLite database used by the query console.
 
@@ -144,6 +144,14 @@ Use `--workers 1` for easier debugging.
 ---
 
 ## Common commands
+
+Preflight a new XML batch before appending:
+
+```powershell
+py rebuild_irs990_slim_clean.py --xml-dir C:\IRSDB\NewXML --preflight --workers 4 --preflight-report exports\preflight_summary.json --preflight-csv exports\preflight_files.csv
+```
+
+See [XML Preflight Guide](preflight.md) for how to review preflight output.
 
 Full clean rebuild:
 

@@ -39,10 +39,12 @@ The database is a **research-oriented slim schema**, not a complete one-table-pe
 | `config/ollama_complexity.example.json` | Optional example config for Ask Database complexity presets. See [`config/README.md`](config/README.md). |
 | `db/` | Local database folder. `db/irs990.db` is ignored by Git. See [`db/README.md`](db/README.md). |
 | `rebuild_irs990_slim_clean.py` | Builds or appends to the slim SQLite database from IRS XML files. |
-| `README_rebuild_irs990_slim_clean.md` | Detailed database rebuild and append instructions. |
+| `docs/database-build.md` | Detailed database rebuild, append, and validation guide. |
+| `docs/preflight.md` | XML preflight scan workflow for checking new XML batches before append. |
 | `resolve_grant_recipients.py` | Deterministic grant-recipient resolution workflow. |
 | `grant_ai_assist_v1.py` | Advanced grant-recipient candidate generation, rule decisions, Ollama adjudication, and final applied views. |
-| `GRANT_AI_ASSIST_README.md` | Detailed grant-recipient resolution and AI-assist workflow. |
+| `grant_ai_batch_worker.py` | Linux/Ollama batch worker for external grant-recipient adjudication packets. |
+| `docs/grant-matching.md` | Detailed enhanced grant matching, AI assist, and batch adjudication workflow. |
 | `.env.example` | Example local environment settings. Copy to `.env` if needed. |
 | `requirements.txt` | Python dependencies. |
 
@@ -113,7 +115,13 @@ py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --ap
 
 Append mode preserves the existing database and skips XML filings already present by filing ID / normalized object ID. After loading, it rebuilds `canonical_by_ein_year`, recreates views, creates indexes, and runs SQLite optimization.
 
-See [`README_rebuild_irs990_slim_clean.md`](README_rebuild_irs990_slim_clean.md) for the full rebuild/append guide, flags, validation queries, and caveats.
+Before appending unfamiliar XML batches, run a preflight scan:
+
+```powershell
+py rebuild_irs990_slim_clean.py --xml-dir C:\IRSDB\NewXML --preflight --workers 4 --preflight-report exports\preflight_summary.json --preflight-csv exports\preflight_files.csv
+```
+
+See [`docs/database-build.md`](docs/database-build.md) for the full rebuild/append guide, flags, validation queries, and caveats. See [`docs/preflight.md`](docs/preflight.md) for preflight scan details.
 
 ---
 
@@ -174,7 +182,13 @@ The raw IRS grant rows often include recipient names and addresses, but not alwa
 
 This workflow can write additional tables/views to the database, so back up the database before running it.
 
-See [`GRANT_AI_ASSIST_README.md`](GRANT_AI_ASSIST_README.md).
+For the standard post-XML-load enhanced grant rebuild, run:
+
+```powershell
+.\batch_enhanced_grant_matches.bat
+```
+
+See [`docs/grant-matching.md`](docs/grant-matching.md).
 
 ---
 
@@ -251,9 +265,10 @@ Several modules can return very large result sets. Use state, year, EIN, amount,
 
 ## Documentation index
 
-- [`README_rebuild_irs990_slim_clean.md`](README_rebuild_irs990_slim_clean.md) — database build/append guide
-- [`GRANT_AI_ASSIST_README.md`](GRANT_AI_ASSIST_README.md) — grant-recipient resolution and AI-assist workflow
-- [`queries/README.md`](queries/README.md) — query module guide
-- [`ai/README.md`](ai/README.md) — Ask Database schema guide notes
-- [`config/README.md`](config/README.md) — Ollama complexity config notes
-- [`db/README.md`](db/README.md) — local database folder notes
+- [`docs/database-build.md`](docs/database-build.md) - database build/append guide
+- [`docs/preflight.md`](docs/preflight.md) - XML preflight scan guide
+- [`docs/grant-matching.md`](docs/grant-matching.md) - enhanced grant matching, AI assist, and batch adjudication guide
+- [`queries/README.md`](queries/README.md) - query module guide
+- [`ai/README.md`](ai/README.md) - Ask Database schema guide notes
+- [`config/README.md`](config/README.md) - Ollama complexity config notes
+- [`db/README.md`](db/README.md) - local database folder notes
