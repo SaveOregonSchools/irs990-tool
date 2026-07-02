@@ -196,6 +196,11 @@ try {
         "--csv-out", (Join-Path $exportsDir "grant_match_stats_after_enhanced_grants.csv")
     )
 
+    Invoke-PythonStep "Refresh web data statistics cache" @(
+        "refresh_data_stats.py",
+        "--db", $DbPath
+    )
+
     $remainingSql = @"
 SELECT
   COUNT(*) AS signatures_left_for_ai_review,
