@@ -70,6 +70,27 @@ See [`../docs/database-build.md`](../docs/database-build.md) for details.
 
 ---
 
+## Web app statistics cache
+
+The Flask app's **Database Statistics** page reads cached summary rows from the local SQLite database instead of running expensive summaries each time the page opens.
+
+Refresh those cached rows with:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+This creates or updates:
+
+```text
+app_data_stats
+app_data_stats_meta
+```
+
+The enhanced grant matching batch also refreshes these cached stats automatically.
+
+---
+
 ## Backup examples
 
 SQLite shell backup:

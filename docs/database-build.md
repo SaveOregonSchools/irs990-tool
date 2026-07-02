@@ -337,6 +337,16 @@ The current append logic prevents future duplicate loads, but it does not remove
 
 After appending new filings, the script rebuilds `canonical_by_ein_year`. If a newly loaded filing is more recent for an EIN/tax year, it may become the canonical filing used by query modules.
 
+### Web statistics cache is separate
+
+The database build script does not refresh the Flask app's cached Database Statistics page. After a rebuild or append, run this if you want the web stats page to reflect the latest database contents:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+The enhanced grant matching batch runs this refresh automatically after rebuilding the grant matching layer.
+
 ### Avoid active writers while rebuilding
 
 Close DB Browser write transactions and other scripts before running a rebuild or append. Read-only app connections are usually fine, but active write locks can cause failures.

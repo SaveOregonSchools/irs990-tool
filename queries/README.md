@@ -1,8 +1,8 @@
 # Query modules
 
-The `queries/` folder contains the prebuilt query modules shown in the Flask query console.
+The `queries/` folder contains the prebuilt query modules shown in the Flask research console.
 
-`app.py` auto-discovers Python files in this folder, imports them, and registers modules that expose the required plugin interface.
+`app.py` auto-discovers Python files in this folder, imports them, and registers modules that expose the required plugin interface. While the app is running, it checks query file modification times on each request and reloads the registry when a query module is added or edited.
 
 ---
 
@@ -101,6 +101,8 @@ For EIN lists, chunk large `IN (...)` lists. Most existing modules use chunks of
 
 `META["name"]` and `META["description"]` are displayed in the UI. Keep them readable for researchers, not just developers.
 
+The home page uses a curated menu in `app.py` for button grouping, order, shortened labels, and concise descriptions. Add new query modules to that menu when they should appear in a specific home-page section; otherwise they are still auto-discovered and appear under Other Modules.
+
 ---
 
 ## Adding a new module
@@ -111,7 +113,7 @@ For EIN lists, chunk large `IN (...)` lists. Most existing modules use chunks of
 4. Parse and validate form fields defensively.
 5. Use `connect_ro()` and parameterized SQL.
 6. Return rows in the same order as `HEADERS`.
-7. Start the app or click **Refresh Queries**.
+7. Start the app if needed. If it is already running, refresh the browser page; the query registry reloads automatically when files in `queries/` change.
 
 Minimal skeleton:
 
