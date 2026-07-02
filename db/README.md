@@ -66,7 +66,7 @@ Append new XMLs:
 py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
 ```
 
-See the root-level `README_rebuild_irs990_slim_clean.md` for details.
+See [`../docs/database-build.md`](../docs/database-build.md) for details.
 
 ---
 
