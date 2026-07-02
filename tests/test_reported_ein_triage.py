@@ -119,6 +119,58 @@ def fixture_rows(conn):
 
 
 class ReportedEinTriageTests(unittest.TestCase):
+    def test_new_list_style_recipient_patterns_are_nonadjudicable(self):
+        cases = {
+            "VARIOUS-AVAILABLE UPON REQUEST": "available_upon_request_placeholder",
+            "NETWORK OF 685 AGENCIES": "network_of_recipients_placeholder",
+            "NETWORK OF OVER 700 AGENCIES": "network_of_recipients_placeholder",
+            "200-300 DIFFERENT ORGANIZATIONS RECEIVE ASSISTANCE MONTHLY FROM CARITAS": "different_recipients_placeholder",
+            "GRANTS MADE TO VARIOUS IRC 501(C)(3) ENTITIES": "various_recipients_placeholder",
+            "DESIGNATIONS TO OTHER UNITED WAYS AND AGENCIES PAID DIRECTLY BY THIRD-PARTY": "designations_to_other_recipients_placeholder",
+            "85 partner charity organizations": "partner_charity_organizations_placeholder",
+        }
+        for name, reason in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(gai.recipient_name_nonadjudicable_reason(name), reason)
+
+    def test_new_list_style_patterns_do_not_catch_specific_names(self):
+        names = [
+            "THE MULTIPLE SCLEROSIS CENTER OF ATLANTA",
+            "CHARTER SCHOOLS DEVELOPMENT CORPORATION",
+            "NC Citizens for Protecting our Schools",
+            "KAMEHAMEHA SCHOOLS",
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(gai.recipient_name_nonadjudicable_reason(name), "")
+
+    def test_reported_ein_triage_parks_new_list_style_rows_when_configured(self):
+        conn = build_conn()
+        try:
+            conn.execute(
+                """
+                UPDATE sig_fixture
+                SET recipient_name='NETWORK OF 685 AGENCIES',
+                    recipient_name_norm='NETWORK OF 685 AGENCIES'
+                """
+            )
+            sig, candidates = fixture_rows(conn)
+
+            row, reason = gai.reported_ein_triage_decision_row(
+                conn,
+                sig,
+                candidates,
+                placeholder_action="human_review",
+            )
+
+            self.assertEqual(reason, "nonadjudicable_recipient_network_of_recipients_placeholder")
+            self.assertEqual(row[1], "HUMAN_REVIEW")
+            self.assertEqual(row[10], 0)
+            self.assertEqual(row[11], "ok")
+            self.assertIn("recipient_name_nonadjudicable", json.loads(row[7]))
+        finally:
+            conn.close()
+
     def test_keeps_known_reported_ein_when_address_location_matches_despite_low_name_score(self):
         conn = build_conn()
         try:

@@ -230,10 +230,12 @@ py grant_ai_assist_v1.py reported-ein-triage --dry-run --include-skips-in-dry-ru
 Run for real:
 
 ```powershell
-py grant_ai_assist_v1.py reported-ein-triage
+py grant_ai_assist_v1.py reported-ein-triage --placeholder-action human_review
 ```
 
 Purpose: keep valid filing-supplied recipient EINs unless strong evidence suggests they are wrong.
+List-style/nonadjudicable reported-EIN rows are parked for human review so they
+do not get auto-kept before the nonadjudicable-recipient triage pass.
 
 ### Nonadjudicable Recipient Triage
 

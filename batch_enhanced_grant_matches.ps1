@@ -126,7 +126,8 @@ try {
     Invoke-PythonStep "Run reported EIN triage" @(
         "grant_ai_assist_v1.py",
         "reported-ein-triage",
-        "--db", $DbPath
+        "--db", $DbPath,
+        "--placeholder-action", "human_review"
     )
 
     Invoke-PythonStep "Park nonadjudicable/list-style and blank-recipient signatures" @(
