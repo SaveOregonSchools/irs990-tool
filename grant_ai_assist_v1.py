@@ -2159,6 +2159,7 @@ REPORTED_EIN_SOFT_WARNING_PATTERNS = (
 # Backward-compatible name; use the hard-only list by default from v1.22 onward.
 REPORTED_EIN_CONTRADICTION_WARNING_PATTERNS = REPORTED_EIN_HARD_CONTRADICTION_WARNING_PATTERNS
 REPORTED_EIN_CONTRADICTION_STATUSES = {"possible_bad_ein_corrected", "conflicting_ein_match"}
+REPORTED_EIN_ADDRESS_LOCATION_MIN_ADDRESS_SCORE = 0.85
 
 
 def _json_counter_has_any(text: Any, keys: Sequence[str]) -> bool:
@@ -2239,6 +2240,25 @@ def matching_candidate_for_ein(candidates: Sequence[sqlite3.Row], ein: str) -> O
         if digits9(c["ein"]) == ein:
             return c
     return None
+
+
+def reported_ein_candidate_has_address_location_support(
+    candidate: Optional[sqlite3.Row],
+    *,
+    min_address_score: float = REPORTED_EIN_ADDRESS_LOCATION_MIN_ADDRESS_SCORE,
+) -> bool:
+    """True when a reported-EIN candidate also matches address/location evidence."""
+    if candidate is None:
+        return False
+    try:
+        reported_match = int(candidate["reported_ein_match"] or 0) == 1
+        exact_address = int(candidate["exact_address"] or 0) == 1
+        zip_match = int(candidate["zip_match"] or 0) == 1
+        city_state_match = int(candidate["city_state_match"] or 0) == 1
+        address_score = float(candidate["address_score"] or 0)
+    except Exception:
+        return False
+    return reported_match and (exact_address or address_score >= min_address_score) and (zip_match or city_state_match)
 
 
 def reported_ein_shortcut_decision_row(
@@ -2435,6 +2455,10 @@ def reported_ein_rule_decision_row(
         },
         "reported_ein_triage": extra_input or {},
     }
+    if isinstance(extra_input, dict):
+        selected_identity = extra_input.get("selected_identity")
+        if isinstance(selected_identity, dict):
+            input_obj["selected_identity"] = selected_identity
     input_json = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
     output_json = json.dumps(output, ensure_ascii=False, sort_keys=True)
     candidate_set_json = json.dumps(
@@ -2631,8 +2655,57 @@ def reported_ein_triage_decision_row(
     identity = best_identity_for_ein(conn, reported_ein)
 
     # If org_identity knows the EIN but the filing recipient name strongly disagrees,
-    # do not let AI casually override or discard it. Park it for human review by default.
+    # trust it when the generated reported-EIN candidate also matches the reported
+    # address/location. Otherwise, do not let AI casually override or discard it.
     if identity is not None and shortcut_reason == "recipient_name_disagrees_with_reported_ein_identity":
+        candidate_match = matching_candidate_for_ein(candidates, reported_ein)
+        if reported_ein_candidate_has_address_location_support(candidate_match):
+            selected_name = clean_text(candidate_match["candidate_name"]) if candidate_match is not None else clean_text(identity["display_name"])
+            confidence = 0.975 if int(candidate_match["exact_address"] or 0) == 1 else 0.965
+            reason_codes = [
+                "reported_ein_present",
+                "reported_ein_known_but_name_disagrees",
+                "reported_ein_candidate_present",
+                "reported_ein_address_location_match",
+                "recipient_name_may_be_alias_or_former_name",
+                "ollama_skipped_nonconflicting_reported_ein",
+            ]
+            explanation = (
+                f"Reported recipient EIN {reported_ein} is known in org_identity as '{clean_text(identity['display_name'])}'. "
+                f"The recipient name '{recip_name}' has weak agreement with that identity, but the reported-EIN candidate "
+                "matches the reported address/location, so the filing-supplied EIN was kept and Ollama was skipped."
+            )
+            return reported_ein_rule_decision_row(
+                sig,
+                candidates,
+                decision="KEEP_REPORTED_EIN",
+                selected_ein=reported_ein,
+                selected_name=selected_name,
+                confidence=confidence,
+                confidence_label="high",
+                reason_codes=reason_codes,
+                explanation=explanation,
+                needs_human_review=False,
+                auto_accept=True,
+                model_label="rule:reported_ein_address_location",
+                extra_input={
+                    "shortcut_reason": shortcut_reason,
+                    "identity_source": clean_text(identity["source"]),
+                    "min_address_score": REPORTED_EIN_ADDRESS_LOCATION_MIN_ADDRESS_SCORE,
+                    "selected_identity": {
+                        "ein": reported_ein,
+                        "display_name": clean_text(identity["display_name"]),
+                        "source": clean_text(identity["source"]),
+                        "source_detail": clean_text(identity["source_detail"] if "source_detail" in identity.keys() else ""),
+                        "identity_id": int(identity["identity_id"]),
+                        "name_score": round(ratio(recip_norm, clean_text(identity["name_norm"])), 4),
+                        "street": clean_text(identity["street"] if "street" in identity.keys() else ""),
+                        "city": clean_text(identity["city"] if "city" in identity.keys() else ""),
+                        "state": clean_text(identity["state"] if "state" in identity.keys() else ""),
+                        "zip5": clean_text(identity["zip5"] if "zip5" in identity.keys() else ""),
+                    },
+                },
+            ), "reported_ein_known_name_disagrees_address_location_kept_no_ai"
         if unsafe_action == "ollama":
             return None, shortcut_reason
         if unsafe_action == "skip":
@@ -3833,6 +3906,15 @@ def iter_signatures_for_reported_ein_shortcuts(conn: sqlite3.Connection, args: a
     params: List[Any] = []
     if not args.regenerate and table_exists(conn, DECISION_TABLE):
         clauses.append(f"NOT EXISTS (SELECT 1 FROM {DECISION_TABLE} d WHERE d.signature_hash = s.signature_hash)")
+    if getattr(args, "signature_hash", None):
+        clauses.append("s.signature_hash=?")
+        params.append(clean_text(args.signature_hash))
+    if getattr(args, "reported_ein", None):
+        reported_ein = usable_reported_ein(args.reported_ein)
+        if not reported_ein:
+            raise RuntimeError(f"--reported-ein is not a usable EIN: {args.reported_ein}")
+        clauses.append("s.reported_ein=?")
+        params.append(reported_ein)
     if args.state:
         clauses.append("s.state=?")
         params.append(args.state.upper())
@@ -4867,6 +4949,7 @@ def refresh_final_view(conn: sqlite3.Connection) -> None:
       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
       CASE
         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
+        WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_address_location' THEN 'reported_ein_address_location'
         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'reported_ein_rule'
         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN 'ai_assisted'
@@ -5605,6 +5688,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reported-ein-shortcuts", help="Create auto-accepted KEEP_REPORTED_EIN decisions from org_identity without calling Ollama")
     add_common_db(p)
     p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for eligible signatures")
+    p.add_argument("--signature-hash", default=None, help="Only process one grant_recipient_signature.signature_hash")
+    p.add_argument("--reported-ein", default=None, help="Only process signatures with this filing-supplied recipient EIN")
     p.add_argument("--state", default=None)
     p.add_argument("--min-total-amount", type=float, default=None)
     p.add_argument("--queue-status", default=None)
@@ -5624,6 +5709,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reported-ein-triage", help="Triage all reported-EIN signatures before AI: keep safe reported EINs or park unsafe non-conflicts for human review")
     add_common_db(p)
     p.add_argument("--regenerate", action="store_true", help="Overwrite existing decisions for eligible signatures")
+    p.add_argument("--signature-hash", default=None, help="Only process one grant_recipient_signature.signature_hash")
+    p.add_argument("--reported-ein", default=None, help="Only process signatures with this filing-supplied recipient EIN")
     p.add_argument("--state", default=None)
     p.add_argument("--min-total-amount", type=float, default=None)
     p.add_argument("--queue-status", default=None)

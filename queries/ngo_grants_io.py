@@ -420,6 +420,7 @@ _ENHANCED_GSRC_CTE_BODY = """
     CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
     CASE
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
+      WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_address_location' THEN 'reported_ein_address_location'
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:reported_ein%' THEN 'reported_ein_rule'
       WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein <> '' AND aa.model LIKE 'rule:%' THEN 'deterministic_rule'
@@ -600,6 +601,7 @@ WITH gsrc AS (
     aa.selected_name AS final_resolved_org_name,
     CASE
       WHEN aa.model='rule:reported_ein_identity_lookup' THEN 'reported_ein_identity_lookup'
+      WHEN aa.model='rule:reported_ein_address_location' THEN 'reported_ein_address_location'
       WHEN aa.model='rule:reported_ein_from_filing_unverified' THEN 'reported_ein_from_filing_unverified'
       WHEN aa.model LIKE 'rule:reported_ein%' THEN 'reported_ein_rule'
       WHEN aa.model LIKE 'rule:%' THEN 'deterministic_rule'
