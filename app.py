@@ -150,6 +150,7 @@ BASE_CSS = """
     font-weight: 650;
     cursor: pointer;
     text-decoration: none;
+    text-align: center;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -235,7 +236,7 @@ BASE_CSS = """
     h1 { font-size: 22px; }
     .home-title-row { gap: 6px 12px; }
     .module-row { grid-template-columns: 1fr; gap: 6px; }
-    .module-button { justify-content: flex-start; }
+    .module-button { justify-content: center; }
   }
 """
 
