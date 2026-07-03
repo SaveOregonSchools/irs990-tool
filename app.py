@@ -360,6 +360,12 @@ HOME_MENU = [
             ),
             (
                 "query",
+                "nonprofit_deep_dive",
+                "Nonprofit Deep Dive",
+                "Single-EIN profile with trend charts, yearly summaries, top grantors, and compensation.",
+            ),
+            (
+                "query",
                 "filings_by_eins",
                 "Filings by EIN(s)",
                 "Basic list of available tax filings by EIN.",
@@ -425,9 +431,11 @@ QUERY_HTML = LAYOUT_START + """
   {% endif %}
 
   {% if headers and rows is not none %}
-    <p>Showing up to <b>{{ (form or {}).get('_limit','500') }}</b> rows. Preview contains <b>{{ len(rows) }}</b> rows.</p>
+    {% if custom_results_html %}
+      {{ custom_results_html | safe }}
 
-    {% if headers and headers[0] == 'generated_sql' and rows|length > 0 %}
+    {% elif headers and headers[0] == 'generated_sql' and rows|length > 0 %}
+      <p>Showing up to <b>{{ (form or {}).get('_limit','500') }}</b> rows. Preview contains <b>{{ len(rows) }}</b> rows.</p>
       <h3>Generated SQL</h3>
       <div class="sql-box">{{ rows[0][0] }}</div>
 
@@ -453,6 +461,7 @@ QUERY_HTML = LAYOUT_START + """
       </div>
 
     {% else %}
+      <p>Showing up to <b>{{ (form or {}).get('_limit','500') }}</b> rows. Preview contains <b>{{ len(rows) }}</b> rows.</p>
       <div style="overflow:auto; max-height:60vh; border:1px solid #ddd;">
         <table>
           <thead><tr>{% for h in headers %}<th>{{ h }}</th>{% endfor %}</tr></thead>
@@ -635,6 +644,9 @@ def _render_home():
 
 def _render_query(qkey, form=None, headers=None, rows=None, error=None):
     ensure_registry()
+    custom_results_html = None
+    if headers and rows is not None and qkey in REGISTRY and hasattr(REGISTRY[qkey], "render_results"):
+        custom_results_html = REGISTRY[qkey].render_results(form or {}, headers, rows)
     return render_template_string(
         QUERY_HTML,
         **_template_context(
@@ -647,6 +659,7 @@ def _render_query(qkey, form=None, headers=None, rows=None, error=None):
             rows=rows,
             error=error,
             len=len,
+            custom_results_html=custom_results_html,
         ),
     )
 

@@ -47,6 +47,7 @@ Use `export_headers()` when the CSV export should omit helper columns that are u
 |---|---|
 | `ask_database.py` | Ask a plain-English database question, generate validated SQL, run a preview, or validate/run existing SQL. |
 | `filings_by_ein.py` | List canonical filings for one or more EINs. |
+| `nonprofit_deep_dive.py` | Single-EIN profile with financial charts, yearly filing summaries, top grantors, and compensation. |
 | `ngo_core_data.py` | Return core organization, filing, financial, address, mission, tax-status, and indicator fields. |
 | `ngo_ein_by_name.py` | Find EINs from pasted organization names using deterministic normalized matching and optional fuzzy fallback. |
 | `ngo_grants_out.py` | List grants paid by filer/grantor organizations. |
