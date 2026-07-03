@@ -261,25 +261,7 @@ _AMOUNT_EXPR = """
 
 
 _SQL = """
-WITH supp AS (
-  SELECT
-    filing_id,
-    COUNT(*) AS schedule_c_supplemental_count,
-    SUBSTR(
-      GROUP_CONCAT(
-        TRIM(COALESCE(form_and_line_reference_desc, '') ||
-             CASE WHEN COALESCE(form_and_line_reference_desc, '') <> ''
-                    AND COALESCE(explanation_txt, '') <> ''
-                  THEN ': ' ELSE '' END ||
-             COALESCE(explanation_txt, '')),
-        ' || '
-      ),
-      1,
-      2000
-    ) AS schedule_c_explanations
-  FROM irs990_schedule_c_supplemental_info
-  GROUP BY filing_id
-)
+WITH candidates AS (
 SELECT
   c.ein,
   r.org_name,
@@ -326,7 +308,7 @@ SELECT
        ELSE '' END AS lobbying_activities_ind,
   pf.legislative_political_acty_ind,
   pf.more_than100_spent_ind,
-  pf.form1120_pol_filed_ind,
+  pf.form1120_pol_filed_ind AS pf_form1120_pol_filed_ind,
   pf.influence_legislation_ind,
   pf.influence_election_ind,
   sc.political_expenditures_amt,
@@ -364,18 +346,93 @@ SELECT
   sc.non_deductible_lbbyng_pltcl_cy_amt,
   sc.non_deductible_lbbyng_pltcl_tot_amt,
   sc.aggregate_reported_dues_ntc_amt,
-  sc.carried_over_amt,
-  COALESCE(supp.schedule_c_supplemental_count, 0),
-  COALESCE(supp.schedule_c_explanations, '')
+  sc.carried_over_amt
 FROM canonical_by_ein_year c
 JOIN returns r ON r.filing_id = c.filing_id
 LEFT JOIN irs990_root f990 ON f990.filing_id = c.filing_id
 LEFT JOIN irs990_ez_root ez ON ez.filing_id = c.filing_id
 LEFT JOIN irs990_pf_root pf ON pf.filing_id = c.filing_id
 LEFT JOIN irs990_schedule_c_root sc ON sc.filing_id = c.filing_id
-LEFT JOIN supp ON supp.filing_id = c.filing_id
 {where_clause}
-ORDER BY c.tax_year DESC, c.ein, r.org_name
+),
+supp AS (
+  SELECT
+    s.filing_id,
+    COUNT(*) AS schedule_c_supplemental_count,
+    SUBSTR(
+      GROUP_CONCAT(
+        TRIM(COALESCE(s.form_and_line_reference_desc, '') ||
+             CASE WHEN COALESCE(s.form_and_line_reference_desc, '') <> ''
+                    AND COALESCE(s.explanation_txt, '') <> ''
+                  THEN ': ' ELSE '' END ||
+             COALESCE(s.explanation_txt, '')),
+        ' || '
+      ),
+      1,
+      2000
+    ) AS schedule_c_explanations
+  FROM irs990_schedule_c_supplemental_info s
+  JOIN candidates c ON c.filing_id = s.filing_id
+  GROUP BY s.filing_id
+)
+SELECT
+  c.ein,
+  c.org_name,
+  c.dba_name,
+  c.tax_year,
+  c.return_type,
+  c.state,
+  c.tax_exempt_status,
+  c.filing_id,
+  c.activity_summary,
+  c.political_campaign_activity_ind,
+  c.lobbying_activities_ind,
+  c.legislative_political_acty_ind,
+  c.more_than100_spent_ind,
+  c.pf_form1120_pol_filed_ind,
+  c.influence_legislation_ind,
+  c.influence_election_ind,
+  c.political_expenditures_amt,
+  c.expended527_activities_amt,
+  c.total_exempt_function_expend_amt,
+  c.form1120_pol_filed_ind,
+  c.total_lobbying_expenditures_amt,
+  c.total_direct_lobbying_amt,
+  c.total_grassroots_lobbying_amt,
+  c.lobbying_nontaxable_amt,
+  c.grassroots_nontaxable_amt,
+  c.lobbying_ceiling_amt,
+  c.grassroots_ceiling_amt,
+  c.lobbying_excess_amt,
+  c.lobbying_grassroots_excess_amt,
+  c.volunteers_ind,
+  c.paid_staff_or_management_ind,
+  c.media_advertisements_ind,
+  c.media_advertisements_amt,
+  c.mailings_members_ind,
+  c.mailings_members_amt,
+  c.publications_or_broadcast_ind,
+  c.publications_or_broadcast_amt,
+  c.grants_other_organizations_ind,
+  c.grants_other_organizations_amt,
+  c.direct_contact_legislators_ind,
+  c.direct_contact_legislators_amt,
+  c.rallies_demonstrations_ind,
+  c.rallies_demonstrations_amt,
+  c.other_activities_ind,
+  c.other_activities_amt,
+  c.not_described_section501c3_ind,
+  c.substantially_all_dues_nonded_ind,
+  c.dues_assessments_amt,
+  c.non_deductible_lbbyng_pltcl_cy_amt,
+  c.non_deductible_lbbyng_pltcl_tot_amt,
+  c.aggregate_reported_dues_ntc_amt,
+  c.carried_over_amt,
+  COALESCE(supp.schedule_c_supplemental_count, 0),
+  COALESCE(supp.schedule_c_explanations, '')
+FROM candidates c
+LEFT JOIN supp ON supp.filing_id = c.filing_id
+ORDER BY c.tax_year DESC, c.ein, c.org_name
 """
 
 
@@ -484,6 +541,9 @@ def _build_where(
     if min_amount is not None:
         clauses.append(_AMOUNT_EXPR)
         params.extend([min_amount] * 13)
+
+    if not clauses:
+        return "", params
 
     return "WHERE " + " AND ".join(f"({c})" for c in clauses), params
 

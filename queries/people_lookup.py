@@ -42,7 +42,7 @@ def render_fields(form) -> str:
     state_val = (f.get("state") or "").upper()
     min_year = str(f.get("min_year") or "")
     max_year = str(f.get("max_year") or "")
-    max_rows = str(f.get("max_rows") or "1048000")
+    max_rows = str(f.get("max_rows") or "5000")
 
     opts = ['<option value="">(Any)</option>']
     for s in US_STATES:
@@ -72,6 +72,9 @@ def render_fields(form) -> str:
       <label>Max rows:
         <input type="number" name="max_rows" value="{max_rows}" min="1" max="1048000" style="width:110px">
       </label>
+      <span style="color:#666; font-size:90%;">
+        Broad contains searches are fastest with a state or tax-year filter. Use exact match for indexed full-name lookups.
+      </span>
     </div>
     """
 
@@ -94,7 +97,7 @@ def _parse(form):
         min_year = max_year
     if min_year and max_year and min_year > max_year:
         min_year, max_year = max_year, min_year
-    max_rows = _toi(f.get("max_rows")) or 200
+    max_rows = _toi(f.get("max_rows")) or 5000
     return person, fuzzy, state, min_year, max_year, max_rows
 
 def _exists(conn, table: str) -> bool:
@@ -362,6 +365,23 @@ def _base_where(person: str, fuzzy: bool, state: Optional[str], min_year: Option
 
     return (" AND ".join(where), params)
 
+def _returns_source(state: Optional[str], min_year: Optional[int], max_year: Optional[int], cols: str = "*") -> Tuple[str, List, bool]:
+    where = []
+    params: List = []
+
+    if state:
+        where.append("state = ?")
+        params.append(state)
+
+    if min_year is not None and max_year is not None:
+        where.append("tax_year BETWEEN ? AND ?")
+        params.extend([min_year, max_year])
+
+    if not where:
+        return "returns", [], False
+
+    return f"(SELECT {cols} FROM returns WHERE {' AND '.join(where)})", params, True
+
 def _query_table(conn, table: str, hit_col: str, label: str, detail_key: str,
                  person: str, fuzzy: bool, state: Optional[str],
                  min_year: Optional[int], max_year: Optional[int], max_rows: int) -> List[Tuple]:
@@ -375,8 +395,26 @@ def _query_table(conn, table: str, hit_col: str, label: str, detail_key: str,
     pred = _name_pred(f"t.{hit_col}", fuzzy)
     person_param = f"%{person}%" if fuzzy else person
 
-    base_where_sql, base_params = _base_where(person, fuzzy, state, min_year, max_year)
+    returns_sql, returns_params, returns_filtered = _returns_source(
+        state,
+        min_year,
+        max_year,
+        "filing_id, ein, org_name, tax_year, state",
+    )
     detail_expr = _detail_expr(conn, table, "t", detail_key, hit_col)
+
+    if returns_filtered:
+        from_sql = f"""
+    FROM {returns_sql} r
+    JOIN {table} t
+      ON t.filing_id = r.filing_id
+"""
+    else:
+        from_sql = f"""
+    FROM {table} t
+    JOIN returns r
+      ON r.filing_id = t.filing_id
+"""
 
     sql = f"""
     SELECT
@@ -386,14 +424,11 @@ def _query_table(conn, table: str, hit_col: str, label: str, detail_key: str,
       r.tax_year,
       ? AS found_in,
       {detail_expr} AS detail
-    FROM {table} t
-    JOIN returns r
-      ON r.filing_id = t.filing_id
+    {from_sql}
     WHERE {pred}
-    {"AND " + base_where_sql if base_where_sql else ""}
     LIMIT ?
     """
-    params = [label, person_param] + base_params + [max_rows]
+    params = [label] + returns_params + [person_param, max_rows]
     return conn.execute(sql, params).fetchall()
 
 def _query_in_care_of(conn, person: str, fuzzy: bool, state: Optional[str],
@@ -406,16 +441,12 @@ def _query_in_care_of(conn, person: str, fuzzy: bool, state: Optional[str],
     pred = _name_pred("r.in_care_of_name", fuzzy)
     person_param = f"%{person}%" if fuzzy else person
 
-    clauses = [pred]
-    params: List = [person_param]
-
-    if state:
-        clauses.append("r.state = ?")
-        params.append(state)
-
-    if min_year is not None and max_year is not None:
-        clauses.append("r.tax_year BETWEEN ? AND ?")
-        params.extend([min_year, max_year])
+    returns_sql, returns_params, _ = _returns_source(
+        state,
+        min_year,
+        max_year,
+        "filing_id, ein, org_name, tax_year, state, in_care_of_name, us_address_line1, city, zip",
+    )
 
     sql = f"""
     SELECT
@@ -430,11 +461,11 @@ def _query_in_care_of(conn, person: str, fuzzy: bool, state: Optional[str],
         ||CASE WHEN COALESCE(r.state,'')<>'' THEN ' | state='||r.state ELSE '' END
         ||CASE WHEN COALESCE(r.zip,'')<>'' THEN ' | zip='||r.zip ELSE '' END
         AS detail
-    FROM returns r
-    WHERE {" AND ".join(clauses)}
+    FROM {returns_sql} r
+    WHERE {pred}
     LIMIT ?
     """
-    params.append(max_rows)
+    params = returns_params + [person_param, max_rows]
     return conn.execute(sql, params).fetchall()
 
 def _dedupe_keep_first(rows: List[Tuple]) -> List[Tuple]:

@@ -101,10 +101,165 @@ WITH candidates AS (
   FROM canonical_by_ein_year c
   JOIN returns r ON r.filing_id = c.filing_id
   {where_clause}
+),
+sr AS (
+  SELECT
+    c.ein AS filer_ein,
+    c.tax_year AS filer_tax_year,
+    r.filing_id,
+    'Related Tax-Exempt Org' AS relationship_category,
+    r.ein AS related_ein,
+    COALESCE(r.business_name_line1_txt, r.disregarded_entity_name_business_name_line1_txt) AS related_name_line1,
+    COALESCE(r.business_name_line2_txt, r.disregarded_entity_name_business_name_line2_txt) AS related_name_line2,
+    CAST(NULL AS NUMERIC) AS ownership_pct,
+    r.controlled_organization_ind,
+    r.primary_activities_txt,
+    CAST(NULL AS TEXT) AS transaction_type_txt,
+    CAST(NULL AS NUMERIC) AS involved_amt,
+    r.exempt_code_section_txt,
+    r.public_charity_status_txt,
+    r.address_line1_txt,
+    r.city_nm,
+    r.state_abbreviation_cd,
+    r.legal_domicile_state_cd,
+    r.country_cd,
+    'irs990_schedule_r_id_related_tax_exempt_org_grp' AS table_source
+  FROM candidates c
+  JOIN irs990_schedule_r_id_related_tax_exempt_org_grp r ON r.filing_id = c.filing_id
+
+  UNION ALL
+
+  SELECT
+    c.ein,
+    c.tax_year,
+    r.filing_id,
+    'Related Taxable Corporation/Trust',
+    r.ein,
+    COALESCE(r.related_organization_name_business_name_line1_txt, r.business_name_line1_txt),
+    COALESCE(r.related_organization_name_business_name_line2_txt, r.business_name_line2_txt),
+    r.ownership_pct,
+    r.controlled_organization_ind,
+    r.primary_activities_txt,
+    CAST(NULL AS TEXT),
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    r.address_line1_txt,
+    r.city_nm,
+    r.state_abbreviation_cd,
+    r.legal_domicile_state_cd,
+    CAST(NULL AS TEXT),
+    'irs990_schedule_r_id_related_org_txbl_corp_tr_grp'
+  FROM candidates c
+  JOIN irs990_schedule_r_id_related_org_txbl_corp_tr_grp r ON r.filing_id = c.filing_id
+
+  UNION ALL
+
+  SELECT
+    c.ein,
+    c.tax_year,
+    r.filing_id,
+    'Related Taxable Partnership',
+    r.ein,
+    COALESCE(r.related_organization_name_business_name_line1_txt, r.business_name_line1_txt),
+    COALESCE(r.related_organization_name_business_name_line2_txt, r.business_name_line2_txt),
+    r.ownership_pct,
+    r.controlled_organization_ind,
+    r.primary_activities_txt,
+    CAST(NULL AS TEXT),
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    r.address_line1_txt,
+    r.city_nm,
+    r.state_abbreviation_cd,
+    r.legal_domicile_state_cd,
+    CAST(NULL AS TEXT),
+    'irs990_schedule_r_id_related_org_txbl_partnership_grp'
+  FROM candidates c
+  JOIN irs990_schedule_r_id_related_org_txbl_partnership_grp r ON r.filing_id = c.filing_id
+
+  UNION ALL
+
+  SELECT
+    c.ein,
+    c.tax_year,
+    r.filing_id,
+    'Disregarded Entity',
+    CAST(NULL AS TEXT),
+    r.disregarded_entity_name_business_name_line1_txt,
+    r.disregarded_entity_name_business_name_line2_txt,
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    r.primary_activities_txt,
+    CAST(NULL AS TEXT),
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    'irs990_schedule_r_id_disregarded_entities_grp'
+  FROM candidates c
+  JOIN irs990_schedule_r_id_disregarded_entities_grp r ON r.filing_id = c.filing_id
+
+  UNION ALL
+
+  SELECT
+    c.ein,
+    c.tax_year,
+    r.filing_id,
+    'Transactions with Related Org',
+    CAST(NULL AS TEXT),
+    r.business_name_line1_txt,
+    r.business_name_line2_txt,
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    r.transaction_type_txt,
+    r.involved_amt,
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    'irs990_schedule_r_transactions_related_org_grp'
+  FROM candidates c
+  JOIN irs990_schedule_r_transactions_related_org_grp r ON r.filing_id = c.filing_id
+
+  UNION ALL
+
+  SELECT
+    c.ein,
+    c.tax_year,
+    r.filing_id,
+    'Unrelated Taxable Partnership',
+    r.ein,
+    r.business_name_line1_txt,
+    CAST(NULL AS TEXT),
+    r.ownership_pct,
+    r.general_or_managing_partner_ind,
+    r.primary_activities_txt,
+    CAST(NULL AS TEXT),
+    CAST(NULL AS NUMERIC),
+    CAST(NULL AS TEXT),
+    CAST(NULL AS TEXT),
+    r.address_line1_txt,
+    r.city_nm,
+    r.state_abbreviation_cd,
+    r.legal_domicile_state_cd,
+    CAST(NULL AS TEXT),
+    'irs990_schedule_r_unrelated_org_txbl_partnership_grp'
+  FROM candidates c
+  JOIN irs990_schedule_r_unrelated_org_txbl_partnership_grp r ON r.filing_id = c.filing_id
 )
 SELECT
-  c.ein                          AS filer_ein,
-  c.tax_year                     AS filer_tax_year,
+  sr.filer_ein                   AS filer_ein,
+  sr.filer_tax_year              AS filer_tax_year,
   sr.filing_id                   AS filing_id,
   sr.relationship_category       AS relationship_category,
   sr.related_ein                 AS related_ein,
@@ -124,11 +279,9 @@ SELECT
   sr.legal_domicile_state_cd     AS domicile_state,
   sr.country_cd                  AS country,
   sr.table_source                AS table_source
-FROM candidates c
-JOIN sched_r_related_orgs_expanded sr
-  ON sr.filing_id = c.filing_id
+FROM sr
 {sr_where_clause}
-ORDER BY c.ein, c.tax_year DESC, sr.relationship_category, related_name
+ORDER BY sr.filer_ein, sr.filer_tax_year DESC, sr.relationship_category, related_name
 """
 
 def _parse_eins(form) -> List[str]:
