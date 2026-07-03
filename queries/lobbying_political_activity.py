@@ -5,7 +5,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "lobbying_political_activity",
-    "name": "Lobbying & Political Activity Explorer",
+    "name": "Lobbying & Political Activity",
     "description": (
         "Explore expanded Schedule C lobbying, political campaign, 527, dues/proxy-tax, "
         "and 990-PF political/legislative indicators by EIN, filer state, and tax year."
