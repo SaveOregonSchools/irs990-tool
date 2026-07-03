@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from import_lobbying_political_data import import_lobbying_data
-from rebuild_irs990_slim_clean import extract_file
+from rebuild_irs990_slim_clean import calculated_lobbying_expense, extract_file
 
 
 SCHEDULE_C_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -91,6 +91,25 @@ PF_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 class LobbyingPoliticalImportTests(unittest.TestCase):
+    def test_calculated_lobbying_expense_uses_grouped_and_component_fallbacks(self):
+        self.assertEqual(
+            calculated_lobbying_expense({
+                "total_lobbying_expenditures_amt": None,
+                "total_lobbying_expend_grp_amt": 10137,
+                "total_direct_lobbying_amt": 999,
+            }),
+            10137,
+        )
+        self.assertEqual(
+            calculated_lobbying_expense({
+                "total_lobbying_expenditures_amt": None,
+                "total_lobbying_expend_grp_amt": None,
+                "total_direct_lobbying_amt": 700,
+                "total_grassroots_lobbying_amt": 300,
+            }),
+            1000,
+        )
+
     def test_extract_file_captures_expanded_schedule_c_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml_path = Path(tmp) / "SCHC1_public.xml"

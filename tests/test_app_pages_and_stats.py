@@ -133,7 +133,28 @@ class AppPagesAndStatsTests(unittest.TestCase):
             run=lambda form: (["col"], [("ask",)]),
             export_rows=lambda form: [("ask",)],
         )
-        app_module.REGISTRY = {"ask_database": fake_ask_query, "fixture_query": fake_query}
+        fake_pdf_query = SimpleNamespace(
+            META={
+                "key": "pdf_query",
+                "name": "PDF Query",
+                "description": "Runs a PDF-capable query for tests.",
+            },
+            HIDE_PREVIEW_LIMIT=True,
+            HIDE_CSV_EXPORT=True,
+            DISABLE_ROW_LIMIT=True,
+            PDF_EXPORT=True,
+            RUN_BUTTON_LABEL="Open Fixture",
+            render_fields=lambda form: "<input name='fixture' value='ok'>",
+            run=lambda form: (["col"], [("one",), ("two",)]),
+            export_rows=lambda form: [("one",), ("two",)],
+            render_results=lambda form, headers, rows: f"<div>custom rows:{len(rows)}</div>",
+            render_pdf_export=lambda form: "<!doctype html><title>PDF fixture</title>",
+        )
+        app_module.REGISTRY = {
+            "ask_database": fake_ask_query,
+            "fixture_query": fake_query,
+            "pdf_query": fake_pdf_query,
+        }
         app_module.PLUGIN_FINGERPRINT = app_module.plugin_fingerprint()
         app_module.app.config.update(TESTING=True)
 
@@ -185,6 +206,26 @@ class AppPagesAndStatsTests(unittest.TestCase):
         run_response = client.post("/run", data={"qkey": "fixture_query", "_limit": "5"})
         run_body = run_response.get_data(as_text=True)
         self.assertIn("value", run_body)
+
+    def test_pdf_query_hides_generic_preview_and_csv_controls(self):
+        client = app_module.app.test_client()
+        response = client.get("/query/pdf_query")
+        body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Preview row limit", body)
+        self.assertNotIn("Export CSV", body)
+        self.assertIn("Export PDF", body)
+        self.assertIn("Open Fixture", body)
+        self.assertIn('formaction="/export_pdf"', body)
+
+        run_response = client.post("/run", data={"qkey": "pdf_query", "_limit": "1"})
+        run_body = run_response.get_data(as_text=True)
+        self.assertIn("custom rows:2", run_body)
+
+        pdf_response = client.post("/export_pdf", data={"qkey": "pdf_query"})
+        self.assertEqual(pdf_response.status_code, 200)
+        self.assertIn("PDF fixture", pdf_response.get_data(as_text=True))
 
     def test_registry_auto_reloads_when_query_files_change(self):
         app_module.REGISTRY = {"old": object()}

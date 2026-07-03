@@ -415,10 +415,16 @@ QUERY_HTML = LAYOUT_START + """
     <input type="hidden" name="qkey" value="{{ qkey }}">
     {{ registry[qkey].render_fields(form or {}) | safe }}
     <div class="toolbar">
-      <label>Preview row limit:</label>
-      <input type="number" name="_limit" value="{{ (form or {}).get('_limit','500') }}" min="1" style="width:100px">
-      <button type="submit">Run Query</button>
-      <button formaction="{{ url_for('export') }}" formmethod="post">Export CSV (full result)</button>
+      {% if not hide_preview_limit %}
+        <label>Preview row limit:</label>
+        <input type="number" name="_limit" value="{{ (form or {}).get('_limit','500') }}" min="1" style="width:100px">
+      {% endif %}
+      <button type="submit">{{ run_button_label }}</button>
+      {% if pdf_export %}
+        <button formaction="{{ url_for('export_pdf') }}" formmethod="post" formtarget="_blank">Export PDF</button>
+      {% elif not hide_csv_export %}
+        <button formaction="{{ url_for('export') }}" formmethod="post">Export CSV (full result)</button>
+      {% endif %}
     </div>
 
     <div class="running-msg">
@@ -481,14 +487,15 @@ QUERY_HTML = LAYOUT_START + """
     document.body.classList.add("is-running");
 
     const submitter = event.submitter;
-    const isExport = submitter && submitter.getAttribute("formaction") === "{{ url_for('export') }}";
+    const submitAction = submitter ? submitter.getAttribute("formaction") : "";
+    const isExport = submitAction === "{{ url_for('export') }}" || submitAction === "{{ url_for('export_pdf') }}";
 
     const buttons = form.querySelectorAll("button");
     buttons.forEach(function(btn) {
       btn.disabled = true;
     });
 
-    // Export CSV usually downloads a file without reloading the page,
+    // Export-style actions usually complete outside this page,
     // so re-enable the UI after a short delay.
     if (isExport) {
       setTimeout(function() {
@@ -642,6 +649,10 @@ def _render_home():
     )
 
 
+def _module_flag(qkey, name):
+    return bool(qkey in REGISTRY and getattr(REGISTRY[qkey], name, False))
+
+
 def _render_query(qkey, form=None, headers=None, rows=None, error=None):
     ensure_registry()
     custom_results_html = None
@@ -660,6 +671,10 @@ def _render_query(qkey, form=None, headers=None, rows=None, error=None):
             error=error,
             len=len,
             custom_results_html=custom_results_html,
+            hide_preview_limit=_module_flag(qkey, "HIDE_PREVIEW_LIMIT"),
+            hide_csv_export=_module_flag(qkey, "HIDE_CSV_EXPORT"),
+            pdf_export=_module_flag(qkey, "PDF_EXPORT"),
+            run_button_label=getattr(REGISTRY[qkey], "RUN_BUTTON_LABEL", "Run Query") if qkey in REGISTRY else "Run Query",
         ),
     )
 
@@ -844,11 +859,12 @@ def run():
     headers, rows = None, None
     try:
         headers, rows = REGISTRY[qkey].run(form)
-        try:
-            lim = max(1, int(form.get("_limit", "500")))
-        except Exception:
-            lim = 500
-        rows = rows[:lim]
+        if not _module_flag(qkey, "DISABLE_ROW_LIMIT"):
+            try:
+                lim = max(1, int(form.get("_limit", "500")))
+            except Exception:
+                lim = 500
+            rows = rows[:lim]
     except Exception:
         error = traceback.format_exc()
     return _render_query(qkey, form=form, headers=headers, rows=rows, error=error)
@@ -884,6 +900,24 @@ def export():
         generate(),
         mimetype="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/export_pdf", methods=["GET", "POST"])
+def export_pdf():
+    if request.method == "GET":
+        return redirect(url_for("home"))
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    form = request.form.to_dict(flat=True)
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    if not hasattr(REGISTRY[qkey], "render_pdf_export"):
+        return "This module does not support PDF export.", 400
+
+    return Response(
+        REGISTRY[qkey].render_pdf_export(form),
+        mimetype="text/html; charset=utf-8",
     )
 
 

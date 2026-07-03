@@ -82,7 +82,7 @@ db/irs990.db
 Or set a custom path:
 
 ```powershell
-$env:IRS_DB_PATH = "C:\IRSDB\db\irs990.db"
+$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
 ```
 
 Then start the web app:

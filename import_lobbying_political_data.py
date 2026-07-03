@@ -21,6 +21,7 @@ from rebuild_irs990_slim_clean import (
     IRS990PF_COLS,
     SCHEDC_COLS,
     build_schema,
+    calculated_lobbying_expense,
     db_connect,
     ensure_schema_columns,
     extract_file,
@@ -101,6 +102,11 @@ def apply_extracted(conn: sqlite3.Connection, row: Dict[str, object]) -> Dict[st
     schedule_c = row.get("irs990_schedule_c_root") or {}
     if has_nonblank(schedule_c):
         insert_singleton(conn, "irs990_schedule_c_root", filing_id, schedule_c, SCHEDC_COLS)
+        if not str(header.get("return_type") or "").startswith(("990PF", "990T")):
+            conn.execute(
+                "UPDATE core_hot SET lobbying_expense = ? WHERE filing_id = ?",
+                [calculated_lobbying_expense(schedule_c), filing_id],
+            )
         conn.execute("DELETE FROM irs990_schedule_c_supplemental_info WHERE filing_id = ?", [filing_id])
         counts["schedule_c"] += 1
 

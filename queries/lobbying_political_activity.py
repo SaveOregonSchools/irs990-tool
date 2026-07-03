@@ -34,7 +34,9 @@ HEADERS = [
     "expended527_activities_amt",
     "total_exempt_function_expend_amt",
     "form1120_pol_filed_ind",
+    "calculated_lobbying_expense",
     "total_lobbying_expenditures_amt",
+    "total_lobbying_expend_grp_amt",
     "total_direct_lobbying_amt",
     "total_grassroots_lobbying_amt",
     "lobbying_nontaxable_amt",
@@ -195,11 +197,30 @@ _POLITICAL_EXPR = f"""
 )
 """
 
+_CALCULATED_LOBBYING_EXPENSE_EXPR = """
+COALESCE(
+  sc.total_lobbying_expenditures_amt,
+  sc.total_lobbying_expend_grp_amt,
+  NULLIF(COALESCE(sc.total_direct_lobbying_amt, 0) + COALESCE(sc.total_grassroots_lobbying_amt, 0), 0),
+  NULLIF(
+    COALESCE(sc.media_advertisements_amt, 0)
+    + COALESCE(sc.mailings_members_amt, 0)
+    + COALESCE(sc.publications_or_broadcast_amt, 0)
+    + COALESCE(sc.grants_other_organizations_amt, 0)
+    + COALESCE(sc.direct_contact_legislators_amt, 0)
+    + COALESCE(sc.rallies_demonstrations_amt, 0)
+    + COALESCE(sc.other_activities_amt, 0),
+    0
+  )
+)
+"""
+
 _LOBBYING_EXPR = f"""
 (
   UPPER(TRIM(COALESCE(f990.lobbying_activities_ind, ez.lobbying_activities_ind, pf.legislative_political_acty_ind, ''))) IN {_TRUTHY}
   OR UPPER(TRIM(COALESCE(pf.influence_legislation_ind, ''))) IN {_TRUTHY}
   OR COALESCE(sc.total_lobbying_expenditures_amt, 0) <> 0
+  OR COALESCE(sc.total_lobbying_expend_grp_amt, 0) <> 0
   OR COALESCE(sc.total_direct_lobbying_amt, 0) <> 0
   OR COALESCE(sc.total_grassroots_lobbying_amt, 0) <> 0
   OR COALESCE(sc.lobbying_nontaxable_amt, 0) <> 0
@@ -247,6 +268,7 @@ _AMOUNT_EXPR = """
   OR COALESCE(sc.expended527_activities_amt, 0) >= ?
   OR COALESCE(sc.total_exempt_function_expend_amt, 0) >= ?
   OR COALESCE(sc.total_lobbying_expenditures_amt, 0) >= ?
+  OR COALESCE(sc.total_lobbying_expend_grp_amt, 0) >= ?
   OR COALESCE(sc.total_direct_lobbying_amt, 0) >= ?
   OR COALESCE(sc.total_grassroots_lobbying_amt, 0) >= ?
   OR COALESCE(sc.lobbying_nontaxable_amt, 0) >= ?
@@ -315,7 +337,9 @@ SELECT
   sc.expended527_activities_amt,
   sc.total_exempt_function_expend_amt,
   sc.form1120_pol_filed_ind,
+  {calculated_lobbying_expr} AS calculated_lobbying_expense,
   sc.total_lobbying_expenditures_amt,
+  sc.total_lobbying_expend_grp_amt,
   sc.total_direct_lobbying_amt,
   sc.total_grassroots_lobbying_amt,
   sc.lobbying_nontaxable_amt,
@@ -396,7 +420,9 @@ SELECT
   c.expended527_activities_amt,
   c.total_exempt_function_expend_amt,
   c.form1120_pol_filed_ind,
+  c.calculated_lobbying_expense,
   c.total_lobbying_expenditures_amt,
+  c.total_lobbying_expend_grp_amt,
   c.total_direct_lobbying_amt,
   c.total_grassroots_lobbying_amt,
   c.lobbying_nontaxable_amt,
@@ -441,6 +467,7 @@ _SQL = _SQL.format(
     lobbying_expr=_LOBBYING_EXPR,
     proxy_dues_expr=_PROXY_DUES_EXPR,
     pf_flags_expr=_PF_FLAGS_EXPR,
+    calculated_lobbying_expr=_CALCULATED_LOBBYING_EXPENSE_EXPR,
     where_clause="{where_clause}",
 )
 
@@ -540,7 +567,7 @@ def _build_where(
 
     if min_amount is not None:
         clauses.append(_AMOUNT_EXPR)
-        params.extend([min_amount] * 13)
+        params.extend([min_amount] * 14)
 
     if not clauses:
         return "", params

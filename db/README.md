@@ -23,13 +23,13 @@ To use a database somewhere else, set `IRS_DB_PATH`.
 PowerShell:
 
 ```powershell
-$env:IRS_DB_PATH = "C:\IRSDB\db\irs990.db"
+$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
 ```
 
 Windows CMD:
 
 ```bat
-set IRS_DB_PATH=C:\IRSDB\db\irs990.db
+set IRS_DB_PATH=C:\Projects\irs990-tool\db\irs990.db
 ```
 
 ---

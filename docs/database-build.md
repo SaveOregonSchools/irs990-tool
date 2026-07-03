@@ -21,7 +21,7 @@ db/irs990.db
 A larger external database path is also fine:
 
 ```text
-C:\IRSDB\db\irs990.db
+C:\Projects\irs990-tool\db\irs990.db
 ```
 
 ---

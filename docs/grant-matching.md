@@ -132,7 +132,7 @@ Common PowerShell options:
 
 ```powershell
 .\batch_enhanced_grant_matches.ps1 `
-  -DbPath C:\IRSDB\db\irs990.db `
+  -DbPath C:\Projects\irs990-tool\db\irs990.db `
   -ProjectDir C:\Projects\irs990-tool `
   -Yes
 ```

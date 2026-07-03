@@ -1095,6 +1095,7 @@ INDEXES = [
     'CREATE INDEX IF NOT EXISTS idx_returns_filing_id ON returns(filing_id);',
     'CREATE INDEX IF NOT EXISTS idx_returns_ein ON returns(ein);',
     'CREATE INDEX IF NOT EXISTS idx_returns_ein_year ON returns(ein, tax_year);',
+    'CREATE INDEX IF NOT EXISTS idx_returns_org_name_nocase ON returns(org_name COLLATE NOCASE);',
     'CREATE INDEX IF NOT EXISTS idx_returns_state_year ON returns(state, tax_year);',
     'CREATE INDEX IF NOT EXISTS idx_returns_tax_year ON returns(tax_year);',
     'CREATE INDEX IF NOT EXISTS idx_returns_type_year ON returns(return_type, tax_year);',
@@ -1333,6 +1334,35 @@ def extract_schedule_c_supplemental(node: Optional[ET.Element], filing_id: str) 
     return rows
 
 
+LOBBYING_ACTIVITY_AMOUNT_COLS = [
+    'media_advertisements_amt',
+    'mailings_members_amt',
+    'publications_or_broadcast_amt',
+    'grants_other_organizations_amt',
+    'direct_contact_legislators_amt',
+    'rallies_demonstrations_amt',
+    'other_activities_amt',
+]
+
+
+def calculated_lobbying_expense(schedule_c: Dict[str, Any]) -> Optional[float]:
+    explicit_total = norm_num(schedule_c.get('total_lobbying_expenditures_amt'))
+    if explicit_total is not None:
+        return explicit_total
+
+    grouped_total = norm_num(schedule_c.get('total_lobbying_expend_grp_amt'))
+    if grouped_total is not None:
+        return grouped_total
+
+    grassroots = norm_num(schedule_c.get('total_grassroots_lobbying_amt')) or 0
+    direct = norm_num(schedule_c.get('total_direct_lobbying_amt')) or 0
+    if grassroots or direct:
+        return grassroots + direct
+
+    activity_total = sum(norm_num(schedule_c.get(col)) or 0 for col in LOBBYING_ACTIVITY_AMOUNT_COLS)
+    return activity_total if activity_total else None
+
+
 def generic_group_rows(root: ET.Element, tag_key: str, cols: Sequence[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for g in find_groups(root, GROUP_TAGS[tag_key]):
@@ -1450,7 +1480,7 @@ def extract_file(file_path: str) -> Dict[str, Any]:
         core_hot['investment_income'] = norm_num(irs990.get('cyinvestment_income_amt'))
         core_hot['government_grants'] = descendants_num_by_col(fns['990'], 'government_grants_amt')
         core_hot['grants_paid'] = norm_num(irs990.get('cygrants_and_similar_paid_amt'))
-        core_hot['lobbying_expense'] = descendants_num_by_col(fns['SCHC'], 'total_lobbying_expenditures_amt')
+        core_hot['lobbying_expense'] = calculated_lobbying_expense(schc)
         core_hot['employees_count'] = norm_int(irs990.get('total_employee_cnt') or irs990.get('employee_cnt'))
         core_hot['volunteers_count'] = norm_int(irs990.get('total_volunteers_cnt'))
         core_hot['mission_desc'] = irs990.get('mission_desc') or irs990.get('activity_or_mission_desc')
@@ -1609,9 +1639,9 @@ def extract_file(file_path: str) -> Dict[str, Any]:
         'irs990_ez_books_in_care_of_detail': books_ez,
         'grants': grants,
         'irs990_contractor_compensation_grp': contractors,
-        'officers': officers_rows,
-        'highest_comp_employees': high_rows,
-        'former_key_people': former_rows,
+        'officers': dedupe_rows(officers_rows, ['filing_id','person_name','title_txt','avg_hours_week','comp_from_org','comp_from_related','other_compensation','is_officer','is_director','is_key_employee','is_former']),
+        'highest_comp_employees': dedupe_rows(high_rows, ['filing_id','person_name','title_txt','avg_hours_week','comp_from_org','comp_from_related','other_compensation']),
+        'former_key_people': dedupe_rows(former_rows, ['filing_id','person_name','title_txt','comp_from_org','comp_from_related','other_compensation']),
         'irs990_ez_officer_director_trustee_empl_grp': ez_officer_rows,
         'irs990_schedule_j_rltd_org_officer_trst_key_empl_grp': schedj_rows,
         'irs990_pf_officer_dir_trst_key_empl_info_grp': pf_officer_rows,
@@ -1626,6 +1656,18 @@ def extract_file(file_path: str) -> Dict[str, Any]:
         'irs990_schedule_r_transactions_related_org_grp': r_trans,
         'irs990_schedule_r_unrelated_org_txbl_partnership_grp': r_unrel,
     }
+
+
+def dedupe_rows(rows: List[dict], cols: List[str]) -> List[dict]:
+    out = []
+    seen = set()
+    for row in rows:
+        key = tuple(row.get(col) for col in cols)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
 
 
 def iter_xml_files(root: Path) -> Iterable[str]:

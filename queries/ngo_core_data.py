@@ -74,6 +74,28 @@ US_STATES = [
     "NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"
 ]
 
+_LOBBYING_EXPENSE_CASE = """
+        CASE
+          WHEN c.return_type LIKE '990PF%' THEN NULL
+          WHEN c.return_type LIKE '990T%'  THEN NULL
+          ELSE COALESCE(
+            sc.total_lobbying_expenditures_amt,
+            sc.total_lobbying_expend_grp_amt,
+            NULLIF(COALESCE(sc.total_direct_lobbying_amt, 0) + COALESCE(sc.total_grassroots_lobbying_amt, 0), 0),
+            NULLIF(
+              COALESCE(sc.media_advertisements_amt, 0)
+              + COALESCE(sc.mailings_members_amt, 0)
+              + COALESCE(sc.publications_or_broadcast_amt, 0)
+              + COALESCE(sc.grants_other_organizations_amt, 0)
+              + COALESCE(sc.direct_contact_legislators_amt, 0)
+              + COALESCE(sc.rallies_demonstrations_amt, 0)
+              + COALESCE(sc.other_activities_amt, 0),
+              0
+            )
+          )
+        END
+"""
+
 def _val_js(val: str) -> str:
     return repr(val)
 
@@ -140,7 +162,7 @@ def render_fields(form) -> str:
     </div>
     """
 
-_SQL_SELECT = """
+_SQL_SELECT = f"""
 SELECT
     t.ein,
     t.org_name,
@@ -242,11 +264,7 @@ FROM (
           WHEN c.return_type LIKE '990T%'  THEN NULL
           ELSE f990.cygrants_and_similar_paid_amt
         END AS grants_paid,
-        CASE
-          WHEN c.return_type LIKE '990PF%' THEN NULL
-          WHEN c.return_type LIKE '990T%'  THEN NULL
-          ELSE sc.total_lobbying_expenditures_amt
-        END AS lobbying_expense,
+        {_LOBBYING_EXPENSE_CASE} AS lobbying_expense,
         CASE
           WHEN c.return_type LIKE '990EZ%' THEN NULL
           WHEN c.return_type LIKE '990PF%' THEN NULL

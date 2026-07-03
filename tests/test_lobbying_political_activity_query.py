@@ -58,6 +58,7 @@ def build_fixture_db():
           total_exempt_function_expend_amt NUMERIC,
           form1120_pol_filed_ind TEXT,
           total_lobbying_expenditures_amt NUMERIC,
+          total_lobbying_expend_grp_amt NUMERIC,
           total_direct_lobbying_amt NUMERIC,
           total_grassroots_lobbying_amt NUMERIC,
           lobbying_nontaxable_amt NUMERIC,
@@ -108,7 +109,7 @@ def build_fixture_db():
     conn.execute(
         """
         INSERT INTO irs990_schedule_c_root VALUES (
-          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+          ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
         )
         """,
         (
@@ -117,6 +118,7 @@ def build_fixture_db():
             100,
             100,
             "X",
+            2500,
             2500,
             1700,
             800,
@@ -194,7 +196,9 @@ class LobbyingPoliticalActivityQueryTests(unittest.TestCase):
         self.assertIn("political", row["activity_summary"])
         self.assertIn("lobbying", row["activity_summary"])
         self.assertIn("dues/proxy-tax", row["activity_summary"])
+        self.assertEqual(row["calculated_lobbying_expense"], 2500)
         self.assertEqual(row["total_lobbying_expenditures_amt"], 2500)
+        self.assertEqual(row["total_lobbying_expend_grp_amt"], 2500)
         self.assertEqual(row["direct_contact_legislators_amt"], 1700)
         self.assertEqual(row["schedule_c_supplemental_count"], 1)
         self.assertIn("Direct contact", row["schedule_c_explanations"])
