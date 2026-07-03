@@ -119,6 +119,12 @@ def col_candidates(col: str) -> List[str]:
         'mission_desc_txt': ['RestrictionsOnAwardsTxt'],
         'employee_benefits_amt': ['EmployeeBenefitsAmt', 'EmployeeBenefitProgramAmt'],
         'expense_account_amt': ['ExpenseAccountAmt', 'ExpenseAccountOtherAllwncAmt'],
+        'form1120_pol_filed_ind': ['Form1120POLFiledInd'],
+        'non_deductible_lbbyng_pltcl_cy_amt': ['NonDeductibleLbbyngPltclCYAmt', 'NonDeductibleLbbyngPltclCYAmt'],
+        'non_deductible_lbbyng_pltcl_tot_amt': ['NonDeductibleLbbyngPltclTotAmt'],
+        'aggregate_reported_dues_ntc_amt': ['AggregateReportedDuesNtcAmt'],
+        'not_described_section501c3_ind': ['NotDescribedSection501c3Ind'],
+        'more_than100_spent_ind': ['MoreThan100SpentInd'],
     }
     out.extend(specials.get(col, []))
     seen, final = set(), []
@@ -477,6 +483,10 @@ CREATE TABLE IF NOT EXISTS irs990_pf_root (
   organization4947a1_trtd_pfind TEXT,
   website_address_txt TEXT,
   legislative_political_acty_ind TEXT,
+  more_than100_spent_ind TEXT,
+  form1120_pol_filed_ind TEXT,
+  influence_legislation_ind TEXT,
+  influence_election_ind TEXT,
   total_grant_or_contri_pd_dur_yr_amt NUMERIC,
   mission_desc_txt TEXT
 );
@@ -484,8 +494,65 @@ CREATE TABLE IF NOT EXISTS irs990_pf_root (
 """
 CREATE TABLE IF NOT EXISTS irs990_schedule_c_root (
   filing_id TEXT PRIMARY KEY,
+  political_expenditures_amt NUMERIC,
+  volunteer_hours_cnt NUMERIC,
+  expended527_activities_amt NUMERIC,
+  total_exempt_function_expend_amt NUMERIC,
+  form1120_pol_filed_ind TEXT,
+  total_grassroots_lobbying_amt NUMERIC,
+  total_direct_lobbying_amt NUMERIC,
+  total_lobbying_expend_grp_amt NUMERIC,
+  other_exempt_purpose_expend_amt NUMERIC,
+  total_exempt_purpose_expenditures_amt NUMERIC,
+  lobbying_nontaxable_amt NUMERIC,
+  grassroots_nontaxable_amt NUMERIC,
+  lobbying_grassroots_excess_amt NUMERIC,
+  lobbying_excess_amt NUMERIC,
+  avg_lobbying_nontaxable_minus3_amt NUMERIC,
+  avg_lobbying_nontaxable_minus2_amt NUMERIC,
+  avg_lobbying_nontaxable_minus1_amt NUMERIC,
+  avg_lobbying_nontaxable_current_amt NUMERIC,
+  avg_lobbying_nontaxable_total_amt NUMERIC,
+  lobbying_ceiling_amt NUMERIC,
+  avg_grassroots_nontaxable_minus3_amt NUMERIC,
+  avg_grassroots_nontaxable_minus2_amt NUMERIC,
+  avg_grassroots_nontaxable_minus1_amt NUMERIC,
+  avg_grassroots_nontaxable_current_amt NUMERIC,
+  avg_grassroots_nontaxable_total_amt NUMERIC,
+  grassroots_ceiling_amt NUMERIC,
+  organization_belongs_afflt_grp_ind TEXT,
+  volunteers_ind TEXT,
+  paid_staff_or_management_ind TEXT,
+  media_advertisements_ind TEXT,
+  media_advertisements_amt NUMERIC,
+  mailings_members_ind TEXT,
+  mailings_members_amt NUMERIC,
+  publications_or_broadcast_ind TEXT,
+  publications_or_broadcast_amt NUMERIC,
+  grants_other_organizations_ind TEXT,
+  grants_other_organizations_amt NUMERIC,
+  direct_contact_legislators_ind TEXT,
+  direct_contact_legislators_amt NUMERIC,
+  rallies_demonstrations_ind TEXT,
+  rallies_demonstrations_amt NUMERIC,
+  other_activities_ind TEXT,
+  other_activities_amt NUMERIC,
   total_lobbying_expenditures_amt NUMERIC,
+  not_described_section501c3_ind TEXT,
+  dues_assessments_amt NUMERIC,
+  non_deductible_lbbyng_pltcl_cy_amt NUMERIC,
+  non_deductible_lbbyng_pltcl_tot_amt NUMERIC,
+  aggregate_reported_dues_ntc_amt NUMERIC,
+  carried_over_amt NUMERIC,
   substantially_all_dues_nonded_ind TEXT
+);
+""",
+"""
+CREATE TABLE IF NOT EXISTS irs990_schedule_c_supplemental_info (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  filing_id TEXT NOT NULL,
+  form_and_line_reference_desc TEXT,
+  explanation_txt TEXT
 );
 """,
 """
@@ -1033,6 +1100,8 @@ INDEXES = [
     'CREATE INDEX IF NOT EXISTS idx_returns_type_year ON returns(return_type, tax_year);',
     'CREATE INDEX IF NOT EXISTS idx_cby_filing_id ON canonical_by_ein_year(filing_id);',
     'CREATE INDEX IF NOT EXISTS idx_canonical_taxyear_filing ON canonical_by_ein_year(tax_year, filing_id);',
+    'CREATE INDEX IF NOT EXISTS idx_schedule_c_root_filing ON irs990_schedule_c_root(filing_id);',
+    'CREATE INDEX IF NOT EXISTS idx_schedule_c_supp_filing ON irs990_schedule_c_supplemental_info(filing_id);',
     'CREATE INDEX IF NOT EXISTS idx_grants_filing_id ON grants(filing_id);',
     'CREATE INDEX IF NOT EXISTS idx_grants_recipient_ein ON grants(recipient_ein);',
     'CREATE INDEX IF NOT EXISTS idx_grants_filing_recipient ON grants(filing_id, recipient_ein);',
@@ -1051,8 +1120,60 @@ INDEXES = [
 
 IRS990_COLS = ['net_assets_or_fund_balances_boyamt','net_assets_or_fund_balances_eoyamt','total_program_service_revenue_amt','cyprogram_service_revenue_amt','membership_dues_amt','cyinvestment_income_amt','cygrants_and_similar_paid_amt','total_employee_cnt','employee_cnt','total_volunteers_cnt','mission_desc','activity_or_mission_desc','address_change_ind','name_change_ind','initial_return_ind','final_return_ind','amended_return_ind','application_pending_ind','website_address_txt','formation_yr','legal_domicile_state_cd','organization501c3_ind','organization501c_ind','attr_organization501c_type_txt','organization4947a1_not_pfind','type_of_organization_corp_ind','type_of_organization_trust_ind','type_of_organization_assoc_ind','type_of_organization_other_ind','other_organization_dsc','cyother_revenue_amt','cysalaries_comp_emp_bnft_paid_amt','cytotal_prof_fndrsng_expns_amt','cytotal_fundraising_expense_amt','cyother_expenses_amt','cyrevenues_less_expenses_amt','total_assets_boyamt','total_assets_eoyamt','total_liabilities_boyamt','total_liabilities_eoyamt','political_campaign_acty_ind','lobbying_activities_ind']
 IRS990EZ_COLS = ['net_assets_or_fund_balances_boyamt','net_assets_or_fund_balances_eoyamt','program_service_revenue_amt','membership_dues_amt','investment_income_amt','grants_and_similar_amounts_paid_amt','primary_exempt_purpose_txt','address_change_ind','name_change_ind','initial_return_ind','final_return_ind','amended_return_ind','application_pending_ind','website_address_txt','organization501c3_ind','organization501c_ind','attr_organization501c_type_txt','organization4947a1_not_pfind','type_of_organization_corp_ind','type_of_organization_trust_ind','type_of_organization_assoc_ind','type_of_organization_other_ind','type_of_organization_other_desc','other_revenue_total_amt','salaries_other_comp_empl_bnft_amt','other_expenses_total_amt','excess_or_deficit_for_year_amt','political_campaign_acty_ind','lobbying_activities_ind']
-IRS990PF_COLS = ['address_change_ind','name_change_ind','initial_return_ind','final_return_ind','amended_return_ind','application_pending_ind','organization501c3_exempt_pfind','organization4947a1_trtd_pfind','website_address_txt','legislative_political_acty_ind','total_grant_or_contri_pd_dur_yr_amt','mission_desc_txt']
-SCHEDC_COLS = ['total_lobbying_expenditures_amt','substantially_all_dues_nonded_ind']
+IRS990PF_COLS = ['address_change_ind','name_change_ind','initial_return_ind','final_return_ind','amended_return_ind','application_pending_ind','organization501c3_exempt_pfind','organization4947a1_trtd_pfind','website_address_txt','legislative_political_acty_ind','more_than100_spent_ind','form1120_pol_filed_ind','influence_legislation_ind','influence_election_ind','total_grant_or_contri_pd_dur_yr_amt','mission_desc_txt']
+SCHEDC_COLS = [
+    'political_expenditures_amt',
+    'volunteer_hours_cnt',
+    'expended527_activities_amt',
+    'total_exempt_function_expend_amt',
+    'form1120_pol_filed_ind',
+    'total_grassroots_lobbying_amt',
+    'total_direct_lobbying_amt',
+    'total_lobbying_expend_grp_amt',
+    'other_exempt_purpose_expend_amt',
+    'total_exempt_purpose_expenditures_amt',
+    'lobbying_nontaxable_amt',
+    'grassroots_nontaxable_amt',
+    'lobbying_grassroots_excess_amt',
+    'lobbying_excess_amt',
+    'avg_lobbying_nontaxable_minus3_amt',
+    'avg_lobbying_nontaxable_minus2_amt',
+    'avg_lobbying_nontaxable_minus1_amt',
+    'avg_lobbying_nontaxable_current_amt',
+    'avg_lobbying_nontaxable_total_amt',
+    'lobbying_ceiling_amt',
+    'avg_grassroots_nontaxable_minus3_amt',
+    'avg_grassroots_nontaxable_minus2_amt',
+    'avg_grassroots_nontaxable_minus1_amt',
+    'avg_grassroots_nontaxable_current_amt',
+    'avg_grassroots_nontaxable_total_amt',
+    'grassroots_ceiling_amt',
+    'organization_belongs_afflt_grp_ind',
+    'volunteers_ind',
+    'paid_staff_or_management_ind',
+    'media_advertisements_ind',
+    'media_advertisements_amt',
+    'mailings_members_ind',
+    'mailings_members_amt',
+    'publications_or_broadcast_ind',
+    'publications_or_broadcast_amt',
+    'grants_other_organizations_ind',
+    'grants_other_organizations_amt',
+    'direct_contact_legislators_ind',
+    'direct_contact_legislators_amt',
+    'rallies_demonstrations_ind',
+    'rallies_demonstrations_amt',
+    'other_activities_ind',
+    'other_activities_amt',
+    'total_lobbying_expenditures_amt',
+    'not_described_section501c3_ind',
+    'dues_assessments_amt',
+    'non_deductible_lbbyng_pltcl_cy_amt',
+    'non_deductible_lbbyng_pltcl_tot_amt',
+    'aggregate_reported_dues_ntc_amt',
+    'carried_over_amt',
+    'substantially_all_dues_nonded_ind',
+]
 EZ_TA_COLS = ['boyamt','eoyamt']
 EZ_TL_COLS = ['boyamt','eoyamt']
 PF_ANA_COLS = ['other_income_rev_and_expnss_amt','oth_empl_slrs_wgs_rev_and_expnss_amt','pension_empl_bnft_rev_and_expnss_amt','other_expenses_rev_and_expnss_amt','excess_revenue_over_expenses_amt','interest_on_savings_temp_cash_investments_rev_and_expnss_amt','dividends_interest_securities_rev_and_expnss_amt','net_investment_income_amt','contri_paid_rev_and_expnss_amt']
@@ -1111,6 +1232,77 @@ def generic_singleton_extract(node: Optional[ET.Element], cols: Sequence[str]) -
     for c in cols:
         out[c] = descendants_first_by_col(node, c)
     return out
+
+
+def child_num(node: Optional[ET.Element], parent_tag: str, child_tag: str) -> Optional[float]:
+    if node is None:
+        return None
+    parent = find_first(node, [parent_tag])
+    if parent is None:
+        return None
+    return rel_first_num(parent, [child_tag])
+
+
+def child_text(node: Optional[ET.Element], parent_tag: str, child_tag: str) -> Optional[str]:
+    if node is None:
+        return None
+    parent = find_first(node, [parent_tag])
+    if parent is None:
+        return None
+    return rel_first_text(parent, [child_tag])
+
+
+def extract_schedule_c(node: Optional[ET.Element]) -> Dict[str, Any]:
+    out = {c: None for c in SCHEDC_COLS}
+    if node is None:
+        return out
+
+    # Generic direct descendants cover most Part I, Part II-B, and proxy-tax fields.
+    for c in SCHEDC_COLS:
+        out[c] = descendants_first_by_col(node, c)
+
+    # Several Schedule C Part II-A groups reuse child names such as
+    # FilingOrganizationsTotalAmt; map by parent group so the meaning is stable.
+    grouped_amounts = {
+        'total_grassroots_lobbying_amt': ('TotalGrassrootsLobbyingGrp', 'FilingOrganizationsTotalAmt'),
+        'total_direct_lobbying_amt': ('TotalDirectLobbyingGrp', 'FilingOrganizationsTotalAmt'),
+        'total_lobbying_expend_grp_amt': ('TotalLobbyingExpendGrp', 'FilingOrganizationsTotalAmt'),
+        'other_exempt_purpose_expend_amt': ('OtherExemptPurposeExpendGrp', 'FilingOrganizationsTotalAmt'),
+        'total_exempt_purpose_expenditures_amt': ('TotalExemptPurposeExpendGrp', 'FilingOrganizationsTotalAmt'),
+        'lobbying_nontaxable_amt': ('LobbyingNontaxableAmountGrp', 'FilingOrganizationsTotalAmt'),
+        'grassroots_nontaxable_amt': ('GrassrootsNontaxableGrp', 'FilingOrganizationsTotalAmt'),
+        'lobbying_grassroots_excess_amt': ('TotLbbyngGrassrootMnsNonTxGrp', 'FilingOrganizationsTotalAmt'),
+        'lobbying_excess_amt': ('TotLbbyExpendMnsLbbyngNonTxGrp', 'FilingOrganizationsTotalAmt'),
+        'avg_lobbying_nontaxable_minus3_amt': ('AvgLobbyingNontaxableAmountGrp', 'CurrentYearMinus3Amt'),
+        'avg_lobbying_nontaxable_minus2_amt': ('AvgLobbyingNontaxableAmountGrp', 'CurrentYearMinus2Amt'),
+        'avg_lobbying_nontaxable_minus1_amt': ('AvgLobbyingNontaxableAmountGrp', 'CurrentYearMinus1Amt'),
+        'avg_lobbying_nontaxable_current_amt': ('AvgLobbyingNontaxableAmountGrp', 'CurrentYearAmt'),
+        'avg_lobbying_nontaxable_total_amt': ('AvgLobbyingNontaxableAmountGrp', 'TotalAmt'),
+        'avg_grassroots_nontaxable_minus3_amt': ('AvgGrassrootsNontaxableGrp', 'CurrentYearMinus3Amt'),
+        'avg_grassroots_nontaxable_minus2_amt': ('AvgGrassrootsNontaxableGrp', 'CurrentYearMinus2Amt'),
+        'avg_grassroots_nontaxable_minus1_amt': ('AvgGrassrootsNontaxableGrp', 'CurrentYearMinus1Amt'),
+        'avg_grassroots_nontaxable_current_amt': ('AvgGrassrootsNontaxableGrp', 'CurrentYearAmt'),
+        'avg_grassroots_nontaxable_total_amt': ('AvgGrassrootsNontaxableGrp', 'TotalAmt'),
+    }
+    for col, (parent, child) in grouped_amounts.items():
+        out[col] = child_num(node, parent, child)
+
+    return out
+
+
+def extract_schedule_c_supplemental(node: Optional[ET.Element], filing_id: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if node is None:
+        return rows
+    for detail in find_groups(node, ['SupplementalInformationDetail']):
+        row = {
+            'filing_id': filing_id,
+            'form_and_line_reference_desc': descendants_text_first(detail, ['FormAndLineReferenceDesc']),
+            'explanation_txt': descendants_text_first(detail, ['ExplanationTxt']),
+        }
+        if row['form_and_line_reference_desc'] or row['explanation_txt']:
+            rows.append(row)
+    return rows
 
 
 def generic_group_rows(root: ET.Element, tag_key: str, cols: Sequence[str]) -> List[Dict[str, Any]]:
@@ -1175,7 +1367,8 @@ def extract_file(file_path: str) -> Dict[str, Any]:
     irs990 = generic_singleton_extract(fns['990'], IRS990_COLS)
     irs990ez = generic_singleton_extract(fns['990EZ'], IRS990EZ_COLS)
     irs990pf = generic_singleton_extract(fns['990PF'], IRS990PF_COLS)
-    schc = generic_singleton_extract(fns['SCHC'], SCHEDC_COLS)
+    schc = extract_schedule_c(fns['SCHC'])
+    schc_supplemental = extract_schedule_c_supplemental(fns['SCHC'], filing_id)
 
     for d in (irs990, irs990ez, irs990pf, schc):
         for k, v in list(d.items()):
@@ -1378,6 +1571,7 @@ def extract_file(file_path: str) -> Dict[str, Any]:
         'irs990_ez_root': irs990ez,
         'irs990_pf_root': irs990pf,
         'irs990_schedule_c_root': schc,
+        'irs990_schedule_c_supplemental_info': schc_supplemental,
         'irs990_ez_form990_total_assets_grp': ez_ta,
         'irs990_ez_sum_of_total_liabilities_grp': ez_tl,
         'irs990_pf_analysis_of_revenue_and_expenses': pf_ana,
@@ -1422,8 +1616,65 @@ SCHEMA_MIGRATIONS = {
     'irs990_pf_root': [
         ('website_address_txt', 'TEXT'),
         ('legislative_political_acty_ind', 'TEXT'),
+        ('more_than100_spent_ind', 'TEXT'),
+        ('form1120_pol_filed_ind', 'TEXT'),
+        ('influence_legislation_ind', 'TEXT'),
+        ('influence_election_ind', 'TEXT'),
         ('total_grant_or_contri_pd_dur_yr_amt', 'NUMERIC'),
         ('mission_desc_txt', 'TEXT'),
+    ],
+    'irs990_schedule_c_root': [
+        ('political_expenditures_amt', 'NUMERIC'),
+        ('volunteer_hours_cnt', 'NUMERIC'),
+        ('expended527_activities_amt', 'NUMERIC'),
+        ('total_exempt_function_expend_amt', 'NUMERIC'),
+        ('form1120_pol_filed_ind', 'TEXT'),
+        ('total_grassroots_lobbying_amt', 'NUMERIC'),
+        ('total_direct_lobbying_amt', 'NUMERIC'),
+        ('total_lobbying_expend_grp_amt', 'NUMERIC'),
+        ('other_exempt_purpose_expend_amt', 'NUMERIC'),
+        ('total_exempt_purpose_expenditures_amt', 'NUMERIC'),
+        ('lobbying_nontaxable_amt', 'NUMERIC'),
+        ('grassroots_nontaxable_amt', 'NUMERIC'),
+        ('lobbying_grassroots_excess_amt', 'NUMERIC'),
+        ('lobbying_excess_amt', 'NUMERIC'),
+        ('avg_lobbying_nontaxable_minus3_amt', 'NUMERIC'),
+        ('avg_lobbying_nontaxable_minus2_amt', 'NUMERIC'),
+        ('avg_lobbying_nontaxable_minus1_amt', 'NUMERIC'),
+        ('avg_lobbying_nontaxable_current_amt', 'NUMERIC'),
+        ('avg_lobbying_nontaxable_total_amt', 'NUMERIC'),
+        ('lobbying_ceiling_amt', 'NUMERIC'),
+        ('avg_grassroots_nontaxable_minus3_amt', 'NUMERIC'),
+        ('avg_grassroots_nontaxable_minus2_amt', 'NUMERIC'),
+        ('avg_grassroots_nontaxable_minus1_amt', 'NUMERIC'),
+        ('avg_grassroots_nontaxable_current_amt', 'NUMERIC'),
+        ('avg_grassroots_nontaxable_total_amt', 'NUMERIC'),
+        ('grassroots_ceiling_amt', 'NUMERIC'),
+        ('organization_belongs_afflt_grp_ind', 'TEXT'),
+        ('volunteers_ind', 'TEXT'),
+        ('paid_staff_or_management_ind', 'TEXT'),
+        ('media_advertisements_ind', 'TEXT'),
+        ('media_advertisements_amt', 'NUMERIC'),
+        ('mailings_members_ind', 'TEXT'),
+        ('mailings_members_amt', 'NUMERIC'),
+        ('publications_or_broadcast_ind', 'TEXT'),
+        ('publications_or_broadcast_amt', 'NUMERIC'),
+        ('grants_other_organizations_ind', 'TEXT'),
+        ('grants_other_organizations_amt', 'NUMERIC'),
+        ('direct_contact_legislators_ind', 'TEXT'),
+        ('direct_contact_legislators_amt', 'NUMERIC'),
+        ('rallies_demonstrations_ind', 'TEXT'),
+        ('rallies_demonstrations_amt', 'NUMERIC'),
+        ('other_activities_ind', 'TEXT'),
+        ('other_activities_amt', 'NUMERIC'),
+        ('total_lobbying_expenditures_amt', 'NUMERIC'),
+        ('not_described_section501c3_ind', 'TEXT'),
+        ('dues_assessments_amt', 'NUMERIC'),
+        ('non_deductible_lbbyng_pltcl_cy_amt', 'NUMERIC'),
+        ('non_deductible_lbbyng_pltcl_tot_amt', 'NUMERIC'),
+        ('aggregate_reported_dues_ntc_amt', 'NUMERIC'),
+        ('carried_over_amt', 'NUMERIC'),
+        ('substantially_all_dues_nonded_ind', 'TEXT'),
     ],
     'irs990_pf_analysis_of_revenue_and_expenses': [
         ('interest_on_savings_temp_cash_investments_rev_and_expnss_amt', 'NUMERIC'),
@@ -1563,6 +1814,11 @@ def load_data(conn: sqlite3.Connection, xml_dir: Path, workers: int, chunksize: 
         ins_singleton('irs990_ez_root', IRS990EZ_COLS)
         ins_singleton('irs990_pf_root', IRS990PF_COLS)
         ins_singleton('irs990_schedule_c_root', SCHEDC_COLS)
+        conn.execute("DELETE FROM irs990_schedule_c_supplemental_info WHERE filing_id = ?", [h['filing_id']])
+        for r in row['irs990_schedule_c_supplemental_info']:
+            ins("""INSERT INTO irs990_schedule_c_supplemental_info (
+                filing_id,form_and_line_reference_desc,explanation_txt
+            ) VALUES (?,?,?)""", [r.get(k) for k in ['filing_id','form_and_line_reference_desc','explanation_txt']])
         ins_singleton('irs990_ez_form990_total_assets_grp', EZ_TA_COLS)
         ins_singleton('irs990_ez_sum_of_total_liabilities_grp', EZ_TL_COLS)
         ins_singleton('irs990_pf_analysis_of_revenue_and_expenses', PF_ANA_COLS)
