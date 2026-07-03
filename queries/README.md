@@ -53,6 +53,7 @@ Use `export_headers()` when the CSV export should omit helper columns that are u
 | `ngo_grants_in.py` | List grants received by recipient EINs. |
 | `ngo_grants_io.py` | Combined paid/received grant workflow with dedupe and row caps. |
 | `ngo_contractors_out.py` | List contractor/vendor payments reported by filers. |
+| `lobbying_political_activity.py` | Explore expanded Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators. |
 | `ngo_related_orgs_sched_r.py` | Return Schedule R related organization entries by EIN, filer state, and year range. |
 | `people_lookup.py` | Search person names across officers, highly compensated employees, contractors, grant recipients, return headers, books-in-care-of, Schedule J, Schedule L, and 990-PF officer data. |
 

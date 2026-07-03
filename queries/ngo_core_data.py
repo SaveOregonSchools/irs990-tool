@@ -3,7 +3,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "ngo_core_data_lookup",
-    "name": "NGO Core Data Lookup",
+    "name": "Core Data Lookup",
     "description": (
         "Enter one or more EINs (comma/semicolon/space/newline separated), "
         "or check 'Return all Non-Profits' to ignore EINs. "

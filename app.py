@@ -307,7 +307,7 @@ HOME_MENU = [
             (
                 "query",
                 "ngo_core_data_lookup",
-                "NGO Core Data Lookup",
+                "Core Data Lookup",
                 "High-level info and financials by tax year for one or more nonprofits.",
             ),
             (
@@ -319,19 +319,19 @@ HOME_MENU = [
             (
                 "query",
                 "ngo_grants_in",
-                "NGO Grants Received",
+                "Grants Received",
                 "See all grants received by a nonprofit by tax year.",
             ),
             (
                 "query",
                 "ngo_grants_out",
-                "NGO Grants Paid",
+                "Grants Paid",
                 "See all grants paid by a nonprofit by tax year.",
             ),
             (
                 "query",
                 "ngo_grants_io",
-                "NGO Grants Paid/Received",
+                "Grants Paid/Received",
                 "See grants paid and received by a nonprofit by tax year.",
             ),
             (
@@ -366,8 +366,14 @@ HOME_MENU = [
             (
                 "query",
                 "ngo_contractors_out",
-                "NGO Contractors",
+                "Contractors",
                 "Show top contractors paid by a nonprofit by tax year.",
+            ),
+            (
+                "query",
+                "lobbying_political_activity",
+                "Lobbying & Political Activity",
+                "Explore Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators.",
             ),
             (
                 "query",
@@ -386,7 +392,7 @@ QUERY_HTML = LAYOUT_START + """
 
     <select name="qkey" id="qkey"
             onchange="this.form.submit()">
-      {% for key, mod in registry.items() %}
+      {% for key, mod in query_options %}
         <option value="{{ key }}" {% if key == qkey %}selected{% endif %}>{{ mod.META["name"] }}</option>
       {% endfor %}
     </select>
@@ -611,6 +617,13 @@ def _build_home_sections():
     return sections
 
 
+def _query_options():
+    return sorted(
+        REGISTRY.items(),
+        key=lambda item: item[1].META.get("name", item[0]).casefold(),
+    )
+
+
 def _render_home():
     ensure_registry()
     return render_template_string(
@@ -626,6 +639,7 @@ def _render_query(qkey, form=None, headers=None, rows=None, error=None):
         **_template_context(
             title="IRS 990 - Query Console",
             registry=REGISTRY,
+            query_options=_query_options(),
             qkey=qkey,
             form=form,
             headers=headers,

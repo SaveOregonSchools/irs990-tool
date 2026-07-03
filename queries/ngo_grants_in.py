@@ -36,7 +36,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "ngo_grants_in",
-    "name": "NGO Grants Received (all filings with grants)",
+    "name": "Grants Received (all filings with grants)",
     "description": (
         "Enter one or more recipient EINs (comma/semicolon/space/newline separated), "
         "or check 'Return all Non-Profits' to ignore EINs. "
