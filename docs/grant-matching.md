@@ -385,7 +385,13 @@ The default worker behavior includes:
 --retry-backoff-multiplier 1.5
 --think disabled
 --format-mode schema
+--max-explanation-words 35
 ```
+
+The worker writes shared run settings once to `worker_run_manifest.json` in the
+decision output directory. Individual `decisions_*.jsonl` rows keep only
+per-record details such as `processed_at`, retry attempt, and candidate-id retry
+count.
 
 ### Test A Single Packet File
 
@@ -443,7 +449,6 @@ After copying decisions back to Windows, always dry-run import first:
 py grant_ai_assist_v1.py import-adjudication-decision-dir `
   --in-dir imports\ai_decisions_100k `
   --glob "decisions_*.jsonl" `
-  --source-model external:linux_gemma4_12b `
   --dry-run `
   --audit-dir imports\ai_decisions_100k_audit
 ```
@@ -454,9 +459,12 @@ If the audit looks good:
 py grant_ai_assist_v1.py import-adjudication-decision-dir `
   --in-dir imports\ai_decisions_100k `
   --glob "decisions_*.jsonl" `
-  --source-model external:linux_gemma4_12b `
   --audit-dir imports\ai_decisions_100k_audit_real
 ```
+
+When `worker_run_manifest.json` is present beside the decision files, import
+uses it to store the actual worker model and model options. Pass
+`--source-model` only when you intentionally want to override that label.
 
 Then rebuild the applied/final layer:
 

@@ -63,7 +63,11 @@ AI_DECISION_SCHEMA = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Decimal confidence between 0 and 1, not a percent. Use 0.95, not 95 or 100."},
         "confidence_label": {"type": "string", "enum": ["high", "medium", "low", "none"]},
         "reason_codes": {"type": "array", "items": {"type": "string"}},
-        "explanation": {"type": "string"},
+        "explanation": {
+            "type": "string",
+            "description": "Brief audit note: one concise sentence, usually under 35 words.",
+            "maxLength": 280,
+        },
         "needs_human_review": {"type": "boolean"},
     },
     "required": ["decision", "candidate_id", "confidence", "confidence_label", "reason_codes", "explanation", "needs_human_review"],
@@ -292,8 +296,18 @@ def get_system_prompt(args: argparse.Namespace) -> str:
         return ""
     path = clean_text(getattr(args, "system_prompt_file", ""))
     if path:
-        return Path(path).read_text(encoding="utf-8").strip()
-    return default_system_prompt()
+        system_msg = Path(path).read_text(encoding="utf-8").strip()
+    else:
+        system_msg = default_system_prompt()
+    max_words = int(getattr(args, "max_explanation_words", 35) or 0)
+    if max_words > 0:
+        system_msg = (
+            system_msg
+            + "\n\nEXPLANATION STYLE:\n"
+            + f"- Keep explanation to one concise sentence, at most {max_words} words.\n"
+            + "- Put compact evidence labels in reason_codes instead of repeating full reasoning in explanation."
+        )
+    return system_msg
 
 
 def candidate_id_list_text(packet: Dict[str, Any]) -> str:
@@ -394,6 +408,63 @@ If none is strong enough or you are unsure, return HUMAN_REVIEW or AMBIGUOUS wit
     return output, retries_used
 
 
+def run_manifest_path(args: argparse.Namespace) -> Path:
+    name = clean_text(getattr(args, "run_manifest", "")) or "worker_run_manifest.json"
+    return Path(args.output_dir) / name
+
+
+def run_settings(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "model": args.model,
+        "format_mode": args.format_mode,
+        "think": bool(args.think),
+        "num_ctx": args.num_ctx,
+        "num_predict": args.num_predict,
+        "temperature": args.temperature,
+        "top_p": 0.9,
+        "keep_alive": args.keep_alive,
+        "timeout": args.timeout,
+        "error_retries": int(args.error_retries or 0),
+        "retry_backoff_seconds": args.retry_backoff_seconds,
+        "retry_backoff_multiplier": args.retry_backoff_multiplier,
+        "candidate_id_retries": int(args.candidate_id_retries or 0),
+        "max_explanation_words": int(getattr(args, "max_explanation_words", 0) or 0),
+        "system_prompt_file": clean_text(getattr(args, "system_prompt_file", "")),
+        "omit_system_message": bool(getattr(args, "omit_system_message", False)),
+        "write_failures_as_human_review": bool(args.write_failures_as_human_review),
+    }
+
+
+def write_run_manifest(args: argparse.Namespace, files: Sequence[Path]) -> Path:
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = run_manifest_path(args)
+    manifest = {
+        "format": "grant_ai_worker_run_manifest_v1",
+        "created_at": now_stamp(),
+        "worker": "grant_ai_batch_worker.py",
+        "input_dir": clean_text(args.input_dir),
+        "input_file": clean_text(args.input_file),
+        "input_pattern": clean_text(args.pattern),
+        "decision_prefix": clean_text(args.decision_prefix),
+        "parallel_workers": int(args.parallel_workers or 1),
+        "settings": run_settings(args),
+        "input_files": [p.name for p in files],
+    }
+    if path.exists() and not args.overwrite:
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception as e:
+            raise RuntimeError(f"Existing run manifest is not readable JSON: {path}: {e}") from e
+        if isinstance(existing, dict) and existing.get("settings") != manifest["settings"]:
+            raise RuntimeError(
+                f"Existing run manifest has different settings: {path}. "
+                "Use a fresh output directory or --overwrite to avoid mixed-run provenance."
+            )
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def process_one(packet: Dict[str, Any], args: argparse.Namespace) -> Tuple[str, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     sig = packet_signature(packet)
     attempt_errors: List[str] = []
@@ -406,12 +477,7 @@ def process_one(packet: Dict[str, Any], args: argparse.Namespace) -> Tuple[str, 
                 "output": output,
                 "worker": {
                     "processed_at": now_stamp(),
-                    "model": args.model,
-                    "format_mode": args.format_mode,
-                    "think": bool(args.think),
-                    "num_predict": args.num_predict,
                     "attempt": attempt,
-                    "error_retries_configured": int(args.error_retries or 0),
                     "candidate_id_retries_used": cid_retries,
                 },
             }
@@ -429,7 +495,6 @@ def process_one(packet: Dict[str, Any], args: argparse.Namespace) -> Tuple[str, 
                 "attempt_errors": attempt_errors,
                 "attempts": attempt,
                 "failed_at": now_stamp(),
-                "model": args.model,
             }
             if args.write_failures_as_human_review:
                 rec = {
@@ -445,7 +510,6 @@ def process_one(packet: Dict[str, Any], args: argparse.Namespace) -> Tuple[str, 
                     },
                     "worker": {
                         "processed_at": now_stamp(),
-                        "model": args.model,
                         "failure_recorded_as_human_review": True,
                         "attempts": attempt,
                         "attempt_errors": attempt_errors,
@@ -517,7 +581,7 @@ def process_file(input_path: Path, args: argparse.Namespace) -> Tuple[int, int, 
                     except Exception as e:
                         sig = future_map.get(fut, "")
                         rec = None
-                        err = {"signature_hash": sig, "error": f"worker_future_error:{type(e).__name__}: {e}", "failed_at": now_stamp(), "model": args.model}
+                        err = {"signature_hash": sig, "error": f"worker_future_error:{type(e).__name__}: {e}", "failed_at": now_stamp()}
                     if rec is not None:
                         out_fh.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
                         ok_count += 1
@@ -557,6 +621,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--candidate-id-retries", type=int, default=1, help="Retry once when model tries SELECT_CANDIDATE but omits/garbles candidate_id. Default: 1")
     p.add_argument("--system-prompt-file", default="", help="Optional file containing system prompt. If omitted, built-in grant adjudicator prompt is used.")
     p.add_argument("--omit-system-message", action="store_true", help="Do not send a system role message. Use only with a custom Ollama model/Modelfile that already embeds the system prompt.")
+    p.add_argument("--max-explanation-words", type=int, default=35, help="Ask the model to keep explanation to this many words. Use 0 to disable the brevity instruction. Default: 35")
+    p.add_argument("--run-manifest", default="worker_run_manifest.json", help="Run-level settings manifest written once to --output-dir. Default: worker_run_manifest.json")
     p.add_argument("--think", action="store_true", help="Enable Ollama thinking. Default is off and recommended for this workflow.")
     p.add_argument("--parallel-workers", type=int, default=1)
     p.add_argument("--limit", type=int, default=None, help="Limit records per input file; mostly for testing")
@@ -578,6 +644,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not files:
         print("No packet files found.", file=sys.stderr)
         return 2
+    manifest_path = write_run_manifest(args, files)
+    print(f"Run manifest written to {manifest_path}", flush=True)
     all_processed = all_ok = all_err = 0
     started = time.time()
     for path in files:
