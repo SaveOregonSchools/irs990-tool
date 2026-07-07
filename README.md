@@ -11,6 +11,22 @@ The database itself is intentionally not stored in GitHub. Build it locally from
 
 ---
 
+## License
+
+IRS 990 Tool's software code is copyright (C) 2026 Save Oregon Schools, LLC and
+is licensed under the GNU Affero General Public License version 3. See
+[`LICENSE`](LICENSE) for the full license text.
+
+IRS 990 Tool is distributed without any warranty; without even the implied
+warranty of merchantability or fitness for a particular purpose.
+
+The Save Oregon Schools name, logo, and related branding are not licensed for
+reuse under the GNU Affero General Public License. See
+[`TRADEMARKS.md`](TRADEMARKS.md) for the project's trademark and branding
+notice.
+
+---
+
 ## What this tool is for
 
 This project is designed for nonprofit and public-records research where you need to answer questions such as:
