@@ -370,6 +370,12 @@ HOME_MENU = [
             ),
             (
                 "query",
+                "fraud_risk_dashboard",
+                "Fraud & Risk Indicators",
+                "Single-EIN dashboard of financial, governance, lobbying, grant, contractor, and related-org indicators.",
+            ),
+            (
+                "query",
                 "filings_by_eins",
                 "Filings by EIN(s)",
                 "Basic list of available tax filings by EIN.",
