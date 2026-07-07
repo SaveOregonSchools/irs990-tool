@@ -5,9 +5,25 @@ A local research tool for building, querying, and exporting data from IRS Form 9
 The project has two main parts:
 
 1. **Database build/update tools** that turn IRS 990 XML filings into a slim local SQLite database.
-2. **A Flask query console** that runs prebuilt research queries, exports CSVs, and can optionally use a local Ollama model to generate validated SQL from plain-English questions.
+2. **A Flask research console** with a simple home page, prebuilt query modules, CSV exports, cached database statistics, and optional local Ollama support for validated SQL from plain-English questions.
 
 The database itself is intentionally not stored in GitHub. Build it locally from XML files, or point the app at an existing `irs990.db` file.
+
+---
+
+## License
+
+IRS 990 Tool's software code is copyright (C) 2026 Save Oregon Schools, LLC and
+is licensed under the GNU Affero General Public License version 3. See
+[`LICENSE`](LICENSE) for the full license text.
+
+IRS 990 Tool is distributed without any warranty; without even the implied
+warranty of merchantability or fitness for a particular purpose.
+
+The Save Oregon Schools name, logo, and related branding are not licensed for
+reuse under the GNU Affero General Public License. See
+[`TRADEMARKS.md`](TRADEMARKS.md) for the project's trademark and branding
+notice.
 
 ---
 
@@ -32,9 +48,11 @@ The database is a **research-oriented slim schema**, not a complete one-table-pe
 
 | Path | Purpose |
 |---|---|
-| `app.py` | Flask web app and query-console shell. Auto-loads query modules from `queries/`. |
+| `app.py` | Flask web app, home page, query-console shell, and cached statistics page. Auto-discovers and reloads query modules from `queries/`. |
 | `common.py` | Shared database path handling, read-only SQLite connection, and EIN normalization helpers. |
 | `queries/` | Prebuilt query modules used by the web console. See [`queries/README.md`](queries/README.md). |
+| `refresh_data_stats.py` | Refreshes cached database and grant-matching statistics shown by the web app's Database Statistics page. |
+| `static/` | Small web assets used by the Flask app, including the Save Oregon Schools logo. |
 | `ai/irs990_ai_schema.md` | Compact schema/prompt guide used by the Ask Database module. See [`ai/README.md`](ai/README.md). |
 | `config/ollama_complexity.example.json` | Optional example config for Ask Database complexity presets. See [`config/README.md`](config/README.md). |
 | `db/` | Local database folder. `db/irs990.db` is ignored by Git. See [`db/README.md`](db/README.md). |
@@ -80,7 +98,7 @@ db/irs990.db
 Or set a custom path:
 
 ```powershell
-$env:IRS_DB_PATH = "C:\IRSDB\db\irs990.db"
+$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
 ```
 
 Then start the web app:
@@ -95,7 +113,7 @@ Open the local Flask URL shown in the console, usually:
 http://127.0.0.1:5000
 ```
 
-Use **Refresh Queries** in the web UI after adding or editing files in `queries/`.
+The root URL opens a home page with grouped buttons for the most common modules and supporting tools. Query modules auto-load when selected from the dropdown, and the app auto-detects added or edited files in `queries/` on the next request.
 
 ---
 
@@ -127,7 +145,9 @@ See [`docs/database-build.md`](docs/database-build.md) for the full rebuild/appe
 
 ## Query console
 
-The web app discovers modules in `queries/`. Each module provides its own form fields, SQL logic, result headers, and CSV export behavior.
+The web app opens to a home page with grouped module buttons. Query pages also include a dropdown for switching modules. The selected module loads automatically when the dropdown changes.
+
+The app discovers modules in `queries/`. Each module provides its own form fields, SQL logic, result headers, and CSV export behavior. Module files are reloaded automatically when their `.py` file modification times change, so a running development server usually picks up added or edited query modules on the next page request.
 
 Current query families include:
 
@@ -145,6 +165,31 @@ Current query families include:
 | `people_lookup.py` | Finds where a person appears across supported tables/views. |
 
 See [`queries/README.md`](queries/README.md) for the plugin interface and development notes.
+
+---
+
+## Database Statistics page
+
+The home page includes **Database Statistics**, which reads cached rows from:
+
+```text
+app_data_stats
+app_data_stats_meta
+```
+
+Refresh the cache manually with:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+The standard enhanced grant matching batch also refreshes the stats cache after rebuilding grant matching data:
+
+```powershell
+.\batch_enhanced_grant_matches.bat
+```
+
+The stats page intentionally reads cached rows so opening it does not run expensive full-database summaries.
 
 ---
 
@@ -179,6 +224,7 @@ The raw IRS grant rows often include recipient names and addresses, but not alwa
 1. `resolve_grant_recipients.py` creates a deterministic first-pass resolution table.
 2. `grant_ai_assist_v1.py` builds identity tables, recipient signatures, candidate matches, rule-based decisions, optional Ollama adjudications, and final applied views.
 3. The final enhanced layer can be used by grant-received workflows when you want matched recipient EINs beyond the raw reported EIN field.
+4. `refresh_data_stats.py` can summarize the resulting database and matching pipeline for the web app's Database Statistics page.
 
 This workflow can write additional tables/views to the database, so back up the database before running it.
 
@@ -205,6 +251,8 @@ Do **not** commit:
 - exports, cache files, logs, or local adjudication packets
 - `.env`
 
+The tracked `static/save-oregon-schools-logo.png` file is a small app asset and is safe to commit.
+
 The `.gitignore` is set up for the normal local database and output folders, but always check `git status` before committing.
 
 ---
@@ -214,10 +262,11 @@ The `.gitignore` is set up for the normal local database and output folders, but
 ### Run a known query
 
 1. Start `py app.py`.
-2. Select a query from the dropdown.
-3. Enter EINs, organization names, state/year filters, or other module-specific inputs.
-4. Click **Run Query** for a preview.
-5. Click **Export CSV** for the full module export.
+2. Open `http://127.0.0.1:5000`.
+3. Choose a module from the home page or select one from the query-page dropdown.
+4. Enter EINs, organization names, state/year filters, or other module-specific inputs.
+5. Click **Run Query** for a preview.
+6. Click **Export CSV** for the full module export.
 
 ### Add a new query module
 
@@ -225,7 +274,7 @@ The `.gitignore` is set up for the normal local database and output folders, but
 2. Define `META`, `render_fields(form)`, `run(form)`, and `export_rows(form)`.
 3. Use `common.connect_ro()` for read-only database access.
 4. Use parameterized SQL rather than string-inserting user input.
-5. Start the app or click **Refresh Queries**.
+5. Start the app if it is not already running. If it is running, refresh the page; query files are auto-detected on the next request.
 
 ### Add new IRS XML filings
 
@@ -251,7 +300,17 @@ Or set `IRS_DB_PATH` to the full database path.
 
 ### Query module does not show up
 
-Check that the module is in `queries/`, does not start with `_`, and defines all required plugin functions. Then click **Refresh Queries**.
+Check that the module is in `queries/`, does not start with `_`, and defines all required plugin functions. Refresh the page to trigger plugin auto-detection. If an import error occurs, it will be printed in the Flask console.
+
+### Database Statistics page is empty
+
+Run the stats refresh script:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+The enhanced grant matching batch also refreshes these cached stats as part of its normal workflow.
 
 ### Ask Database cannot reach Ollama
 

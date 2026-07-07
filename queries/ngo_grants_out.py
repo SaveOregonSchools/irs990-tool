@@ -22,7 +22,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "ngo_grants_out",
-    "name": "NGO Grants Paid (all filings with grants)",
+    "name": "Grants Paid (all filings with grants)",
     "description": (
         "Enter one or more EINs (comma/semicolon/space/newline separated), "
         "or check 'Return all Non-Profits' to ignore EINs. "

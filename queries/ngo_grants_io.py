@@ -16,7 +16,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "ngo_grants_io",
-    "name": "NGO Grants Paid/Received (combined, with dedupe)",
+    "name": "Grants Paid/Received (combined, with dedupe)",
     "description": (
         "Enter EINs (comma/semicolon/space/newline), choose Paid / Received / Both, "
         "or check 'Return all Non-Profits' to ignore EINs. Filters: filer state (Paid), "

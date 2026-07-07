@@ -15,7 +15,7 @@ from common import connect_ro, normalize_eins
 
 META = {
     "key": "ngo_contractors_out",
-    "name": "NGO Contractors (all filings with contractors)",
+    "name": "Contractors (all filings with contractors)",
     "description": (
         "Enter one or more EINs (comma/semicolon/space/newline separated), "
         "or check 'Return all Non-Profits' to ignore EINs. "

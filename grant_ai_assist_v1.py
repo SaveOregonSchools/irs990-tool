@@ -1912,7 +1912,11 @@ AI_DECISION_SCHEMA = {
         "confidence": {"type": "number", "minimum": 0, "maximum": 1, "description": "Decimal confidence between 0 and 1, not a percent. Use 0.95, not 95 or 100."},
         "confidence_label": {"type": "string", "enum": ["high", "medium", "low", "none"]},
         "reason_codes": {"type": "array", "items": {"type": "string"}},
-        "explanation": {"type": "string"},
+        "explanation": {
+            "type": "string",
+            "description": "Brief audit note: one concise sentence, usually under 35 words.",
+            "maxLength": 280,
+        },
         "needs_human_review": {"type": "boolean"},
     },
     "required": ["decision", "confidence", "confidence_label", "reason_codes", "explanation", "needs_human_review"],
@@ -2987,6 +2991,18 @@ def decision_row_tuple(sig_hash: str, input_obj: Dict[str, Any], candidates: Seq
     input_json = json.dumps(input_obj, ensure_ascii=False, sort_keys=True)
     output_json = json.dumps(output, ensure_ascii=False, sort_keys=True)
     candidate_set_json = json.dumps([{"id": c["candidate_id"], "ein": c["ein"], "score": c["candidate_score"]} for c in candidates], sort_keys=True)
+    model_options = {
+        "num_ctx": getattr(args, "num_ctx", 0),
+        "num_predict": getattr(args, "num_predict", 0),
+        "temperature": getattr(args, "temperature", 0),
+        "think": bool(getattr(args, "think", False)),
+    }
+    format_mode = clean_text(getattr(args, "format_mode", ""))
+    if format_mode:
+        model_options["format_mode"] = format_mode
+    top_p = getattr(args, "top_p", None)
+    if top_p is not None:
+        model_options["top_p"] = top_p
     return (
         sig_hash,
         clean_text(output.get("decision")),
@@ -3002,7 +3018,7 @@ def decision_row_tuple(sig_hash: str, input_obj: Dict[str, Any], candidates: Seq
         validation["validation_status"],
         validation["validation_error"],
         args.model,
-        json.dumps({"num_ctx": args.num_ctx, "num_predict": args.num_predict, "temperature": 0, "think": bool(args.think)}, sort_keys=True),
+        json.dumps(model_options, sort_keys=True),
         stable_hash([input_json], "PROMPT_"),
         stable_hash([candidate_set_json], "CANDS_"),
         input_json,
@@ -3305,6 +3321,44 @@ def iter_external_decision_records(path: Path) -> Iterator[Dict[str, Any]]:
             reader = csv.DictReader(fh)
             for row in reader:
                 yield dict(row)
+
+
+EXTERNAL_DECISION_MANIFEST_NAMES = ("worker_run_manifest.json", "decision_run_manifest.json")
+DEFAULT_EXTERNAL_SOURCE_MODELS = {"", "external:chatgpt", "external:linux-ollama"}
+
+
+def load_external_decision_manifest(path: Path) -> Dict[str, Any]:
+    """Load run-level worker settings beside an external decision file, if present."""
+    base_dir = path if path.is_dir() else path.parent
+    for name in EXTERNAL_DECISION_MANIFEST_NAMES:
+        manifest_path = base_dir / name
+        if not manifest_path.exists():
+            continue
+        data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Decision manifest is not a JSON object: {manifest_path}")
+        data["_manifest_path"] = str(manifest_path)
+        return data
+    return {}
+
+
+def external_import_row_args(args: argparse.Namespace, manifest: Dict[str, Any]) -> argparse.Namespace:
+    settings = manifest.get("settings") if isinstance(manifest.get("settings"), dict) else {}
+    source_model = clean_text(getattr(args, "source_model", ""))
+    manifest_model = clean_text(settings.get("model"))
+    if source_model in DEFAULT_EXTERNAL_SOURCE_MODELS and manifest_model:
+        source_model = manifest_model
+    elif not source_model:
+        source_model = "external"
+    return argparse.Namespace(
+        model=source_model,
+        num_ctx=int(settings.get("num_ctx") or 0),
+        num_predict=int(settings.get("num_predict") or 0),
+        temperature=float(settings.get("temperature") or 0),
+        top_p=settings.get("top_p"),
+        think=_bool_from_any(settings.get("think"), default=False),
+        format_mode=clean_text(settings.get("format_mode")),
+    )
 
 
 def export_packet_for_signature(sig: sqlite3.Row, candidates: Sequence[sqlite3.Row], include_schema: bool = False) -> Dict[str, Any]:
@@ -3659,6 +3713,9 @@ def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
     in_path = Path(args.in_file)
     if not in_path.exists():
         raise FileNotFoundError(in_path)
+    manifest = load_external_decision_manifest(in_path)
+    if manifest:
+        print(f"Loaded decision run manifest: {manifest.get('_manifest_path')}", flush=True)
     audit_fh = None
     audit_writer = None
     if args.audit_csv:
@@ -3669,15 +3726,10 @@ def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
         audit_writer.writerow([
             "signature_hash", "decision", "candidate_id", "selected_ein", "selected_name", "confidence",
             "auto_accept", "validation_status", "validation_error", "needs_human_review", "explanation",
+            "source_model", "model_options_json",
         ])
 
-    # Dummy args object for decision_row_tuple.
-    row_args = argparse.Namespace(
-        model=args.source_model,
-        num_ctx=0,
-        num_predict=0,
-        think=False,
-    )
+    row_args = external_import_row_args(args, manifest)
     processed = inserted = skipped_existing = invalid_missing = 0
     started = time.time()
     try:
@@ -3687,13 +3739,13 @@ def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
             if not sig_hash:
                 invalid_missing += 1
                 if audit_writer:
-                    audit_writer.writerow(["", output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "missing_signature_hash", output.get("needs_human_review"), output.get("explanation")])
+                    audit_writer.writerow(["", output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "missing_signature_hash", output.get("needs_human_review"), output.get("explanation"), row_args.model, ""])
                 continue
             sig = conn.execute(f"SELECT * FROM {SIG_TABLE} WHERE signature_hash=?", (sig_hash,)).fetchone()
             if sig is None:
                 invalid_missing += 1
                 if audit_writer:
-                    audit_writer.writerow([sig_hash, output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "signature_not_found", output.get("needs_human_review"), output.get("explanation")])
+                    audit_writer.writerow([sig_hash, output.get("decision"), output.get("candidate_id"), "", "", output.get("confidence"), 0, "invalid", "signature_not_found", output.get("needs_human_review"), output.get("explanation"), row_args.model, ""])
                 continue
             if not args.regenerate and conn.execute(f"SELECT 1 FROM {DECISION_TABLE} WHERE signature_hash=? LIMIT 1", (sig_hash,)).fetchone():
                 skipped_existing += 1
@@ -3704,7 +3756,7 @@ def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
             row = decision_row_tuple(sig_hash, input_obj, cands, output, validation, row_args)
             if audit_writer:
                 audit_writer.writerow([
-                    row[0], row[1], row[2], row[3], row[4], row[5], row[10], row[11], row[12], row[9], row[8]
+                    row[0], row[1], row[2], row[3], row[4], row[5], row[10], row[11], row[12], row[9], row[8], row[13], row[14]
                 ])
             if not args.dry_run:
                 insert_decision(conn, row)

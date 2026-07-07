@@ -23,13 +23,13 @@ To use a database somewhere else, set `IRS_DB_PATH`.
 PowerShell:
 
 ```powershell
-$env:IRS_DB_PATH = "C:\IRSDB\db\irs990.db"
+$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
 ```
 
 Windows CMD:
 
 ```bat
-set IRS_DB_PATH=C:\IRSDB\db\irs990.db
+set IRS_DB_PATH=C:\Projects\irs990-tool\db\irs990.db
 ```
 
 ---
@@ -67,6 +67,27 @@ py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --ap
 ```
 
 See [`../docs/database-build.md`](../docs/database-build.md) for details.
+
+---
+
+## Web app statistics cache
+
+The Flask app's **Database Statistics** page reads cached summary rows from the local SQLite database instead of running expensive summaries each time the page opens.
+
+Refresh those cached rows with:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+This creates or updates:
+
+```text
+app_data_stats
+app_data_stats_meta
+```
+
+The enhanced grant matching batch also refreshes these cached stats automatically.
 
 ---
 

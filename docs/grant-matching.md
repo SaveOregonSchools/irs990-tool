@@ -13,6 +13,7 @@ Back up the database before running real write steps.
 | `resolve_grant_recipients.py` | Deterministic first-pass grant-recipient matching. |
 | `grant_ai_assist_v1.py` | Identity building, recipient signatures, candidate generation, rule decisions, optional Ollama adjudication, imports, and applied views. |
 | `grant_ai_batch_worker.py` | Linux/Ollama worker for externally adjudicating exported packet batches. |
+| `refresh_data_stats.py` | Refreshes cached web-app database statistics after grant matching changes. |
 | `batch_enhanced_grant_matches.bat` | Windows launcher for the full enhanced matching rebuild workflow. |
 | `batch_enhanced_grant_matches.ps1` | PowerShell implementation used by the launcher. |
 
@@ -73,6 +74,13 @@ grant_recipient_ai_applied
 grant_recipient_resolved_plus_ai_v1
 ```
 
+The web-app statistics refresh creates or replaces cached rows in:
+
+```text
+app_data_stats
+app_data_stats_meta
+```
+
 The final enhanced matching view is:
 
 ```text
@@ -116,14 +124,15 @@ The PowerShell workflow:
 10. Applies deterministic candidate-rule decisions.
 11. Rebuilds the applied/final enhanced matching layer.
 12. Writes `exports\grant_match_stats_after_enhanced_grants.csv`.
-13. Prints the remaining AI/human adjudication queue count.
-14. Runs a SQLite WAL checkpoint unless `-SkipCheckpoint` is passed.
+13. Refreshes the web app's cached Database Statistics page data.
+14. Prints the remaining AI/human adjudication queue count.
+15. Runs a SQLite WAL checkpoint unless `-SkipCheckpoint` is passed.
 
 Common PowerShell options:
 
 ```powershell
 .\batch_enhanced_grant_matches.ps1 `
-  -DbPath C:\IRSDB\db\irs990.db `
+  -DbPath C:\Projects\irs990-tool\db\irs990.db `
   -ProjectDir C:\Projects\irs990-tool `
   -Yes
 ```
@@ -376,7 +385,13 @@ The default worker behavior includes:
 --retry-backoff-multiplier 1.5
 --think disabled
 --format-mode schema
+--max-explanation-words 35
 ```
+
+The worker writes shared run settings once to `worker_run_manifest.json` in the
+decision output directory. Individual `decisions_*.jsonl` rows keep only
+per-record details such as `processed_at`, retry attempt, and candidate-id retry
+count.
 
 ### Test A Single Packet File
 
@@ -434,7 +449,6 @@ After copying decisions back to Windows, always dry-run import first:
 py grant_ai_assist_v1.py import-adjudication-decision-dir `
   --in-dir imports\ai_decisions_100k `
   --glob "decisions_*.jsonl" `
-  --source-model external:linux_gemma4_12b `
   --dry-run `
   --audit-dir imports\ai_decisions_100k_audit
 ```
@@ -445,9 +459,12 @@ If the audit looks good:
 py grant_ai_assist_v1.py import-adjudication-decision-dir `
   --in-dir imports\ai_decisions_100k `
   --glob "decisions_*.jsonl" `
-  --source-model external:linux_gemma4_12b `
   --audit-dir imports\ai_decisions_100k_audit_real
 ```
+
+When `worker_run_manifest.json` is present beside the decision files, import
+uses it to store the actual worker model and model options. Pass
+`--source-model` only when you intentionally want to override that label.
 
 Then rebuild the applied/final layer:
 
@@ -477,6 +494,14 @@ Stats command:
 ```powershell
 py grant_ai_assist_v1.py stats --csv-out exports\grant_match_stats.csv
 ```
+
+Refresh the web app's cached Database Statistics page:
+
+```powershell
+py refresh_data_stats.py --db db\irs990.db
+```
+
+The standard `batch_enhanced_grant_matches.ps1` workflow runs this refresh automatically after writing the grant-match stats CSV.
 
 Exact count of signatures still needing decisions:
 

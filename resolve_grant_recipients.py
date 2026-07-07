@@ -35,16 +35,16 @@ SQLite does not have to maintain several large indexes during every insert.
 Examples
 --------
 Dry run to CSV:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --dry-run --csv-out grant_matches.csv
+  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --dry-run --csv-out grant_matches.csv
 
 Write/update database table, processing only rows not already resolved:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db
+  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db
 
 Rebuild the resolved table from scratch:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --full-refresh
+  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --full-refresh
 
 Enable fuzzy fallback conservatively:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\IRSDB\db\irs990.db --enable-fuzzy --fuzzy-threshold 0.92
+  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --enable-fuzzy --fuzzy-threshold 0.92
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-DEFAULT_DB = r"C:\IRSDB\db\irs990.db"
+DEFAULT_DB = str(Path(__file__).resolve().parent / "db" / "irs990.db")
 RESOLVED_TABLE = "grant_recipient_resolved"
 
 # Only remove true legal suffix / punctuation noise. Do NOT remove words like

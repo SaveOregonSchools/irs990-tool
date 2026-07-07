@@ -1,8 +1,8 @@
 # Query modules
 
-The `queries/` folder contains the prebuilt query modules shown in the Flask query console.
+The `queries/` folder contains the prebuilt query modules shown in the Flask research console.
 
-`app.py` auto-discovers Python files in this folder, imports them, and registers modules that expose the required plugin interface.
+`app.py` auto-discovers Python files in this folder, imports them, and registers modules that expose the required plugin interface. While the app is running, it checks query file modification times on each request and reloads the registry when a query module is added or edited.
 
 ---
 
@@ -47,12 +47,15 @@ Use `export_headers()` when the CSV export should omit helper columns that are u
 |---|---|
 | `ask_database.py` | Ask a plain-English database question, generate validated SQL, run a preview, or validate/run existing SQL. |
 | `filings_by_ein.py` | List canonical filings for one or more EINs. |
+| `fraud_risk_dashboard.py` | Single-EIN dashboard of explainable financial, governance, lobbying, grant, contractor, and related-organization indicators. |
+| `nonprofit_deep_dive.py` | Single-EIN profile with financial charts, yearly filing summaries, top grantors, and compensation. |
 | `ngo_core_data.py` | Return core organization, filing, financial, address, mission, tax-status, and indicator fields. |
 | `ngo_ein_by_name.py` | Find EINs from pasted organization names using deterministic normalized matching and optional fuzzy fallback. |
 | `ngo_grants_out.py` | List grants paid by filer/grantor organizations. |
 | `ngo_grants_in.py` | List grants received by recipient EINs. |
 | `ngo_grants_io.py` | Combined paid/received grant workflow with dedupe and row caps. |
 | `ngo_contractors_out.py` | List contractor/vendor payments reported by filers. |
+| `lobbying_political_activity.py` | Explore expanded Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators. |
 | `ngo_related_orgs_sched_r.py` | Return Schedule R related organization entries by EIN, filer state, and year range. |
 | `people_lookup.py` | Search person names across officers, highly compensated employees, contractors, grant recipients, return headers, books-in-care-of, Schedule J, Schedule L, and 990-PF officer data. |
 
@@ -101,6 +104,8 @@ For EIN lists, chunk large `IN (...)` lists. Most existing modules use chunks of
 
 `META["name"]` and `META["description"]` are displayed in the UI. Keep them readable for researchers, not just developers.
 
+The home page uses a curated menu in `app.py` for button grouping, order, shortened labels, and concise descriptions. Add new query modules to that menu when they should appear in a specific home-page section; otherwise they are still auto-discovered and appear under Other Modules.
+
 ---
 
 ## Adding a new module
@@ -111,7 +116,7 @@ For EIN lists, chunk large `IN (...)` lists. Most existing modules use chunks of
 4. Parse and validate form fields defensively.
 5. Use `connect_ro()` and parameterized SQL.
 6. Return rows in the same order as `HEADERS`.
-7. Start the app or click **Refresh Queries**.
+7. Start the app if needed. If it is already running, refresh the browser page; the query registry reloads automatically when files in `queries/` change.
 
 Minimal skeleton:
 

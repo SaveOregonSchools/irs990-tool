@@ -23,7 +23,7 @@ The production database is large and should not be committed to GitHub.
 ## Local database assumptions
 
 The app reads the SQLite database path from `IRS_DB_PATH`.
-If unset, `common.py` defaults to `C:\IRSDB\db\irs990.db`.
+If unset, `common.py` defaults to `C:\Projects\irs990-tool\db\irs990.db`.
 
 Codex should not assume the full database is available in its cloud environment. For tests, create tiny fixture databases or use in-memory SQLite.
 
