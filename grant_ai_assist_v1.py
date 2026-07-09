@@ -192,15 +192,28 @@ US_STATES = {
     "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
 }
 
-ORG_IDENTITY_TABLE = "org_identity"
-ORG_TOKEN_TABLE = "org_identity_token"
-SIG_TABLE = "grant_recipient_signature"
-SIG_GRANT_TABLE = "grant_recipient_signature_grant"
-CAND_TABLE = "grant_recipient_ai_candidate"
+ORG_IDENTITY_BASE = "org_identity"
+ORG_TOKEN_BASE = "org_identity_token"
+ORG_IDENTITY_FTS_BASE = "org_identity_fts"
+SIG_BASE = "grant_recipient_signature"
+SIG_GRANT_BASE = "grant_recipient_signature_grant"
+CAND_BASE = "grant_recipient_ai_candidate"
+
+ORG_IDENTITY_TABLE = ORG_IDENTITY_BASE
+ORG_TOKEN_TABLE = ORG_TOKEN_BASE
+ORG_IDENTITY_FTS_TABLE = ORG_IDENTITY_FTS_BASE
+SIG_TABLE = SIG_BASE
+SIG_GRANT_TABLE = SIG_GRANT_BASE
+CAND_TABLE = CAND_BASE
 DECISION_TABLE = "grant_recipient_ai_decision"
 APPLIED_TABLE = "grant_recipient_ai_applied"
 FINAL_VIEW = "grant_recipient_resolved_plus_ai_v1"
 RESOLVED_TABLE = "grant_recipient_resolved"
+
+GRANT_WORK_SCHEMA = "grant_work"
+DEFAULT_GRANT_WORK_DB_NAME = "grant_matching_work.db"
+GRANT_WORK_DB_PATH: Optional[str] = None
+GRANT_WORK_SIDECAR_ENABLED = False
 
 
 class OllamaCallError(RuntimeError):
@@ -264,7 +277,68 @@ def connect(db_path: str, readonly: bool = False, exclusive: bool = False) -> sq
                 conn.execute("PRAGMA locking_mode=EXCLUSIVE;")
     except Exception:
         pass
+    if GRANT_WORK_SIDECAR_ENABLED:
+        attach_grant_work_db(conn, db_path=db_path, readonly=readonly)
     return conn
+
+
+def _qualified(schema: str, name: str) -> str:
+    return f"{schema}.{name}"
+
+
+def _split_qualified_name(name: str) -> Tuple[Optional[str], str]:
+    parts = str(name).split(".", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return None, parts[0]
+
+
+def _base_name(name: str) -> str:
+    return _split_qualified_name(name)[1]
+
+
+def _sqlite_master_name(schema: Optional[str]) -> str:
+    return f"{schema}.sqlite_master" if schema else "sqlite_master"
+
+
+def _index_sql(index_name: str, table_name: str, columns_sql: str) -> str:
+    schema, table = _split_qualified_name(table_name)
+    if schema:
+        return f"CREATE INDEX IF NOT EXISTS {schema}.{index_name} ON {table}({columns_sql});"
+    return f"CREATE INDEX IF NOT EXISTS {index_name} ON {table}({columns_sql});"
+
+
+def default_grant_work_db_path(db_path: str) -> str:
+    env_path = os.getenv("IRS_GRANT_WORK_DB_PATH")
+    if env_path:
+        return env_path
+    return str(Path(db_path).resolve().parent / DEFAULT_GRANT_WORK_DB_NAME)
+
+
+def configure_grant_work_sidecar(db_path: str, work_db_path: Optional[str] = None) -> None:
+    """Route enhanced matching working tables through the sidecar database."""
+    global GRANT_WORK_DB_PATH, GRANT_WORK_SIDECAR_ENABLED
+    global ORG_IDENTITY_TABLE, ORG_TOKEN_TABLE, ORG_IDENTITY_FTS_TABLE
+    global SIG_TABLE, SIG_GRANT_TABLE, CAND_TABLE
+
+    GRANT_WORK_DB_PATH = work_db_path or default_grant_work_db_path(db_path)
+    GRANT_WORK_SIDECAR_ENABLED = True
+    ORG_IDENTITY_TABLE = _qualified(GRANT_WORK_SCHEMA, ORG_IDENTITY_BASE)
+    ORG_TOKEN_TABLE = _qualified(GRANT_WORK_SCHEMA, ORG_TOKEN_BASE)
+    ORG_IDENTITY_FTS_TABLE = _qualified(GRANT_WORK_SCHEMA, ORG_IDENTITY_FTS_BASE)
+    SIG_TABLE = _qualified(GRANT_WORK_SCHEMA, SIG_BASE)
+    SIG_GRANT_TABLE = _qualified(GRANT_WORK_SCHEMA, SIG_GRANT_BASE)
+    CAND_TABLE = _qualified(GRANT_WORK_SCHEMA, CAND_BASE)
+
+
+def attach_grant_work_db(conn: sqlite3.Connection, db_path: str, readonly: bool = False) -> None:
+    work_db_path = GRANT_WORK_DB_PATH or default_grant_work_db_path(db_path)
+    if readonly and not Path(work_db_path).exists():
+        conn.execute(f"ATTACH DATABASE ':memory:' AS {GRANT_WORK_SCHEMA}")
+        return
+    if not readonly:
+        Path(work_db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (work_db_path,))
 
 
 def run_index_statements(conn: sqlite3.Connection, statements: Sequence[str], label: str) -> None:
@@ -286,9 +360,10 @@ def analyze_tables(conn: sqlite3.Connection, tables: Sequence[str]) -> None:
 
 
 def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    schema, table = _split_qualified_name(name)
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1",
-        (name,),
+        f"SELECT 1 FROM {_sqlite_master_name(schema)} WHERE type IN ('table','view') AND name=? LIMIT 1",
+        (table,),
     ).fetchone()
     return row is not None
 
@@ -608,8 +683,7 @@ def identity_key(ein: str, source: str, name_norm: str, street_norm: str, city: 
 def create_identity_schema(conn: sqlite3.Connection, full_refresh: bool = False, create_fts: bool = True) -> None:
     if full_refresh:
         conn.executescript(f"""
-        DROP VIEW IF EXISTS {FINAL_VIEW};
-        DROP TABLE IF EXISTS org_identity_fts;
+        DROP TABLE IF EXISTS {ORG_IDENTITY_FTS_TABLE};
         DROP TABLE IF EXISTS {ORG_TOKEN_TABLE};
         DROP TABLE IF EXISTS {ORG_IDENTITY_TABLE};
         """)
@@ -661,10 +735,10 @@ def create_identity_schema(conn: sqlite3.Connection, full_refresh: bool = False,
     if create_fts:
         try:
             conn.execute(f"""
-            CREATE VIRTUAL TABLE IF NOT EXISTS org_identity_fts USING fts5(
+            CREATE VIRTUAL TABLE IF NOT EXISTS {ORG_IDENTITY_FTS_TABLE} USING fts5(
               display_name,
               name_norm,
-              content='{ORG_IDENTITY_TABLE}',
+              content='{_base_name(ORG_IDENTITY_TABLE)}',
               content_rowid='identity_id'
             );
             """)
@@ -675,24 +749,24 @@ def create_identity_schema(conn: sqlite3.Connection, full_refresh: bool = False,
 
 def create_identity_indexes(conn: sqlite3.Connection, include_fts_rebuild: bool = True) -> None:
     statements = [
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_ein ON {ORG_IDENTITY_TABLE}(ein);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_name ON {ORG_IDENTITY_TABLE}(name_norm);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_name_zip ON {ORG_IDENTITY_TABLE}(name_norm, zip5);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_name_state ON {ORG_IDENTITY_TABLE}(name_norm, state);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_name_city_state ON {ORG_IDENTITY_TABLE}(name_norm, city, state);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_addr_zip ON {ORG_IDENTITY_TABLE}(street_norm, zip5);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_addr_city_state ON {ORG_IDENTITY_TABLE}(street_norm, city, state);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_state_zip ON {ORG_IDENTITY_TABLE}(state, zip5);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_identity_source ON {ORG_IDENTITY_TABLE}(source);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_token_token ON {ORG_TOKEN_TABLE}(token);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_token_token_state ON {ORG_TOKEN_TABLE}(token, state);",
-        f"CREATE INDEX IF NOT EXISTS idx_org_token_token_zip ON {ORG_TOKEN_TABLE}(token, zip5);",
+        _index_sql("idx_org_identity_ein", ORG_IDENTITY_TABLE, "ein"),
+        _index_sql("idx_org_identity_name", ORG_IDENTITY_TABLE, "name_norm"),
+        _index_sql("idx_org_identity_name_zip", ORG_IDENTITY_TABLE, "name_norm, zip5"),
+        _index_sql("idx_org_identity_name_state", ORG_IDENTITY_TABLE, "name_norm, state"),
+        _index_sql("idx_org_identity_name_city_state", ORG_IDENTITY_TABLE, "name_norm, city, state"),
+        _index_sql("idx_org_identity_addr_zip", ORG_IDENTITY_TABLE, "street_norm, zip5"),
+        _index_sql("idx_org_identity_addr_city_state", ORG_IDENTITY_TABLE, "street_norm, city, state"),
+        _index_sql("idx_org_identity_state_zip", ORG_IDENTITY_TABLE, "state, zip5"),
+        _index_sql("idx_org_identity_source", ORG_IDENTITY_TABLE, "source"),
+        _index_sql("idx_org_token_token", ORG_TOKEN_TABLE, "token"),
+        _index_sql("idx_org_token_token_state", ORG_TOKEN_TABLE, "token, state"),
+        _index_sql("idx_org_token_token_zip", ORG_TOKEN_TABLE, "token, zip5"),
     ]
     run_index_statements(conn, statements, "org_identity")
     analyze_tables(conn, [ORG_IDENTITY_TABLE, ORG_TOKEN_TABLE])
-    if include_fts_rebuild and table_exists(conn, "org_identity_fts"):
+    if include_fts_rebuild and table_exists(conn, ORG_IDENTITY_FTS_TABLE):
         try:
-            conn.execute("INSERT INTO org_identity_fts(org_identity_fts) VALUES('rebuild')")
+            conn.execute(f"INSERT INTO {ORG_IDENTITY_FTS_TABLE}({_base_name(ORG_IDENTITY_FTS_TABLE)}) VALUES('rebuild')")
             conn.commit()
         except sqlite3.Error as e:
             print(f"FTS rebuild skipped: {e}", flush=True)
@@ -1010,11 +1084,11 @@ def cmd_build_identity(args: argparse.Namespace) -> None:
 
 def create_signature_indexes(conn: sqlite3.Connection) -> None:
     statements = [
-        f"CREATE INDEX IF NOT EXISTS idx_sig_state_zip ON {SIG_TABLE}(state, zip5);",
-        f"CREATE INDEX IF NOT EXISTS idx_sig_name ON {SIG_TABLE}(recipient_name_norm);",
-        f"CREATE INDEX IF NOT EXISTS idx_sig_amount ON {SIG_TABLE}(total_amount DESC);",
-        f"CREATE INDEX IF NOT EXISTS idx_sig_queue ON {SIG_TABLE}(ai_queue_status, total_amount DESC);",
-        f"CREATE INDEX IF NOT EXISTS idx_sig_grant_grant ON {SIG_GRANT_TABLE}(grant_id);",
+        _index_sql("idx_sig_state_zip", SIG_TABLE, "state, zip5"),
+        _index_sql("idx_sig_name", SIG_TABLE, "recipient_name_norm"),
+        _index_sql("idx_sig_amount", SIG_TABLE, "total_amount DESC"),
+        _index_sql("idx_sig_queue", SIG_TABLE, "ai_queue_status, total_amount DESC"),
+        _index_sql("idx_sig_grant_grant", SIG_GRANT_TABLE, "grant_id"),
     ]
     run_index_statements(conn, statements, "signature")
     analyze_tables(conn, [SIG_TABLE, SIG_GRANT_TABLE])
@@ -1326,8 +1400,8 @@ def cmd_build_signatures(args: argparse.Namespace) -> None:
 
 def create_candidate_indexes(conn: sqlite3.Connection) -> None:
     statements = [
-        f"CREATE INDEX IF NOT EXISTS idx_ai_cand_sig_rank ON {CAND_TABLE}(signature_hash, candidate_rank);",
-        f"CREATE INDEX IF NOT EXISTS idx_ai_cand_ein ON {CAND_TABLE}(ein);",
+        _index_sql("idx_ai_cand_sig_rank", CAND_TABLE, "signature_hash, candidate_rank"),
+        _index_sql("idx_ai_cand_ein", CAND_TABLE, "ein"),
     ]
     run_index_statements(conn, statements, "candidate")
     analyze_tables(conn, [CAND_TABLE])
@@ -1521,7 +1595,7 @@ def get_candidate_identity_rows(
 
     # FTS fallback, intentionally last. It can be useful, but it is much more
     # expensive than exact/name/address lookup on very large identity tables.
-    if name_norm and table_exists(conn, "org_identity_fts"):
+    if name_norm and table_exists(conn, ORG_IDENTITY_FTS_TABLE):
         toks = distinctive_name_tokens(name_norm, max_tokens=5)
         if toks:
             match = " ".join('"' + t.replace('"', '') + '"' for t in toks)
@@ -1536,9 +1610,9 @@ def get_candidate_identity_rows(
             try:
                 sql = f"""
                 SELECT oi.*
-                FROM org_identity_fts f
+                FROM {ORG_IDENTITY_FTS_TABLE} f
                 JOIN {ORG_IDENTITY_TABLE} oi ON oi.identity_id = f.rowid
-                WHERE org_identity_fts MATCH ? {geo_clause}
+                WHERE {_base_name(ORG_IDENTITY_FTS_TABLE)} MATCH ? {geo_clause}
                 ORDER BY rank
                 LIMIT 75
                 """
@@ -1752,13 +1826,13 @@ def bulk_update_signature_candidate_status(conn: sqlite3.Connection, label: str 
         SET candidate_count = COALESCE((
               SELECT t.candidate_count
               FROM temp.tmp_ai_candidate_counts t
-              WHERE t.signature_hash = {SIG_TABLE}.signature_hash
+              WHERE t.signature_hash = {_base_name(SIG_TABLE)}.signature_hash
             ), 0),
             ai_queue_status = CASE
               WHEN COALESCE((
                 SELECT t.candidate_count
                 FROM temp.tmp_ai_candidate_counts t
-                WHERE t.signature_hash = {SIG_TABLE}.signature_hash
+                WHERE t.signature_hash = {_base_name(SIG_TABLE)}.signature_hash
               ), 0) > 0 THEN 'candidates_ready'
               ELSE 'no_candidates'
             END,
@@ -5354,10 +5428,10 @@ def collect_stats(conn: sqlite3.Connection, top_n: int = 50, include_final_view:
 
     if table_exists(conn, ORG_TOKEN_TABLE):
         _add_stat(stats, "org_identity", "token_rows", count=int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_TOKEN_TABLE}") or 0))
-    if table_exists(conn, f"{ORG_IDENTITY_TABLE}_fts"):
+    if table_exists(conn, ORG_IDENTITY_FTS_TABLE):
         # FTS row count is often equal-ish to indexed docs; this is cheap enough.
         try:
-            _add_stat(stats, "org_identity", "fts_rows", count=int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_IDENTITY_TABLE}_fts") or 0))
+            _add_stat(stats, "org_identity", "fts_rows", count=int(_scalar(conn, f"SELECT COUNT(*) FROM {ORG_IDENTITY_FTS_TABLE}") or 0))
         except sqlite3.Error as e:
             _add_stat(stats, "org_identity", "fts_rows", notes=f"could not count FTS rows: {e}")
 
@@ -5618,6 +5692,14 @@ def cmd_stats(args: argparse.Namespace) -> None:
 
 def add_common_db(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db", default=DEFAULT_DB, help=f"SQLite database path (default: {DEFAULT_DB})")
+    p.add_argument(
+        "--work-db",
+        default=None,
+        help=(
+            "Enhanced grant-matching sidecar database path. "
+            "Defaults to IRS_GRANT_WORK_DB_PATH or grant_matching_work.db beside --db."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -6091,6 +6173,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if hasattr(args, "db"):
+            configure_grant_work_sidecar(args.db, getattr(args, "work_db", None))
         args.func(args)
         return 0
     except Exception as e:

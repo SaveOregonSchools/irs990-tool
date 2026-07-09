@@ -2,6 +2,7 @@
 param(
     [string]$ProjectDir = "",
     [string]$DbPath = "",
+    [string]$WorkDbPath = "",
     [string]$Python = "python",
     [string]$Sqlite = "sqlite3",
     [switch]$Yes,
@@ -27,9 +28,17 @@ if ([string]::IsNullOrWhiteSpace($DbPath)) {
         $DbPath = Join-Path $ProjectDir "db\irs990.db"
     }
 }
+if ([string]::IsNullOrWhiteSpace($WorkDbPath)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:IRS_GRANT_WORK_DB_PATH)) {
+        $WorkDbPath = $env:IRS_GRANT_WORK_DB_PATH
+    } else {
+        $WorkDbPath = Join-Path (Split-Path -Parent $DbPath) "grant_matching_work.db"
+    }
+}
 
 $env:IRS_PROJECT_DIR = $ProjectDir
 $env:IRS_DB_PATH = $DbPath
+$env:IRS_GRANT_WORK_DB_PATH = $WorkDbPath
 $exportsDir = Join-Path $ProjectDir "exports"
 New-Item -ItemType Directory -Force -Path $exportsDir | Out-Null
 
@@ -62,6 +71,7 @@ Write-Host "Run it only after loading new XML files into the database."
 Write-Host ""
 Write-Host "Project:  $ProjectDir"
 Write-Host "Database: $DbPath"
+Write-Host "Work DB:  $WorkDbPath"
 Write-Host ""
 Write-Host "The entire process can take many hours, depending on the amount of IRS data."
 
@@ -201,15 +211,17 @@ try {
         "--db", $DbPath
     )
 
+    $workDbSqlLiteral = $WorkDbPath.Replace("'", "''")
     $remainingSql = @"
+ATTACH DATABASE '$workDbSqlLiteral' AS grant_work;
 SELECT
   COUNT(*) AS signatures_left_for_ai_review,
   COALESCE(SUM(s.grant_count),0) AS grants_represented,
   ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount
-FROM grant_recipient_signature s
+FROM grant_work.grant_recipient_signature s
 WHERE EXISTS (
   SELECT 1
-  FROM grant_recipient_ai_candidate c
+  FROM grant_work.grant_recipient_ai_candidate c
   WHERE c.signature_hash = s.signature_hash
 )
 AND NOT EXISTS (
@@ -222,6 +234,9 @@ AND NOT EXISTS (
 
     if (-not $SkipCheckpoint) {
         Invoke-External "Checkpoint and truncate SQLite WAL" $Sqlite @($DbPath, "PRAGMA wal_checkpoint(TRUNCATE);")
+        if (Test-Path -LiteralPath $WorkDbPath) {
+            Invoke-External "Checkpoint and truncate grant work SQLite WAL" $Sqlite @($WorkDbPath, "PRAGMA wal_checkpoint(TRUNCATE);")
+        }
     }
 }
 finally {

@@ -67,7 +67,7 @@ def _file_size(path: Path) -> int:
         return 0
 
 
-def _database_file_stats(db_path: Path) -> List[Dict[str, Any]]:
+def _database_file_stats(db_path: Path, work_db_path: Optional[Path] = None) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     main_size = _file_size(db_path)
     wal_size = _file_size(Path(str(db_path) + "-wal"))
@@ -77,6 +77,13 @@ def _database_file_stats(db_path: Path) -> List[Dict[str, Any]]:
     _add_stat(rows, "database", "file_size_bytes", "wal", count=wal_size, notes=str(db_path) + "-wal")
     _add_stat(rows, "database", "file_size_bytes", "shm", count=shm_size, notes=str(db_path) + "-shm")
     _add_stat(rows, "database", "file_size_bytes", "total_sqlite_files", count=total_size)
+    if work_db_path is not None:
+        work_size = _file_size(work_db_path)
+        work_wal_size = _file_size(Path(str(work_db_path) + "-wal"))
+        work_shm_size = _file_size(Path(str(work_db_path) + "-shm"))
+        _add_stat(rows, "database", "file_size_bytes", "grant_work_db", count=work_size, notes=str(work_db_path))
+        _add_stat(rows, "database", "file_size_bytes", "grant_work_wal", count=work_wal_size, notes=str(work_db_path) + "-wal")
+        _add_stat(rows, "database", "file_size_bytes", "grant_work_shm", count=work_shm_size, notes=str(work_db_path) + "-shm")
     return rows
 
 
@@ -310,12 +317,17 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def refresh_stats(db_path: str, top_n: int = 50, include_final_view: bool = True) -> int:
+def refresh_stats(db_path: str, top_n: int = 50, include_final_view: bool = True, work_db_path: Optional[str] = None) -> int:
     db = Path(db_path).expanduser().resolve()
+    work_db: Optional[Path] = None
+    candidate_work_db = Path(work_db_path or grant_stats.default_grant_work_db_path(str(db))).expanduser().resolve()
+    if work_db_path is not None or candidate_work_db.exists():
+        grant_stats.configure_grant_work_sidecar(str(db), str(candidate_work_db))
+        work_db = candidate_work_db
     conn = grant_stats.connect(str(db), readonly=False)
     try:
         rows: List[Dict[str, Any]] = []
-        rows.extend(_database_file_stats(db))
+        rows.extend(_database_file_stats(db, work_db))
         rows.extend(_filing_stats(conn))
         rows.extend(_grant_match_summary(conn))
         rows.extend(grant_stats.collect_stats(conn, top_n=top_n, include_final_view=include_final_view))
@@ -360,6 +372,7 @@ def refresh_stats(db_path: str, top_n: int = 50, include_final_view: bool = True
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Refresh cached statistics for the IRS 990 Flask app")
     parser.add_argument("--db", default=grant_stats.DEFAULT_DB, help=f"SQLite database path (default: {grant_stats.DEFAULT_DB})")
+    parser.add_argument("--work-db", default=None, help="Enhanced grant-matching sidecar DB path")
     parser.add_argument("--top-n", type=int, default=50, help="Maximum rows for grouped grant matching breakdowns")
     parser.add_argument("--skip-final-view", action="store_true", help="Skip final resolved view counts")
     return parser
@@ -368,7 +381,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        count = refresh_stats(args.db, top_n=args.top_n, include_final_view=not args.skip_final_view)
+        count = refresh_stats(args.db, top_n=args.top_n, include_final_view=not args.skip_final_view, work_db_path=args.work_db)
         print(f"Refreshed {count} cached data-stat rows.")
         return 0
     except Exception as e:

@@ -60,7 +60,8 @@ The deterministic resolver creates or refreshes:
 grant_recipient_resolved
 ```
 
-The AI-assist workflow can create or refresh:
+The AI-assist workflow stores bulky working data in the grant work sidecar DB
+(`IRS_GRANT_WORK_DB_PATH`, or `db\grant_matching_work.db` by default):
 
 ```text
 org_identity
@@ -69,6 +70,11 @@ org_identity_fts
 grant_recipient_signature
 grant_recipient_signature_grant
 grant_recipient_ai_candidate
+```
+
+The final accepted/enhanced matching data stays in the main application DB:
+
+```text
 grant_recipient_ai_decision
 grant_recipient_ai_applied
 grant_recipient_resolved_plus_ai_v1
@@ -133,6 +139,7 @@ Common PowerShell options:
 ```powershell
 .\batch_enhanced_grant_matches.ps1 `
   -DbPath C:\Projects\irs990-tool\db\irs990.db `
+  -WorkDbPath C:\Projects\irs990-tool\db\grant_matching_work.db `
   -ProjectDir C:\Projects\irs990-tool `
   -Yes
 ```
@@ -144,6 +151,18 @@ Common PowerShell options:
 ```powershell
 sqlite3 db\irs990.db ".backup db\irs990_before_grant_ai.db"
 ```
+
+If you are migrating an existing main DB that still contains the enhanced
+matching working tables, move them to the sidecar before rebuilding:
+
+```powershell
+py migrate_grant_work_sidecar.py --db db\irs990.db --drop-main --yes
+```
+
+The migration verifies sidecar row counts before dropping working tables from
+the main DB. It does not move `grant_recipient_ai_decision`,
+`grant_recipient_ai_applied`, `grant_recipient_resolved`, or the final enhanced
+view because the Flask app and query modules read those from the main DB.
 
 ### Step 1: Run Deterministic First-Pass Resolver
 
@@ -506,14 +525,16 @@ The standard `batch_enhanced_grant_matches.ps1` workflow runs this refresh autom
 Exact count of signatures still needing decisions:
 
 ```sql
+ATTACH DATABASE 'db/grant_matching_work.db' AS grant_work;
+
 SELECT
   COUNT(*) AS signatures_left_for_ai_review,
   COALESCE(SUM(s.grant_count),0) AS grants_represented,
   ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount
-FROM grant_recipient_signature s
+FROM grant_work.grant_recipient_signature s
 WHERE EXISTS (
   SELECT 1
-  FROM grant_recipient_ai_candidate c
+  FROM grant_work.grant_recipient_ai_candidate c
   WHERE c.signature_hash = s.signature_hash
 )
 AND NOT EXISTS (
