@@ -61,6 +61,7 @@ The database is a **research-oriented slim schema**, not a complete one-table-pe
 | `docs/preflight.md` | XML preflight scan workflow for checking new XML batches before append. |
 | `resolve_grant_recipients.py` | Deterministic grant-recipient resolution workflow. |
 | `grant_ai_assist_v1.py` | Advanced grant-recipient candidate generation, rule decisions, Ollama adjudication, and final applied views. |
+| `migrate_grant_work_sidecar.py` | One-time migration utility for moving enhanced grant-matching working tables to `db/grant_matching_work.db`. |
 | `grant_ai_batch_worker.py` | Linux/Ollama batch worker for external grant-recipient adjudication packets. |
 | `docs/grant-matching.md` | Detailed enhanced grant matching, AI assist, and batch adjudication workflow. |
 | `.env.example` | Example local environment settings. Copy to `.env` if needed. |
@@ -226,7 +227,7 @@ The raw IRS grant rows often include recipient names and addresses, but not alwa
 3. The final enhanced layer can be used by grant-received workflows when you want matched recipient EINs beyond the raw reported EIN field.
 4. `refresh_data_stats.py` can summarize the resulting database and matching pipeline for the web app's Database Statistics page.
 
-This workflow can write additional tables/views to the database, so back up the database before running it.
+Bulky working tables live in `db\grant_matching_work.db` by default, or the path in `IRS_GRANT_WORK_DB_PATH`. Final decisions, applied grant rows, and the final enhanced view stay in `db\irs990.db` so the Flask app and query modules continue to use a single main database. Back up the database before running the workflow or migration.
 
 For the standard post-XML-load enhanced grant rebuild, run:
 
