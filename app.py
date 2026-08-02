@@ -3,8 +3,11 @@ import importlib
 import pkgutil
 import io
 import csv
+import os
+import tempfile
 import traceback
 import sys
+import zipfile
 from pathlib import Path
 from common import DB_PATH, connect_ro
 from datetime import datetime
@@ -164,6 +167,20 @@ BASE_CSS = """
     border-color: var(--border);
   }
   button.secondary:hover { background: var(--panel); }
+  .help-icon {
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--muted);
+    border-radius: 50%;
+    color: var(--muted);
+    background: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: help;
+  }
   .description { color: var(--muted); line-height: 1.35; }
   .row { margin: 8px 0; }
   table { border-collapse: collapse; width: 100%; }
@@ -431,9 +448,17 @@ QUERY_HTML = LAYOUT_START + """
       {% endif %}
       <button type="submit">{{ run_button_label }}</button>
       {% if pdf_export %}
-        <button formaction="{{ url_for('export_pdf') }}" formmethod="post" formtarget="_blank">Export PDF</button>
+        {% if export_controls_visible %}
+          <button formaction="{{ url_for('export_pdf') }}" formmethod="post" formtarget="_blank">Export PDF</button>
+        {% endif %}
       {% elif not hide_csv_export %}
         <button formaction="{{ url_for('export') }}" formmethod="post">Export CSV (full result)</button>
+      {% endif %}
+      {% if download_filings and export_controls_visible %}
+        <button formaction="{{ url_for('download_filings') }}" formmethod="post">Download Filings</button>
+        <span class="help-icon" tabindex="0" role="img"
+              aria-label="Downloads a ZIP containing the XML versions of all displayed tax filings."
+              title="This will zip the XML versions of all displayed tax filings and begin a download.">?</span>
       {% endif %}
     </div>
 
@@ -498,7 +523,9 @@ QUERY_HTML = LAYOUT_START + """
 
     const submitter = event.submitter;
     const submitAction = submitter ? submitter.getAttribute("formaction") : "";
-    const isExport = submitAction === "{{ url_for('export') }}" || submitAction === "{{ url_for('export_pdf') }}";
+    const isExport = submitAction === "{{ url_for('export') }}" ||
+      submitAction === "{{ url_for('export_pdf') }}" ||
+      submitAction === "{{ url_for('download_filings') }}";
 
     const buttons = form.querySelectorAll("button");
     buttons.forEach(function(btn) {
@@ -668,6 +695,10 @@ def _render_query(qkey, form=None, headers=None, rows=None, error=None):
     custom_results_html = None
     if headers and rows is not None and qkey in REGISTRY and hasattr(REGISTRY[qkey], "render_results"):
         custom_results_html = REGISTRY[qkey].render_results(form or {}, headers, rows)
+    exports_require_results = _module_flag(qkey, "EXPORTS_REQUIRE_RESULTS")
+    export_controls_visible = not exports_require_results or (
+        error is None and rows is not None and bool(rows)
+    )
     return render_template_string(
         QUERY_HTML,
         **_template_context(
@@ -684,6 +715,8 @@ def _render_query(qkey, form=None, headers=None, rows=None, error=None):
             hide_preview_limit=_module_flag(qkey, "HIDE_PREVIEW_LIMIT"),
             hide_csv_export=_module_flag(qkey, "HIDE_CSV_EXPORT"),
             pdf_export=_module_flag(qkey, "PDF_EXPORT"),
+            download_filings=_module_flag(qkey, "DOWNLOAD_FILINGS"),
+            export_controls_visible=export_controls_visible,
             run_button_label=getattr(REGISTRY[qkey], "RUN_BUTTON_LABEL", "Run Query") if qkey in REGISTRY else "Run Query",
         ),
     )
@@ -928,6 +961,78 @@ def export_pdf():
     return Response(
         REGISTRY[qkey].render_pdf_export(form),
         mimetype="text/html; charset=utf-8",
+    )
+
+
+def _flat_archive_name(filename, used_names):
+    candidate = Path(filename).name
+    stem = Path(candidate).stem
+    suffix = Path(candidate).suffix
+    counter = 2
+    while candidate.casefold() in used_names:
+        candidate = f"{stem}_{counter}{suffix}"
+        counter += 1
+    used_names.add(candidate.casefold())
+    return candidate
+
+
+def _create_filings_zip(source_paths):
+    temp_dir = app.config.get("DOWNLOAD_TEMP_DIR")
+    fd, temp_name = tempfile.mkstemp(prefix="irs990_filings_", suffix=".zip", dir=temp_dir)
+    os.close(fd)
+    zip_path = Path(temp_name)
+    try:
+        used_names = set()
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for source_path in source_paths:
+                source_path = Path(source_path)
+                archive.write(source_path, _flat_archive_name(source_path.name, used_names))
+        return zip_path
+    except Exception:
+        zip_path.unlink(missing_ok=True)
+        raise
+
+
+def _stream_file_then_delete(path, chunk_size=1024 * 1024):
+    try:
+        with Path(path).open("rb") as handle:
+            while True:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+@app.route("/download_filings", methods=["GET", "POST"])
+def download_filings():
+    if request.method == "GET":
+        return redirect(url_for("home"))
+    ensure_registry()
+    qkey = request.form.get("qkey")
+    form = request.form.to_dict(flat=True)
+    if qkey not in REGISTRY:
+        return "Unknown query key.", 400
+    module = REGISTRY[qkey]
+    if not getattr(module, "DOWNLOAD_FILINGS", False) or not hasattr(module, "filing_xml_paths"):
+        return "This module does not support filing downloads.", 400
+
+    try:
+        source_paths = list(module.filing_xml_paths(form))
+        if not source_paths:
+            return "No displayed tax filings were available to download.", 404
+        zip_path = _create_filings_zip(source_paths)
+    except (FileNotFoundError, ValueError) as exc:
+        return str(exc), 404
+
+    ein = "".join(ch for ch in (form.get("ein") or "") if ch.isdigit())
+    ts = datetime.now().strftime("%m-%d-%Y")
+    filename = f"nonprofit_deep_dive_{ein}_filings_{ts}.zip"
+    return Response(
+        _stream_file_then_delete(zip_path),
+        mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

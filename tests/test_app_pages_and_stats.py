@@ -1,6 +1,8 @@
 import sqlite3
 import tempfile
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -150,10 +152,31 @@ class AppPagesAndStatsTests(unittest.TestCase):
             render_results=lambda form, headers, rows: f"<div>custom rows:{len(rows)}</div>",
             render_pdf_export=lambda form: "<!doctype html><title>PDF fixture</title>",
         )
+        fake_download_query = SimpleNamespace(
+            META={
+                "key": "download_query",
+                "name": "Download Query",
+                "description": "Tests conditional report downloads.",
+            },
+            HIDE_PREVIEW_LIMIT=True,
+            HIDE_CSV_EXPORT=True,
+            DISABLE_ROW_LIMIT=True,
+            PDF_EXPORT=True,
+            DOWNLOAD_FILINGS=True,
+            EXPORTS_REQUIRE_RESULTS=True,
+            RUN_BUTTON_LABEL="Open EIN",
+            render_fields=lambda form: "<input name='ein' value='{}'>".format(form.get("ein", "")),
+            run=lambda form: (["ein"], [(form.get("ein"),)] if form.get("ein") else []),
+            export_rows=lambda form: [],
+            render_results=lambda form, headers, rows: f"<div>report rows:{len(rows)}</div>",
+            render_pdf_export=lambda form: "<!doctype html><title>PDF fixture</title>",
+            filing_xml_paths=lambda form: [],
+        )
         app_module.REGISTRY = {
             "ask_database": fake_ask_query,
             "fixture_query": fake_query,
             "pdf_query": fake_pdf_query,
+            "download_query": fake_download_query,
         }
         app_module.PLUGIN_FINGERPRINT = app_module.plugin_fingerprint()
         app_module.app.config.update(TESTING=True)
@@ -227,6 +250,52 @@ class AppPagesAndStatsTests(unittest.TestCase):
         pdf_response = client.post("/export_pdf", data={"qkey": "pdf_query"})
         self.assertEqual(pdf_response.status_code, 200)
         self.assertIn("PDF fixture", pdf_response.get_data(as_text=True))
+
+    def test_report_exports_only_appear_after_a_report_is_opened(self):
+        client = app_module.app.test_client()
+        initial_body = client.get("/query/download_query").get_data(as_text=True)
+        self.assertNotIn("Export PDF", initial_body)
+        self.assertNotIn("Download Filings", initial_body)
+
+        report_body = client.post(
+            "/run", data={"qkey": "download_query", "ein": "111111111"}
+        ).get_data(as_text=True)
+        self.assertIn("Export PDF", report_body)
+        self.assertIn("Download Filings", report_body)
+        self.assertIn('formaction="/download_filings"', report_body)
+        self.assertIn("zip the XML versions of all displayed tax filings", report_body)
+
+    def test_download_filings_streams_flat_zip_and_removes_temp_file(self):
+        module = app_module.REGISTRY["download_query"]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first_dir = root / "first"
+            second_dir = root / "second"
+            first_dir.mkdir()
+            second_dir.mkdir()
+            first = first_dir / "filing.xml"
+            second = second_dir / "filing.xml"
+            first.write_text("<first/>", encoding="utf-8")
+            second.write_text("<second/>", encoding="utf-8")
+            module.filing_xml_paths = lambda form: [first, second]
+            app_module.app.config["DOWNLOAD_TEMP_DIR"] = td
+
+            response = app_module.app.test_client().post(
+                "/download_filings",
+                data={"qkey": "download_query", "ein": "11-1111111"},
+                buffered=True,
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.mimetype, "application/zip")
+            self.assertIn("nonprofit_deep_dive_111111111_filings_", response.headers["Content-Disposition"])
+            with zipfile.ZipFile(BytesIO(response.data)) as archive:
+                self.assertEqual(archive.namelist(), ["filing.xml", "filing_2.xml"])
+                self.assertTrue(all("/" not in name and "\\" not in name for name in archive.namelist()))
+                self.assertEqual(archive.read("filing.xml"), b"<first/>")
+                self.assertEqual(archive.read("filing_2.xml"), b"<second/>")
+            self.assertEqual(list(root.glob("irs990_filings_*.zip")), [])
+            app_module.app.config.pop("DOWNLOAD_TEMP_DIR", None)
 
     def test_registry_auto_reloads_when_query_files_change(self):
         app_module.REGISTRY = {"old": object()}

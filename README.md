@@ -140,6 +140,13 @@ Before appending unfamiliar XML batches, run a preflight scan:
 py rebuild_irs990_slim_clean.py --xml-dir C:\IRSDB\NewXML --preflight --workers 4 --preflight-report exports\preflight_summary.json --preflight-csv exports\preflight_files.csv
 ```
 
+To inventory source XML locations and review duplicate files under the long-term
+XML folder:
+
+```powershell
+py scan_xml_sources.py --xml-dir C:\Projects\irsdb\xml --sidecar-db db\irs990_sources.db --main-db db\irs990.db --report-csv exports\xml_source_audit.csv --duplicates-csv exports\xml_source_duplicates.csv
+```
+
 See [`docs/database-build.md`](docs/database-build.md) for the full rebuild/append guide, flags, validation queries, and caveats. See [`docs/preflight.md`](docs/preflight.md) for preflight scan details.
 
 ---

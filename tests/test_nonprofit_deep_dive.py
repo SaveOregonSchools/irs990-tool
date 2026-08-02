@@ -1,5 +1,7 @@
 import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 
 from queries import ngo_core_data
 from queries import nonprofit_deep_dive as mod
@@ -177,6 +179,8 @@ class NonprofitDeepDiveTests(unittest.TestCase):
         self.assertTrue(mod.HIDE_CSV_EXPORT)
         self.assertTrue(mod.DISABLE_ROW_LIMIT)
         self.assertTrue(mod.PDF_EXPORT)
+        self.assertTrue(mod.DOWNLOAD_FILINGS)
+        self.assertTrue(mod.EXPORTS_REQUIRE_RESULTS)
         self.assertEqual(mod.RUN_BUTTON_LABEL, "Open EIN")
 
         fields = mod.render_fields({})
@@ -212,6 +216,46 @@ class NonprofitDeepDiveTests(unittest.TestCase):
         self.assertEqual(rows, [])
         html = mod.render_results({"ein": "111111111 222222222"}, headers, rows)
         self.assertIn("Enter exactly one valid 9-digit EIN", html)
+
+    def test_filing_xml_paths_uses_inventory_and_prefers_kept_exact_source(self):
+        original_inventory = mod.SOURCE_INVENTORY_DB_PATH
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            preferred = root / "preferred" / "F1.xml"
+            duplicate = root / "duplicate" / "F1.xml"
+            preferred.parent.mkdir()
+            duplicate.parent.mkdir()
+            preferred.write_text("<preferred/>", encoding="utf-8")
+            duplicate.write_text("<duplicate/>", encoding="utf-8")
+            inventory_path = root / "sources.db"
+            inventory = sqlite3.connect(inventory_path)
+            inventory.executescript(
+                """
+                CREATE TABLE source_files (
+                  filing_id TEXT,
+                  object_id TEXT,
+                  source_file TEXT,
+                  duplicate_status TEXT,
+                  keep_source_file TEXT,
+                  quarantine_status TEXT
+                );
+                CREATE INDEX idx_source_object ON source_files(object_id);
+                """
+            )
+            inventory.executemany(
+                "INSERT INTO source_files VALUES (?,?,?,?,?,?)",
+                [
+                    ("F1", "F1", str(duplicate), "exact_duplicate", str(preferred), None),
+                    ("F1", "F1", str(preferred), "primary_duplicate_group", str(preferred), None),
+                ],
+            )
+            inventory.commit()
+            inventory.close()
+            mod.SOURCE_INVENTORY_DB_PATH = inventory_path
+            try:
+                self.assertEqual(mod.filing_xml_paths({"ein": "11-1111111"}), [preferred])
+            finally:
+                mod.SOURCE_INVENTORY_DB_PATH = original_inventory
 
 
 if __name__ == "__main__":

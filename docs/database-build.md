@@ -106,6 +106,102 @@ These are treated as the same underlying filing/object:
 
 The script also skips duplicate object IDs inside the incoming XML directory itself.
 
+For a durable inventory of the XML files on disk, and to safely find duplicate
+files before appending or rebuilding, use the source manifest sidecar scanner.
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --main-db db\irs990.db `
+  --report-csv exports\xml_source_audit.csv `
+  --duplicates-csv exports\xml_source_duplicates.csv
+```
+
+The sidecar scanner rebuilds `db\irs990_sources.db` with one row per XML file,
+plus a copy of loaded filing IDs from `returns` when `--main-db` is supplied.
+It hashes duplicate object-ID candidates by default and classifies them as:
+
+- `unique`: no other XML file has the same normalized object ID.
+- `primary_duplicate_group`: the retained file for an exact duplicate group.
+- `exact_duplicate`: same normalized object ID and same SHA-256 content hash as
+  the retained file.
+- `object_id_conflict`: same normalized object ID, but different or unknown file
+  content. Review these manually.
+
+To move exact duplicates out of the XML tree after reviewing the report, use an
+explicit quarantine directory outside `--xml-dir`:
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --duplicates-csv exports\xml_source_duplicates.csv `
+  --quarantine-duplicates C:\Projects\irsdb\xml_duplicates_quarantine `
+  --yes
+```
+
+Quarantine only moves `exact_duplicate` files. It does not remove
+`object_id_conflict` files.
+
+After quarantine, rescan the XML folder so the sidecar reflects the files still
+in the active source tree:
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --main-db db\irs990.db `
+  --duplicates-csv exports\xml_source_duplicates_after_quarantine.csv
+```
+
+To investigate `object_id_conflict` rows, ask the scanner to parse the conflicting
+XML files and hash a canonicalized XML structure. This ignores indentation, line
+endings, and attribute order, so it can separate formatting-only differences from
+real XML content differences:
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --analyze-conflicts `
+  --conflict-groups-csv exports\xml_source_conflict_groups.csv
+```
+
+The conflict group CSV writes one row per conflicting object ID. Conflict groups
+marked `canonical_equivalent` have different bytes but the same parsed XML
+structure. Groups marked `canonical_different` need manual review before moving
+or deleting anything.
+
+When the production database has `returns.source_file` paths, the scanner can
+also create a keep/move recommendation for conflicts. It keeps the current XML
+file whose relative path matches the source path recorded in `returns`, even if
+the XML root folder has moved:
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --main-db db\irs990.db `
+  --conflict-resolution-csv exports\xml_source_conflict_resolution.csv
+```
+
+Review the `recommended_action` column. Rows marked `keep` stay in the active
+XML folder, rows marked `quarantine_conflict` are the extra conflicting copies,
+and rows marked `review` did not resolve to exactly one loaded source file.
+
+After reviewing the recommendation CSV, move only resolved extra conflict copies:
+
+```powershell
+py scan_xml_sources.py `
+  --xml-dir C:\Projects\irsdb\xml `
+  --sidecar-db db\irs990_sources.db `
+  --main-db db\irs990.db `
+  --conflict-resolution-csv exports\xml_source_conflict_resolution.csv `
+  --quarantine-resolved-conflicts C:\Projects\irsdb\xml_conflicts `
+  --yes
+```
+
 ---
 
 ## `--keep-db` behavior
