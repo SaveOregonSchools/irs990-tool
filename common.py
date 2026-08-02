@@ -2,8 +2,17 @@ import os
 import sqlite3
 import re
 from pathlib import Path
+from typing import Optional
 
 APP_ROOT = Path(__file__).resolve().parent
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - requirements.txt installs python-dotenv
+    load_dotenv = None
+
+if load_dotenv:
+    load_dotenv(APP_ROOT / ".env")
 
 # Default portable layout:
 # irs990-tool/
@@ -17,6 +26,12 @@ DEFAULT_DB = APP_ROOT / "db" / "irs990.db"
 # PowerShell:
 #   $env:IRS_DB_PATH="C:\some\other\path\irs990.db"
 DB_PATH = Path(os.getenv("IRS_DB_PATH", DEFAULT_DB)).expanduser().resolve()
+
+
+def configured_xml_root() -> Optional[Path]:
+    """Return the machine-local XML root, or None when it is not configured."""
+    value = (os.getenv("IRS_XML_ROOT") or "").strip()
+    return Path(value).expanduser().resolve() if value else None
 
 def current_db_path():
     return str(DB_PATH)

@@ -1,8 +1,10 @@
 import argparse
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import scan_xml_sources
 
@@ -31,6 +33,27 @@ def args_for(tmp: Path, xml_dir: Path, **overrides):
 
 
 class XmlSourceScannerTests(unittest.TestCase):
+    def test_scan_uses_configured_xml_root_when_argument_is_omitted(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            xml_dir = root / "xml"
+            xml_dir.mkdir()
+            (xml_dir / "ROOT_public.xml").write_text(SAMPLE_XML, encoding="utf-8")
+            args = args_for(root, xml_dir)
+            args.xml_dir = None
+
+            with patch.dict(os.environ, {"IRS_XML_ROOT": str(xml_dir)}):
+                scan_xml_sources.run(args)
+
+            conn = sqlite3.connect(root / "irs990_sources.db")
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT relative_path FROM source_files").fetchone()[0],
+                    "ROOT_public.xml",
+                )
+            finally:
+                conn.close()
+
     def test_scan_marks_exact_duplicates_and_object_id_conflicts(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -57,6 +80,18 @@ class XmlSourceScannerTests(unittest.TestCase):
                 self.assertEqual(statuses["primary_duplicate_group"], 1)
                 self.assertEqual(statuses["object_id_conflict"], 1)
                 self.assertEqual(statuses["unique"], 1)
+                paths = conn.execute(
+                    "SELECT xml_root, source_file, relative_path, keep_source_file FROM source_files"
+                ).fetchall()
+                self.assertTrue(all(row[0] == "" for row in paths))
+                self.assertTrue(all(not Path(row[1]).is_absolute() for row in paths))
+                self.assertTrue(all("\\" not in row[1] and "\\" not in row[2] for row in paths))
+                self.assertTrue(
+                    all(row[3] is None or ("\\" not in row[3] and not Path(row[3]).is_absolute()) for row in paths)
+                )
+                meta = dict(conn.execute("SELECT key, value FROM scan_meta"))
+                self.assertEqual(meta["path_format"], "relative_posix_v1")
+                self.assertNotIn("last_xml_root", meta)
             finally:
                 conn.close()
 
@@ -99,6 +134,8 @@ class XmlSourceScannerTests(unittest.TestCase):
                 self.assertEqual(row["loaded_by_object_id"], 1)
                 self.assertEqual(row["loaded_filing_id"], "LOADME_public")
                 self.assertEqual(row["ein"], "123456789")
+                self.assertFalse(Path(row["loaded_source_file"]).is_absolute())
+                self.assertNotIn("\\", row["loaded_source_file"])
             finally:
                 conn.close()
 
@@ -221,6 +258,18 @@ class XmlSourceScannerTests(unittest.TestCase):
             text = resolution_csv.read_text(encoding="utf-8")
             self.assertIn("loaded_relative_path", text)
             self.assertIn("quarantine_conflict", text)
+
+    def test_portable_paths_accept_windows_separators_and_reject_escape(self):
+        self.assertEqual(
+            scan_xml_sources.portable_relative_path(r"17-18\batch\filing.xml"),
+            "17-18/batch/filing.xml",
+        )
+        self.assertEqual(
+            scan_xml_sources.portable_path_hint(r"C:\IRSDB\XML\batch\filing.xml"),
+            "IRSDB/XML/batch/filing.xml",
+        )
+        with self.assertRaises(ValueError):
+            scan_xml_sources.portable_relative_path("../outside.xml")
 
 
 if __name__ == "__main__":

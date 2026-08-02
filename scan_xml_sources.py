@@ -3,10 +3,10 @@
 """
 Build and maintain a sidecar inventory of IRS 990 XML source files.
 
-The scanner records every XML file under a source directory, identifies duplicate
-object IDs, hashes duplicate candidates, and optionally quarantines exact content
-duplicates. It can also compare the source inventory with the production returns
-table without modifying the production database.
+The scanner records portable paths relative to a configured XML root, identifies
+duplicate object IDs, hashes duplicate candidates, and optionally quarantines
+exact content duplicates. It can also compare the source inventory with the
+production returns table without modifying the production database.
 """
 
 from __future__ import annotations
@@ -21,15 +21,16 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from common import configured_xml_root
 from rebuild_irs990_slim_clean import object_id_from_filing_id
 
 
-DEFAULT_XML_DIR = Path(r"C:\Projects\irsdb\xml")
 DEFAULT_SIDECAR_DB = Path("db") / "irs990_sources.db"
 CHUNK_SIZE = 1024 * 1024
+PATH_FORMAT = "relative_posix_v1"
 
 
 def utc_now() -> str:
@@ -86,16 +87,58 @@ def canonical_xml_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def portable_relative_path(value: object) -> str:
+    """Normalize a trusted inventory-relative path and reject path traversal."""
+    text = str(value or "").strip().replace("\\", "/")
+    pure = PurePosixPath(text)
+    if not text or pure.is_absolute() or (pure.parts and pure.parts[0].endswith(":")):
+        raise ValueError(f"inventory path must be relative: {value}")
+    parts = [part for part in pure.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"invalid inventory relative path: {value}")
+    return PurePosixPath(*parts).as_posix()
+
+
+def portable_path_hint(value: object) -> Optional[str]:
+    """Convert a legacy absolute source path into a portable comparison hint."""
+    text = str(value or "").strip().replace("\\", "/").lstrip("/")
+    if not text:
+        return None
+    parts = [part for part in PurePosixPath(text).parts if part not in {"", "/", "."}]
+    if parts and parts[0].endswith(":"):
+        parts = parts[1:]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return PurePosixPath(*parts).as_posix()
+
+
+def resolve_relative_path(root: Path, value: object) -> Path:
+    """Resolve a portable inventory path underneath root without allowing escape."""
+    relative = portable_relative_path(value)
+    root = root.expanduser().resolve()
+    candidate = root.joinpath(*PurePosixPath(relative).parts).resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError(f"inventory path escapes XML root: {value}")
+    return candidate
+
+
 def path_depth(path: str) -> int:
-    return len(Path(path).parts)
+    return len(PurePosixPath(portable_relative_path(path)).parts)
 
 
 def norm_rel_for_loaded_match(path: str) -> str:
-    return path.replace("/", "\\").lower().replace("_old\\", "\\")
+    return str(path or "").replace("\\", "/").lower().replace("_old/", "/").strip("/")
+
+
+def path_match_key(path: str) -> str:
+    return str(path or "").replace("\\", "/").lower().strip("/")
 
 
 def choose_primary(rows: Sequence[Dict[str, object]]) -> Dict[str, object]:
-    return sorted(rows, key=lambda r: (path_depth(str(r["source_file"])), str(r["source_file"]).casefold()))[0]
+    return sorted(
+        rows,
+        key=lambda r: (path_depth(str(r["relative_path"])), str(r["relative_path"]).casefold()),
+    )[0]
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -202,9 +245,12 @@ def collect_files(xml_dir: Path, scan_id: str, hash_mode: str, scanned_at: str) 
         rows.append(
             {
                 "scan_id": scan_id,
-                "xml_root": str(xml_dir),
-                "source_file": str(p),
-                "relative_path": str(p.relative_to(xml_dir)),
+                # Keep legacy columns populated for schema compatibility, but
+                # store only portable paths. IRS_XML_ROOT supplies the machine-
+                # specific root when a real file must be opened.
+                "xml_root": "",
+                "source_file": p.relative_to(xml_dir).as_posix(),
+                "relative_path": p.relative_to(xml_dir).as_posix(),
                 "filename": p.name,
                 "filing_id": filing_id,
                 "object_id": object_id_from_filing_id(filing_id),
@@ -218,6 +264,7 @@ def collect_files(xml_dir: Path, scan_id: str, hash_mode: str, scanned_at: str) 
                 "quarantine_status": None,
                 "quarantine_file": None,
                 "scanned_at": scanned_at,
+                "_absolute_path": p,
             }
         )
 
@@ -228,13 +275,13 @@ def collect_files(xml_dir: Path, scan_id: str, hash_mode: str, scanned_at: str) 
     for object_id, group in by_object.items():
         if len(group) == 1:
             if hash_mode == "all":
-                group[0]["sha256"] = sha256_file(Path(str(group[0]["source_file"])))
+                group[0]["sha256"] = sha256_file(Path(group[0]["_absolute_path"]))
             continue
 
         should_hash = hash_mode in {"all", "candidates"}
         if should_hash:
             for row in group:
-                row["sha256"] = sha256_file(Path(str(row["source_file"])))
+                row["sha256"] = sha256_file(Path(row["_absolute_path"]))
 
         by_hash: Dict[Optional[str], List[Dict[str, object]]] = defaultdict(list)
         for row in group:
@@ -248,7 +295,7 @@ def collect_files(xml_dir: Path, scan_id: str, hash_mode: str, scanned_at: str) 
             primary = choose_primary(hash_group)
             for row in hash_group:
                 row["duplicate_group_key"] = object_id if sha is None else f"{object_id}:{sha}"
-                row["keep_source_file"] = primary["source_file"]
+                row["keep_source_file"] = primary["relative_path"]
                 if len(hash_group) == 1:
                     row["duplicate_status"] = "object_id_conflict"
                 elif row["source_file"] == primary["source_file"]:
@@ -290,20 +337,20 @@ def insert_source_files(conn: sqlite3.Connection, rows: Sequence[Dict[str, objec
     conn.commit()
 
 
-def analyze_conflicts(conn: sqlite3.Connection) -> Dict[str, int]:
+def analyze_conflicts(conn: sqlite3.Connection, xml_dir: Path) -> Dict[str, int]:
     rows = conn.execute(
         """
-        SELECT source_file_id, object_id, source_file
+        SELECT source_file_id, object_id, relative_path
         FROM source_files
         WHERE duplicate_status = 'object_id_conflict'
-        ORDER BY object_id, source_file COLLATE NOCASE
+        ORDER BY object_id, relative_path COLLATE NOCASE
         """
     ).fetchall()
     updated = 0
     errors = 0
     for row in rows:
         try:
-            canonical_hash = canonical_xml_sha256(Path(row["source_file"]))
+            canonical_hash = canonical_xml_sha256(resolve_relative_path(xml_dir, row["relative_path"]))
         except Exception as e:
             canonical_hash = f"ERROR:{type(e).__name__}:{e}"
             errors += 1
@@ -385,7 +432,7 @@ def import_loaded_filings(conn: sqlite3.Connection, main_db: Optional[Path], imp
             (
                 r["filing_id"],
                 object_id_from_filing_id(r["filing_id"]),
-                r["source_file"],
+                portable_path_hint(r["source_file"]),
                 r["ein"],
                 r["return_type"],
                 r["tax_year"],
@@ -430,7 +477,7 @@ def write_conflict_groups_csv(conn: sqlite3.Connection, path: Path) -> int:
             THEN 'canonical_equivalent'
             ELSE 'canonical_different'
           END AS conflict_kind,
-          GROUP_CONCAT(source_file, char(10)) AS source_files
+          GROUP_CONCAT(relative_path, char(10)) AS source_files
         FROM source_files
         WHERE duplicate_status = 'object_id_conflict'
         GROUP BY object_id
@@ -465,8 +512,8 @@ def conflict_resolution_rows(conn: sqlite3.Connection) -> List[Dict[str, object]
     for object_id, group in by_object.items():
         exact_matches = [
             row for row in group
-            if (row["loaded_source_file"] or "").replace("/", "\\").lower().endswith(
-                row["relative_path"].replace("/", "\\").lower()
+            if path_match_key(row["loaded_source_file"] or "").endswith(
+                path_match_key(row["relative_path"])
             )
         ]
         normalized_matches = [
@@ -540,19 +587,19 @@ def quarantine_exact_duplicates(conn: sqlite3.Connection, xml_dir: Path, quarant
         SELECT source_file_id, source_file, relative_path
         FROM source_files
         WHERE duplicate_status = 'exact_duplicate'
-        ORDER BY source_file COLLATE NOCASE
+        ORDER BY relative_path COLLATE NOCASE
         """
     ).fetchall()
     moved = 0
     for row in rows:
-        src = Path(row["source_file"])
+        src = resolve_relative_path(xml_dir, row["relative_path"])
         if not src.exists():
             conn.execute(
                 "UPDATE source_files SET quarantine_status=? WHERE source_file_id=?",
                 ("missing_before_quarantine", row["source_file_id"]),
             )
             continue
-        dest = quarantine_dir / row["relative_path"]
+        dest = quarantine_dir.joinpath(*PurePosixPath(portable_relative_path(row["relative_path"])).parts)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             dest = dest.with_name(f"{dest.stem}.{row['source_file_id']}{dest.suffix}")
@@ -563,7 +610,7 @@ def quarantine_exact_duplicates(conn: sqlite3.Connection, xml_dir: Path, quarant
             SET quarantine_status = 'moved', quarantine_file = ?
             WHERE source_file_id = ?
             """,
-            (str(dest), row["source_file_id"]),
+            (dest.relative_to(quarantine_dir).as_posix(), row["source_file_id"]),
         )
         moved += 1
     conn.commit()
@@ -580,14 +627,14 @@ def quarantine_resolved_conflicts(conn: sqlite3.Connection, xml_dir: Path, quara
     rows = [r for r in conflict_resolution_rows(conn) if r["recommended_action"] == "quarantine_conflict"]
     moved = 0
     for row in rows:
-        src = Path(str(row["source_file"]))
+        src = resolve_relative_path(xml_dir, row["relative_path"])
         if not src.exists():
             conn.execute(
                 "UPDATE source_files SET quarantine_status=? WHERE source_file_id=?",
                 ("missing_before_conflict_quarantine", row["source_file_id"]),
             )
             continue
-        dest = quarantine_dir / str(row["relative_path"])
+        dest = quarantine_dir.joinpath(*PurePosixPath(portable_relative_path(row["relative_path"])).parts)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             dest = dest.with_name(f"{dest.stem}.{row['source_file_id']}{dest.suffix}")
@@ -598,7 +645,7 @@ def quarantine_resolved_conflicts(conn: sqlite3.Connection, xml_dir: Path, quara
             SET quarantine_status = 'conflict_moved', quarantine_file = ?
             WHERE source_file_id = ?
             """,
-            (str(dest), row["source_file_id"]),
+            (dest.relative_to(quarantine_dir).as_posix(), row["source_file_id"]),
         )
         moved += 1
     conn.commit()
@@ -618,7 +665,10 @@ def summarize(conn: sqlite3.Connection) -> Dict[str, int]:
 
 
 def run(args: argparse.Namespace) -> Dict[str, int]:
-    xml_dir = Path(args.xml_dir).expanduser().resolve()
+    xml_dir_value = args.xml_dir or configured_xml_root()
+    if not xml_dir_value:
+        raise ValueError("XML root is not configured; set IRS_XML_ROOT or pass --xml-dir")
+    xml_dir = Path(xml_dir_value).expanduser().resolve()
     if not xml_dir.exists():
         raise FileNotFoundError(f"XML directory not found: {xml_dir}")
     if not xml_dir.is_dir():
@@ -637,7 +687,9 @@ def run(args: argparse.Namespace) -> Dict[str, int]:
         loaded = import_loaded_filings(conn, Path(args.main_db) if args.main_db else None, scanned_at)
         conn.execute("INSERT OR REPLACE INTO scan_meta VALUES (?,?)", ("last_scan_id", scan_id))
         conn.execute("INSERT OR REPLACE INTO scan_meta VALUES (?,?)", ("last_scanned_at", scanned_at))
-        conn.execute("INSERT OR REPLACE INTO scan_meta VALUES (?,?)", ("last_xml_root", str(xml_dir)))
+        conn.execute("DELETE FROM scan_meta WHERE key = 'last_xml_root'")
+        conn.execute("INSERT OR REPLACE INTO scan_meta VALUES (?,?)", ("path_format", PATH_FORMAT))
+        conn.execute("INSERT OR REPLACE INTO scan_meta VALUES (?,?)", ("xml_root_setting", "IRS_XML_ROOT"))
         conn.commit()
 
         if args.report_csv:
@@ -660,7 +712,7 @@ def run(args: argparse.Namespace) -> Dict[str, int]:
             print(f"[report] wrote duplicate CSV rows: {count:,} -> {args.duplicates_csv}")
         conflict_stats: Dict[str, int] = {}
         if args.analyze_conflicts:
-            conflict_stats = analyze_conflicts(conn)
+            conflict_stats = analyze_conflicts(conn, xml_dir)
             print(f"[conflicts] canonicalized conflict files: {conflict_stats['conflict_files_canonicalized']:,}")
             print(f"[conflicts] canonical-equivalent object IDs: {conflict_stats['conflict_equivalent_groups']:,}")
             print(f"[conflicts] canonical-different object IDs: {conflict_stats['conflict_different_groups']:,}")
@@ -704,7 +756,11 @@ def run(args: argparse.Namespace) -> Dict[str, int]:
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Scan IRS XML source files into a sidecar manifest database.")
-    ap.add_argument("--xml-dir", default=str(DEFAULT_XML_DIR), help="Root directory containing IRS XML files.")
+    ap.add_argument(
+        "--xml-dir",
+        default=None,
+        help="Root directory containing IRS XML files. Defaults to IRS_XML_ROOT.",
+    )
     ap.add_argument("--sidecar-db", default=str(DEFAULT_SIDECAR_DB), help="SQLite sidecar DB to create/update.")
     ap.add_argument("--main-db", default=None, help="Optional production irs990.db for comparison with returns.")
     ap.add_argument("--report-csv", default=None, help="Optional full source audit CSV output path.")

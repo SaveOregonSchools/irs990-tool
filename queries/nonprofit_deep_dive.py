@@ -2,10 +2,10 @@ import html
 import os
 import sqlite3
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from common import connect_ro, normalize_eins
+from common import configured_xml_root, connect_ro, normalize_eins
 from queries import ngo_core_data, ngo_grants_in, ngo_grants_out
 
 
@@ -133,20 +133,59 @@ def _object_id_from_filing_id(filing_id: str) -> str:
     return value
 
 
+def _portable_relative_path(value: object) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    pure = PurePosixPath(text)
+    if not text or pure.is_absolute() or (pure.parts and pure.parts[0].endswith(":")):
+        raise ValueError(f"inventory path must be relative: {value}")
+    parts = [part for part in pure.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"invalid inventory relative path: {value}")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _path_key(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip("/").casefold()
+
+
+def _resolved_inventory_source(relative_path: object, legacy_source_file: object) -> Optional[Path]:
+    xml_root = configured_xml_root()
+    if xml_root:
+        try:
+            relative = _portable_relative_path(relative_path)
+            candidate = xml_root.joinpath(*PurePosixPath(relative).parts).resolve()
+            if (candidate == xml_root or xml_root in candidate.parents) and candidate.is_file():
+                return candidate
+        except ValueError:
+            return None
+        return None
+
+    # Backward compatibility for Windows sidecars created before IRS_XML_ROOT.
+    # Once a root is configured it is authoritative and absolute legacy paths
+    # are not allowed to bypass it.
+    legacy = Path(str(legacy_source_file or ""))
+    return legacy if legacy.is_file() else None
+
+
 def _preferred_inventory_source(rows, filing_id: str) -> Optional[Path]:
     candidates = []
     for row in rows:
-        source_path = Path(row[2])
-        quarantine_status = row[5]
-        if quarantine_status or not source_path.is_file():
+        relative_path = row[2]
+        source_path = _resolved_inventory_source(relative_path, row[3])
+        quarantine_status = row[6]
+        if quarantine_status or source_path is None or not source_path.is_file():
             continue
-        is_kept_source = bool(row[4]) and os.path.normcase(row[2]) == os.path.normcase(row[4])
+        source_key = _path_key(relative_path)
+        keep_key = _path_key(row[5])
+        is_kept_source = bool(keep_key) and (
+            source_key == keep_key or keep_key.endswith(f"/{source_key}")
+        )
         status_rank = {
             "unique": 0,
             "primary_duplicate_group": 0,
             "exact_duplicate": 1,
             "object_id_conflict": 2,
-        }.get(row[3], 3)
+        }.get(row[4], 3)
         candidates.append((
             0 if row[0] == filing_id else 1,
             0 if is_kept_source else 1,
@@ -191,8 +230,8 @@ def filing_xml_paths(form) -> List[Path]:
         for filing_id in filing_ids:
             rows = inventory.execute(
                 """
-                SELECT filing_id, object_id, source_file, duplicate_status,
-                       keep_source_file, quarantine_status
+                SELECT filing_id, object_id, relative_path, source_file,
+                       duplicate_status, keep_source_file, quarantine_status
                 FROM source_files
                 WHERE object_id = ?
                 ORDER BY source_file COLLATE NOCASE

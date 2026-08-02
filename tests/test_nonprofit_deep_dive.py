@@ -1,7 +1,9 @@
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from queries import ngo_core_data
 from queries import nonprofit_deep_dive as mod
@@ -234,6 +236,7 @@ class NonprofitDeepDiveTests(unittest.TestCase):
                 CREATE TABLE source_files (
                   filing_id TEXT,
                   object_id TEXT,
+                  relative_path TEXT,
                   source_file TEXT,
                   duplicate_status TEXT,
                   keep_source_file TEXT,
@@ -243,19 +246,34 @@ class NonprofitDeepDiveTests(unittest.TestCase):
                 """
             )
             inventory.executemany(
-                "INSERT INTO source_files VALUES (?,?,?,?,?,?)",
+                "INSERT INTO source_files VALUES (?,?,?,?,?,?,?)",
                 [
-                    ("F1", "F1", str(duplicate), "exact_duplicate", str(preferred), None),
-                    ("F1", "F1", str(preferred), "primary_duplicate_group", str(preferred), None),
+                    ("F1", "F1", "duplicate\\F1.xml", str(duplicate), "exact_duplicate", "preferred\\F1.xml", None),
+                    ("F1", "F1", "preferred\\F1.xml", str(preferred), "primary_duplicate_group", "preferred\\F1.xml", None),
                 ],
             )
             inventory.commit()
             inventory.close()
             mod.SOURCE_INVENTORY_DB_PATH = inventory_path
             try:
-                self.assertEqual(mod.filing_xml_paths({"ein": "11-1111111"}), [preferred])
+                with patch.dict(os.environ, {"IRS_XML_ROOT": str(root)}):
+                    self.assertEqual(mod.filing_xml_paths({"ein": "11-1111111"}), [preferred])
             finally:
                 mod.SOURCE_INVENTORY_DB_PATH = original_inventory
+
+    def test_inventory_path_rejects_parent_traversal(self):
+        with self.assertRaises(ValueError):
+            mod._portable_relative_path("../outside.xml")
+
+    def test_configured_root_does_not_fall_back_to_legacy_absolute_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            allowed = root / "allowed"
+            allowed.mkdir()
+            outside = root / "outside.xml"
+            outside.write_text("<outside/>", encoding="utf-8")
+            with patch.dict(os.environ, {"IRS_XML_ROOT": str(allowed)}):
+                self.assertIsNone(mod._resolved_inventory_source("../outside.xml", outside))
 
 
 if __name__ == "__main__":

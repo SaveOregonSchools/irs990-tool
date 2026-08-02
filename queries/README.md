@@ -37,6 +37,11 @@ def export_headers(form):
     return headers
 ```
 
+Modules can also declare UI capabilities such as `PDF_EXPORT`,
+`DOWNLOAD_FILINGS`, `HIDE_CSV_EXPORT`, `HIDE_PREVIEW_LIMIT`, and
+`EXPORTS_REQUIRE_RESULTS`. A filing-download module implements
+`filing_xml_paths(form)` and returns validated local `Path` objects.
+
 Use `export_headers()` when the CSV export should omit helper columns that are useful in the preview UI, such as a generated SQL column.
 
 ---
@@ -48,7 +53,7 @@ Use `export_headers()` when the CSV export should omit helper columns that are u
 | `ask_database.py` | Ask a plain-English database question, generate validated SQL, run a preview, or validate/run existing SQL. |
 | `filings_by_ein.py` | List canonical filings for one or more EINs. |
 | `fraud_risk_dashboard.py` | Single-EIN dashboard of explainable financial, governance, lobbying, grant, contractor, and related-organization indicators. |
-| `nonprofit_deep_dive.py` | Single-EIN profile with financial charts, yearly filing summaries, top grantors, and compensation. |
+| `nonprofit_deep_dive.py` | Single-EIN profile with financial charts, yearly filing summaries, top grantors, compensation, PDF output, and ZIP downloads of inventoried source XML. |
 | `ngo_core_data.py` | Return core organization, filing, financial, address, mission, tax-status, and indicator fields. |
 | `ngo_ein_by_name.py` | Find EINs from pasted organization names using deterministic normalized matching and optional fuzzy fallback. |
 | `ngo_grants_out.py` | List grants paid by filer/grantor organizations. |

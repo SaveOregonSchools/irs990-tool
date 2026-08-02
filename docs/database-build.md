@@ -18,11 +18,14 @@ Typical database location inside this repo:
 db/irs990.db
 ```
 
-A larger external database path is also fine:
+A larger external database path is also fine and is recommended for a server:
 
 ```text
-C:\Projects\irs990-tool\db\irs990.db
+/var/lib/irs990-tool/db/irs990.db
 ```
+
+The commands below use project-relative database paths and generic XML
+placeholders. Substitute absolute paths when data lives elsewhere.
 
 ---
 
@@ -48,7 +51,7 @@ This is a slim research schema, not a complete mirror of every XML element.
 A full rebuild deletes the existing database file if it already exists, then builds a new database from the XML directory.
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml
 ```
 
 Use a full rebuild when:
@@ -67,7 +70,7 @@ Without `--append` or `--keep-db`, the script removes the existing DB file befor
 Append mode preserves the existing database and loads only XML filings that are not already present.
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --append
 ```
 
 Use append mode when:
@@ -110,16 +113,24 @@ For a durable inventory of the XML files on disk, and to safely find duplicate
 files before appending or rebuilding, use the source manifest sidecar scanner.
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
-  --main-db db\irs990.db `
-  --report-csv exports\xml_source_audit.csv `
-  --duplicates-csv exports\xml_source_duplicates.csv
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --main-db db/irs990.db `
+  --report-csv exports/xml_source_audit.csv `
+  --duplicates-csv exports/xml_source_duplicates.csv
 ```
 
 The sidecar scanner rebuilds `db\irs990_sources.db` with one row per XML file,
 plus a copy of loaded filing IDs from `returns` when `--main-db` is supplied.
+It uses `IRS_XML_ROOT` unless `--xml-dir` overrides it. Inventory paths are
+stored relative to that root with forward slashes, so the sidecar can move
+between Windows and Linux. Existing absolute-path sidecars remain readable; the
+next scan replaces active rows with portable entries. The main database's
+historical `returns.source_file` values are retained as matching provenance.
+`source_files.relative_path` is authoritative. Legacy compatibility columns such
+as `source_file`, `keep_source_file`, and `quarantine_file` also contain relative
+values after a new scan; the old per-row `xml_root` column is left blank. The
+actual root exists only in `IRS_XML_ROOT` or the current `--xml-dir` argument.
 It hashes duplicate object-ID candidates by default and classifies them as:
 
 - `unique`: no other XML file has the same normalized object ID.
@@ -129,15 +140,31 @@ It hashes duplicate object-ID candidates by default and classifies them as:
 - `object_id_conflict`: same normalized object ID, but different or unknown file
   content. Review these manually.
 
+### Rescanning after a move
+
+Changing only the absolute archive location does not invalidate a portable
+inventory. If the relative tree is unchanged, update `IRS_XML_ROOT`; the same
+sidecar will resolve beneath the new Windows or Linux root. A scan on the new
+computer is nevertheless recommended to verify the transferred archive and to
+replace any legacy absolute-path entries.
+
+Rescan whenever files or directories are renamed or moved inside the XML root,
+or whenever XML files are added, removed, restored, or quarantined. Those changes
+alter the relative-path inventory. For a large archive, scan into a new sidecar
+filename and switch `IRS_XML_INVENTORY_PATH` after reviewing the results. This
+preserves the current inventory if the scan is interrupted.
+
+See [Moving an Existing Installation](migrating-data.md) for a safe
+Windows-to-Linux procedure, example commands, and a validation checklist.
+
 To move exact duplicates out of the XML tree after reviewing the report, use an
 explicit quarantine directory outside `--xml-dir`:
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
-  --duplicates-csv exports\xml_source_duplicates.csv `
-  --quarantine-duplicates C:\Projects\irsdb\xml_duplicates_quarantine `
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --duplicates-csv exports/xml_source_duplicates.csv `
+  --quarantine-duplicates C:/path/to/xml-duplicates-quarantine `
   --yes
 ```
 
@@ -148,11 +175,10 @@ After quarantine, rescan the XML folder so the sidecar reflects the files still
 in the active source tree:
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
-  --main-db db\irs990.db `
-  --duplicates-csv exports\xml_source_duplicates_after_quarantine.csv
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --main-db db/irs990.db `
+  --duplicates-csv exports/xml_source_duplicates_after_quarantine.csv
 ```
 
 To investigate `object_id_conflict` rows, ask the scanner to parse the conflicting
@@ -161,11 +187,10 @@ endings, and attribute order, so it can separate formatting-only differences fro
 real XML content differences:
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
   --analyze-conflicts `
-  --conflict-groups-csv exports\xml_source_conflict_groups.csv
+  --conflict-groups-csv exports/xml_source_conflict_groups.csv
 ```
 
 The conflict group CSV writes one row per conflicting object ID. Conflict groups
@@ -179,11 +204,10 @@ file whose relative path matches the source path recorded in `returns`, even if
 the XML root folder has moved:
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
-  --main-db db\irs990.db `
-  --conflict-resolution-csv exports\xml_source_conflict_resolution.csv
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --main-db db/irs990.db `
+  --conflict-resolution-csv exports/xml_source_conflict_resolution.csv
 ```
 
 Review the `recommended_action` column. Rows marked `keep` stay in the active
@@ -193,12 +217,11 @@ and rows marked `review` did not resolve to exactly one loaded source file.
 After reviewing the recommendation CSV, move only resolved extra conflict copies:
 
 ```powershell
-py scan_xml_sources.py `
-  --xml-dir C:\Projects\irsdb\xml `
-  --sidecar-db db\irs990_sources.db `
-  --main-db db\irs990.db `
-  --conflict-resolution-csv exports\xml_source_conflict_resolution.csv `
-  --quarantine-resolved-conflicts C:\Projects\irsdb\xml_conflicts `
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --main-db db/irs990.db `
+  --conflict-resolution-csv exports/xml_source_conflict_resolution.csv `
+  --quarantine-resolved-conflicts C:/path/to/xml-conflicts-quarantine `
   --yes
 ```
 
@@ -211,11 +234,11 @@ py scan_xml_sources.py `
 These are equivalent:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --append
 ```
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --keep-db
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --keep-db
 ```
 
 Prefer `--append` because it makes the intent clearer.
@@ -244,7 +267,7 @@ Use `--workers 1` for easier debugging.
 Preflight a new XML batch before appending:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --xml-dir C:\IRSDB\NewXML --preflight --workers 4 --preflight-report exports\preflight_summary.json --preflight-csv exports\preflight_files.csv
+python rebuild_irs990_slim_clean.py --xml-dir C:/path/to/new-xml --preflight --workers 4 --preflight-report exports/preflight_summary.json --preflight-csv exports/preflight_files.csv
 ```
 
 See [XML Preflight Guide](preflight.md) for how to review preflight output.
@@ -252,31 +275,31 @@ See [XML Preflight Guide](preflight.md) for how to review preflight output.
 Full clean rebuild:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml
 ```
 
 Full rebuild with fewer workers:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML --workers 4
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml --workers 4
 ```
 
 Append new XMLs:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --append
 ```
 
 Append with one worker for debugging:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append --workers 1
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --append --workers 1
 ```
 
 Full rebuild and compact afterward:
 
 ```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML --vacuum
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml --vacuum
 ```
 
 ---
@@ -438,7 +461,7 @@ After appending new filings, the script rebuilds `canonical_by_ein_year`. If a n
 The database build script does not refresh the Flask app's cached Database Statistics page. After a rebuild or append, run this if you want the web stats page to reflect the latest database contents:
 
 ```powershell
-py refresh_data_stats.py --db db\irs990.db
+python refresh_data_stats.py --db db/irs990.db
 ```
 
 The enhanced grant matching batch runs this refresh automatically after rebuilding the grant matching layer.

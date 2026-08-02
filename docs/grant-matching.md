@@ -17,9 +17,12 @@ Back up the database before running real write steps.
 | `batch_enhanced_grant_matches.bat` | Windows launcher for the full enhanced matching rebuild workflow. |
 | `batch_enhanced_grant_matches.ps1` | PowerShell implementation used by the launcher. |
 
-## Expected Layout
+## Expected layout and configuration
 
-Typical project folder:
+The workflow can use project-relative paths locally or absolute paths on a
+server. Keep the main database, work sidecar, and EO BMF inputs out of Git.
+
+Typical Windows project folder:
 
 ```text
 C:\Projects\irs990-tool
@@ -29,6 +32,14 @@ Typical database:
 
 ```text
 C:\Projects\irs990-tool\db\irs990.db
+```
+
+Typical Linux layout:
+
+```text
+/opt/irs990-tool
+/var/lib/irs990-tool/db/irs990.db
+/var/lib/irs990-tool/db/grant_matching_work.db
 ```
 
 Expected EO BMF files for the AI-assist identity layer:
@@ -45,14 +56,21 @@ Useful environment variables:
 ```text
 IRS_DB_PATH
 IRS_PROJECT_DIR
+IRS_GRANT_WORK_DB_PATH
 OLLAMA_ENDPOINTS
+OLLAMA_URL
 OLLAMA_MODEL
 OLLAMA_NUM_CTX
 OLLAMA_NUM_PREDICT
 OLLAMA_TIMEOUT
 ```
 
-## Database Objects
+Set `IRS_PROJECT_DIR`, `IRS_DB_PATH`, and `IRS_GRANT_WORK_DB_PATH` explicitly on
+Linux because legacy command defaults were originally Windows oriented.
+`OLLAMA_ENDPOINTS` is used by Ask Database; grant adjudication commands use
+`OLLAMA_URL` or their `--ollama-url` option.
+
+## Database objects
 
 The deterministic resolver creates or refreshes:
 
@@ -102,7 +120,7 @@ final_match_source
 final_confidence
 ```
 
-## Recommended Full Workflow
+## Recommended full workflow
 
 For the standard post-XML-load rebuild, run the launcher from the repo root:
 

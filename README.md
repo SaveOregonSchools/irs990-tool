@@ -1,341 +1,334 @@
-# IRS 990 Tool
+# IRS Form 990 Research Tool
 
-A local research tool for building, querying, and exporting data from IRS Form 990 e-file XML returns.
+A local research application for building, searching, analyzing, and exporting a
+slim SQLite database derived from IRS Form 990 e-file XML returns.
 
-The project has two main parts:
+The repository includes two related systems:
 
-1. **Database build/update tools** that turn IRS 990 XML filings into a slim local SQLite database.
-2. **A Flask research console** with a simple home page, prebuilt query modules, CSV exports, cached database statistics, and optional local Ollama support for validated SQL from plain-English questions.
+1. A Flask research console with purpose-built nonprofit, grant, people,
+   contractor, lobbying, related-organization, and risk-analysis modules.
+2. Data-maintenance tools for preflighting XML, building or appending the main
+   database, inventorying original XML files, and improving grant-recipient EIN
+   matching.
 
-The database itself is intentionally not stored in GitHub. Build it locally from XML files, or point the app at an existing `irs990.db` file.
+The database and XML collection are intentionally not stored in Git. You can
+build a database from XML or point the application at an existing `irs990.db`.
+SQLite database files are portable between Windows and Linux when copied from a
+clean, consistent snapshot.
 
----
+## Capabilities
 
-## License
+- Search organizations by EIN or normalized organization name.
+- Review multi-year organization, filing, financial, mission, and address data.
+- Explore grants paid, grants received, contractors, compensation, people,
+  Schedule R relationships, lobbying, and political activity.
+- Open single-EIN deep-dive and fraud/risk dashboards with HTML/PDF output.
+- Download a ZIP of the original XML filings shown in a nonprofit deep dive.
+- Ask plain-English questions through Ollama and review validated, read-only SQL.
+- Export full CSV results from supported modules.
+- View cached database and enhanced grant-matching statistics.
+- Preflight, rebuild, and safely append IRS XML batches.
+- Inventory source XML, detect duplicates/conflicts, and quarantine reviewed
+  duplicate files without changing the production database.
+- Run optional deterministic and AI-assisted grant-recipient resolution.
 
-IRS 990 Tool's software code is copyright (C) 2026 Save Oregon Schools, LLC and
-is licensed under the GNU Affero General Public License version 3. See
-[`LICENSE`](LICENSE) for the full license text.
-
-IRS 990 Tool is distributed without any warranty; without even the implied
-warranty of merchantability or fitness for a particular purpose.
-
-The Save Oregon Schools name, logo, and related branding are not licensed for
-reuse under the GNU Affero General Public License. See
-[`TRADEMARKS.md`](TRADEMARKS.md) for the project's trademark and branding
-notice.
-
----
-
-## What this tool is for
-
-This project is designed for nonprofit and public-records research where you need to answer questions such as:
-
-- What filings exist for a list of EINs?
-- What are an organization's revenues, expenses, assets, grants paid, government grants, lobbying indicators, and mission text across years?
-- Which organizations paid grants to a recipient?
-- Which organizations received grants from a funder?
-- Which contractors/vendors were paid by nonprofits?
-- Where does a person appear in officer, compensation, contractor, grant, signer, preparer, or Schedule L/J data?
-- What related organizations appear in Schedule R?
-- Can a plain-English database question be converted into safe SQLite for review or preview?
-
-The database is a **research-oriented slim schema**, not a complete one-table-per-XML-field mirror of every IRS form and schedule.
-
----
-
-## Repository map
-
-| Path | Purpose |
-|---|---|
-| `app.py` | Flask web app, home page, query-console shell, and cached statistics page. Auto-discovers and reloads query modules from `queries/`. |
-| `common.py` | Shared database path handling, read-only SQLite connection, and EIN normalization helpers. |
-| `queries/` | Prebuilt query modules used by the web console. See [`queries/README.md`](queries/README.md). |
-| `refresh_data_stats.py` | Refreshes cached database and grant-matching statistics shown by the web app's Database Statistics page. |
-| `static/` | Small web assets used by the Flask app, including the Save Oregon Schools logo. |
-| `ai/irs990_ai_schema.md` | Compact schema/prompt guide used by the Ask Database module. See [`ai/README.md`](ai/README.md). |
-| `config/ollama_complexity.example.json` | Optional example config for Ask Database complexity presets. See [`config/README.md`](config/README.md). |
-| `db/` | Local database folder. `db/irs990.db` is ignored by Git. See [`db/README.md`](db/README.md). |
-| `rebuild_irs990_slim_clean.py` | Builds or appends to the slim SQLite database from IRS XML files. |
-| `docs/database-build.md` | Detailed database rebuild, append, and validation guide. |
-| `docs/preflight.md` | XML preflight scan workflow for checking new XML batches before append. |
-| `resolve_grant_recipients.py` | Deterministic grant-recipient resolution workflow. |
-| `grant_ai_assist_v1.py` | Advanced grant-recipient candidate generation, rule decisions, Ollama adjudication, and final applied views. |
-| `migrate_grant_work_sidecar.py` | One-time migration utility for moving enhanced grant-matching working tables to `db/grant_matching_work.db`. |
-| `grant_ai_batch_worker.py` | Linux/Ollama batch worker for external grant-recipient adjudication packets. |
-| `docs/grant-matching.md` | Detailed enhanced grant matching, AI assist, and batch adjudication workflow. |
-| `.env.example` | Example local environment settings. Copy to `.env` if needed. |
-| `requirements.txt` | Python dependencies. |
-
----
+This is a research-oriented slim schema, not a complete mirror of every field in
+every IRS form and schedule.
 
 ## Requirements
 
-- Python 3.10+ recommended
-- SQLite
-- IRS 990 e-file XML files, if building the database locally
-- Optional: Ollama running locally or on a reachable server for Ask Database and grant-recipient AI adjudication
+- Python 3.10 or newer
+- SQLite support in Python
+- An existing `irs990.db`, or IRS e-file XML files from which to build one
+- Optional: the original XML collection for filing downloads and future updates
+- Optional: Ollama for Ask Database and AI-assisted grant matching
 
-Python package dependencies are listed in `requirements.txt`.
+Python dependencies are in `requirements.txt`. Development and test dependencies
+are in `requirements-dev.txt`.
 
----
+## Install
 
-## Quick start
+Clone the repository and create a fresh virtual environment. Do not copy a
+virtual environment between Windows and Linux.
 
-From the project folder:
+Windows PowerShell:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-Place the SQLite database at:
+Linux/macOS:
 
-```text
-db/irs990.db
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Or set a custom path:
-
-```powershell
-$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
-```
-
-Then start the web app:
-
-```powershell
-py app.py
-```
-
-Open the local Flask URL shown in the console, usually:
-
-```text
-http://127.0.0.1:5000
-```
-
-The root URL opens a home page with grouped buttons for the most common modules and supporting tools. Query modules auto-load when selected from the dropdown, and the app auto-detects added or edited files in `queries/` on the next request.
-
----
-
-## Building the database
-
-For a full rebuild from a folder of IRS XML files:
-
-```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML
-```
-
-For adding new XML files to an existing database:
-
-```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
-```
-
-Append mode preserves the existing database and skips XML filings already present by filing ID / normalized object ID. After loading, it rebuilds `canonical_by_ein_year`, recreates views, creates indexes, and runs SQLite optimization.
-
-Before appending unfamiliar XML batches, run a preflight scan:
-
-```powershell
-py rebuild_irs990_slim_clean.py --xml-dir C:\IRSDB\NewXML --preflight --workers 4 --preflight-report exports\preflight_summary.json --preflight-csv exports\preflight_files.csv
-```
-
-To inventory source XML locations and review duplicate files under the long-term
-XML folder:
-
-```powershell
-py scan_xml_sources.py --xml-dir C:\Projects\irsdb\xml --sidecar-db db\irs990_sources.db --main-db db\irs990.db --report-csv exports\xml_source_audit.csv --duplicates-csv exports\xml_source_duplicates.csv
-```
-
-See [`docs/database-build.md`](docs/database-build.md) for the full rebuild/append guide, flags, validation queries, and caveats. See [`docs/preflight.md`](docs/preflight.md) for preflight scan details.
-
----
-
-## Query console
-
-The web app opens to a home page with grouped module buttons. Query pages also include a dropdown for switching modules. The selected module loads automatically when the dropdown changes.
-
-The app discovers modules in `queries/`. Each module provides its own form fields, SQL logic, result headers, and CSV export behavior. Module files are reloaded automatically when their `.py` file modification times change, so a running development server usually picks up added or edited query modules on the next page request.
-
-Current query families include:
-
-| Query module | What it does |
-|---|---|
-| `ask_database.py` | Generates and/or runs validated SQLite from a plain-English question. Also supports validating and running pasted SQL. |
-| `filings_by_ein.py` | Lists filings for one or more EINs. |
-| `ngo_core_data.py` | Core organization/financial data by EIN, state, and year range. |
-| `ngo_ein_by_name.py` | Finds EINs from organization names using deterministic matching and optional fuzzy fallback. |
-| `ngo_grants_out.py` | Grants paid by filers/grantors. |
-| `ngo_grants_in.py` | Grants received by recipient EINs. |
-| `ngo_grants_io.py` | Combined grants paid/received workflow. |
-| `ngo_contractors_out.py` | Contractors/vendors reported by filers. |
-| `ngo_related_orgs_sched_r.py` | Related organizations from Schedule R. |
-| `people_lookup.py` | Finds where a person appears across supported tables/views. |
-
-See [`queries/README.md`](queries/README.md) for the plugin interface and development notes.
-
----
-
-## Database Statistics page
-
-The home page includes **Database Statistics**, which reads cached rows from:
-
-```text
-app_data_stats
-app_data_stats_meta
-```
-
-Refresh the cache manually with:
-
-```powershell
-py refresh_data_stats.py --db db\irs990.db
-```
-
-The standard enhanced grant matching batch also refreshes the stats cache after rebuilding grant matching data:
-
-```powershell
-.\batch_enhanced_grant_matches.bat
-```
-
-The stats page intentionally reads cached rows so opening it does not run expensive full-database summaries.
-
----
-
-## Ask Database / Ollama
-
-The Ask Database module uses:
-
-- `queries/ask_database.py`
-- `ai/irs990_ai_schema.md`
-- optional settings from `.env`
-- optional complexity presets from a JSON file such as `config/ollama_complexity.json`
-
-Common `.env` settings:
+Edit `.env` for the machine. At minimum, identify the main database. Configure
+the XML settings if you want source-file inventory or filing downloads:
 
 ```text
 IRS_DB_PATH=db/irs990.db
-OLLAMA_ENDPOINTS=http://localhost:11434/api/chat
-OLLAMA_MODEL=qwen3.5:9b
-OLLAMA_COMPLEXITY_CONFIG=config/ollama_complexity.json
+IRS_XML_ROOT=C:/Projects/IRSDB/XML
+IRS_XML_INVENTORY_PATH=db/irs990_sources.db
 ```
 
-Ask Database is intentionally conservative. Generated SQL must be read-only, use approved tables/views, and include a numeric `LIMIT`. The SQL is shown in the UI so it can be reviewed before relying on the output.
+Linux example:
 
-See [`ai/README.md`](ai/README.md) and [`config/README.md`](config/README.md).
+```text
+IRS_DB_PATH=/var/lib/irs990-tool/db/irs990.db
+IRS_XML_ROOT=/srv/irs990-data/xml
+IRS_XML_INVENTORY_PATH=/var/lib/irs990-tool/db/irs990_sources.db
+```
 
----
+Forward slashes are accepted on Windows and make configuration easier to move
+between operating systems.
 
-## Grant-recipient resolution and AI assist
+Place an existing database at `db/irs990.db`, or use any other location through
+`IRS_DB_PATH`. The app opens the main database read-only.
 
-The raw IRS grant rows often include recipient names and addresses, but not always reliable recipient EINs. This repo includes an advanced workflow to resolve grant recipients more accurately:
+## Configuration
 
-1. `resolve_grant_recipients.py` creates a deterministic first-pass resolution table.
-2. `grant_ai_assist_v1.py` builds identity tables, recipient signatures, candidate matches, rule-based decisions, optional Ollama adjudications, and final applied views.
-3. The final enhanced layer can be used by grant-received workflows when you want matched recipient EINs beyond the raw reported EIN field.
-4. `refresh_data_stats.py` can summarize the resulting database and matching pipeline for the web app's Database Statistics page.
+| Setting | Purpose | Default |
+|---|---|---|
+| `IRS_DB_PATH` | Main application SQLite database. | `db/irs990.db` |
+| `IRS_XML_ROOT` | Machine-local root of the original XML tree. | None |
+| `IRS_XML_INVENTORY_PATH` | XML source inventory sidecar. | `db/irs990_sources.db` |
+| `IRS_PROJECT_DIR` | Project/EO-BMF root used by grant-matching tools. | Project-specific |
+| `IRS_GRANT_WORK_DB_PATH` | Bulky grant-matching work sidecar. | Beside the main DB |
+| `OLLAMA_ENDPOINTS` | Comma-separated Ask Database `/api/chat` endpoints. | Local Ollama |
+| `OLLAMA_URL` | Ollama endpoint used by grant adjudication commands. | Local Ollama |
+| `OLLAMA_MODEL` | Installed Ollama model name. | Workflow-specific |
+| `OLLAMA_COMPLEXITY_CONFIG` | Optional Ask Database preset JSON. | Built-in presets |
 
-Bulky working tables live in `db\grant_matching_work.db` by default, or the path in `IRS_GRANT_WORK_DB_PATH`. Final decisions, applied grant rows, and the final enhanced view stay in `db\irs990.db` so the Flask app and query modules continue to use a single main database. Back up the database before running the workflow or migration.
+`common.py` loads `.env` before resolving application paths. Process-level
+environment variables take precedence over values in `.env`.
 
-For the standard post-XML-load enhanced grant rebuild, run:
+## Run the web app
+
+For local use and development:
+
+```powershell
+python app.py
+```
+
+Windows users can also run `Launch IRS 990 Tool.ps1`. Open the URL printed in the
+terminal, normally `http://127.0.0.1:5000`.
+
+`python app.py` starts Flask's development server. A shared Linux deployment
+should import `app:app` through a production WSGI server and place it behind the
+same private proxy, VPN, or authentication layer used for other internal tools.
+The application does not currently provide its own user authentication.
+
+## Original XML and the source inventory
+
+`IRS_XML_ROOT` is deliberately machine-specific. The inventory stores portable
+forward-slash relative paths, so the same sidecar can resolve files beneath a
+Windows or Linux root without rewriting millions of rows.
+
+Create or refresh the inventory:
+
+```powershell
+python scan_xml_sources.py `
+  --sidecar-db db/irs990_sources.db `
+  --main-db db/irs990.db `
+  --report-csv exports/xml_source_audit.csv `
+  --duplicates-csv exports/xml_source_duplicates.csv
+```
+
+The scanner uses `IRS_XML_ROOT`; `--xml-dir` can override it for one run. A scan
+rebuilds the sidecar's source and loaded-filing rows. Newly written entries use
+portable relative paths only. Existing sidecars containing absolute Windows
+paths remain readable, and the next scan converts their active entries to the
+portable format.
+
+The Nonprofit Deep Dive module uses `IRS_XML_ROOT` plus the stored relative path
+when producing a filing ZIP. Historical `returns.source_file` strings in the main
+database remain provenance and do not need to identify a currently mounted path.
+
+If only the absolute XML root changes and the directory tree beneath it stays
+the same, updating `IRS_XML_ROOT` is sufficient. A new scan is recommended after
+moving the archive to another computer and is required after renaming or moving
+files or directories inside the root. Build a replacement sidecar under a new
+filename, validate it, and then switch `IRS_XML_INVENTORY_PATH` so an interrupted
+large scan cannot replace the current inventory.
+
+See the [Data Migration Guide](docs/migrating-data.md) for the Windows-to-Linux
+procedure and the [Database Build Guide](docs/database-build.md) for duplicate
+classification, conflict analysis, quarantine safeguards, and inventory reports.
+
+## Build or update the database
+
+The build script requires an explicit XML directory. You can pass the configured
+root from the shell.
+
+Windows PowerShell, full rebuild:
+
+```powershell
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml
+```
+
+Linux, full rebuild:
+
+```bash
+python rebuild_irs990_slim_clean.py --db /var/lib/irs990-tool/db/irs990.db --xml-dir /srv/irs990-data/xml
+```
+
+Preflight a new batch before appending it:
+
+```powershell
+python rebuild_irs990_slim_clean.py `
+  --xml-dir C:/path/to/new-xml `
+  --preflight `
+  --workers 4 `
+  --preflight-report exports/preflight_summary.json `
+  --preflight-csv exports/preflight_files.csv
+```
+
+Append the reviewed batch:
+
+```powershell
+python rebuild_irs990_slim_clean.py `
+  --db db/irs990.db `
+  --xml-dir C:/path/to/new-xml `
+  --append
+```
+
+Append mode preserves existing data, skips existing filing/object IDs, rebuilds
+canonical filing selections and views, creates indexes, and runs SQLite
+optimization. It does not re-extract an already-loaded filing.
+
+After a build or append, refresh the cached statistics page:
+
+```powershell
+python refresh_data_stats.py --db db/irs990.db
+```
+
+See [XML Preflight Guide](docs/preflight.md) and
+[Database Build Guide](docs/database-build.md) before modifying a production
+database.
+
+## Research modules
+
+| Module | Primary use |
+|---|---|
+| Ask Database | Generate, inspect, validate, and optionally run read-only SQLite from a plain-English question. |
+| Core Data Lookup | Organization, filing, financial, address, mission, status, and indicator data. |
+| Find EINs by Organization Name | Deterministic normalized-name matching with optional fuzzy fallback. |
+| Grants Paid / Received / Paid-Received | Research grantor and recipient relationships and export results. |
+| Nonprofit Deep Dive | Single-EIN trends, yearly summaries, top grantors, compensation, PDF output, and original filing downloads. |
+| Fraud & Risk Indicators | Explainable financial, governance, lobbying, grant, contractor, and related-organization indicators. |
+| Contractors | Contractor/vendor compensation reported by filers. |
+| Find Filings by Person Name | Search officers, employees, contractors, grant recipients, preparers, signers, and supported schedules. |
+| Lobbying & Political Activity | Schedule C, political campaign, 527, dues/proxy-tax, and 990-PF indicators. |
+| Schedule R: Related Organizations | Related organizations and supported transaction fields. |
+| Filings by EIN(s) | Basic canonical filing availability. |
+| Database Statistics | Cached coverage and enhanced grant-matching summaries. |
+
+Query modules are discovered from `queries/` and reloaded when their files
+change. See [Query Module Guide](queries/README.md) for the plugin contract.
+
+## Ask Database and Ollama
+
+Ask Database uses `queries/ask_database.py`, `ai/irs990_ai_schema.md`, and the
+configured Ollama endpoint/model. Generated SQL must:
+
+- start with `SELECT` or `WITH`;
+- use approved tables and views;
+- avoid forbidden write/admin keywords;
+- use approved qualified columns; and
+- include a numeric `LIMIT`.
+
+The SQL is displayed for review. See [AI Schema Guide](ai/README.md) and
+[Ollama Configuration](config/README.md).
+
+## Enhanced grant-recipient matching
+
+The optional grant workflow combines deterministic resolution, EO BMF identity
+data, candidate generation, rule decisions, optional Ollama adjudication, and a
+final applied view.
+
+Bulky working tables live in `grant_matching_work.db`; final decisions and
+application-facing views remain in `irs990.db`. The standard Windows workflow is:
 
 ```powershell
 .\batch_enhanced_grant_matches.bat
 ```
 
-See [`docs/grant-matching.md`](docs/grant-matching.md).
+Back up the database and read [Enhanced Grant Matching Guide](docs/grant-matching.md)
+before running the workflow. It can take many hours.
 
----
+## Local data files
 
-## Data and Git hygiene
+| Artifact | Required to run queries? | Notes |
+|---|---:|---|
+| `irs990.db` | Yes | Main application data and final enhanced grant results. |
+| `irs990_sources.db` | Only for XML downloads | Regenerable inventory of the original XML tree. |
+| Original XML tree | Only for XML downloads/updates | Keep outside Git; configure with `IRS_XML_ROOT`. |
+| `grant_matching_work.db` | No | Preserve to continue enhanced matching without rebuilding working tables. |
+| `eo-bmf/` | No | Required when rebuilding the enhanced identity layer. |
+| `exports/`, `imports/`, `adj/` | No | Reports, packets, decisions, and audit artifacts. |
 
-The repo is intended to track code and documentation only.
+Never commit databases, XML archives, WAL/SHM files, EO BMF CSVs, exports, model
+decision packets, logs, or `.env`. See [Database Folder Notes](db/README.md).
 
-Do **not** commit:
+## Development and tests
 
-- `db/irs990.db`
-- SQLite WAL/SHM files
-- large XML datasets
-- EO BMF CSVs
-- exports, cache files, logs, or local adjudication packets
-- `.env`
+Install development dependencies and run the fixture-based suite:
 
-The tracked `static/save-oregon-schools-logo.png` file is a small app asset and is safe to commit.
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
 
-The `.gitignore` is set up for the normal local database and output folders, but always check `git status` before committing.
-
----
-
-## Typical workflows
-
-### Run a known query
-
-1. Start `py app.py`.
-2. Open `http://127.0.0.1:5000`.
-3. Choose a module from the home page or select one from the query-page dropdown.
-4. Enter EINs, organization names, state/year filters, or other module-specific inputs.
-5. Click **Run Query** for a preview.
-6. Click **Export CSV** for the full module export.
-
-### Add a new query module
-
-1. Add a `.py` file under `queries/`.
-2. Define `META`, `render_fields(form)`, `run(form)`, and `export_rows(form)`.
-3. Use `common.connect_ro()` for read-only database access.
-4. Use parameterized SQL rather than string-inserting user input.
-5. Start the app if it is not already running. If it is running, refresh the page; query files are auto-detected on the next request.
-
-### Add new IRS XML filings
-
-1. Put the new XMLs in a separate folder.
-2. Run `rebuild_irs990_slim_clean.py --append` against that folder.
-3. Check the selected/skipped load summary.
-4. Run validation queries or spot-check known filings.
-5. Restart the app if needed.
-
----
+Tests use small temporary or in-memory SQLite databases; they do not require the
+production database.
 
 ## Troubleshooting
 
-### Database not found
+- **Database not found:** verify `IRS_DB_PATH` or place the file at
+  `db/irs990.db`.
+- **Original XML download unavailable:** configure `IRS_XML_ROOT`, confirm the
+  XML tree preserves its inventoried hierarchy, and refresh `irs990_sources.db`.
+- **Module missing:** check the Flask terminal for an import error and confirm
+  the file under `queries/` implements the plugin contract.
+- **Statistics page empty/stale:** run `refresh_data_stats.py` after builds or
+  matching changes.
+- **Ollama unavailable:** verify the endpoint and installed model, then try a
+  smaller Ask Database complexity preset.
+- **Large export:** narrow the state, year, EIN, amount, or max-row filters.
 
-Use the default layout:
+## Repository and documentation map
 
-```text
-db/irs990.db
-```
+| Path | Purpose |
+|---|---|
+| `app.py` | Flask application, page shell, exports, statistics, and filing ZIP downloads. |
+| `common.py` | Environment loading, data paths, read-only SQLite connections, and EIN normalization. |
+| `queries/` | Research modules and plugin documentation. |
+| `rebuild_irs990_slim_clean.py` | Full database rebuild, append, and preflight entry point. |
+| `scan_xml_sources.py` | Portable XML inventory, duplicate/conflict analysis, and quarantine workflow. |
+| `refresh_data_stats.py` | Cached web statistics refresh. |
+| `resolve_grant_recipients.py` | Deterministic grant-recipient resolution. |
+| `grant_ai_assist_v1.py` | Enhanced identity, candidates, decisions, adjudication, and final views. |
+| `migrate_grant_work_sidecar.py` | Moves bulky matching work tables out of the main database. |
+| `docs/migrating-data.md` | Existing-database, XML archive, and sidecar migration between computers. |
+| `docs/database-build.md` | Build, append, inventory, validation, and caveats. |
+| `docs/preflight.md` | XML batch preflight and report interpretation. |
+| `docs/grant-matching.md` | Enhanced grant matching and adjudication. |
+| `queries/README.md` | Query plugin contract and current modules. |
+| `config/README.md` | Ollama complexity configuration. |
+| `db/README.md` | Database placement, backup, and local-file hygiene. |
 
-Or set `IRS_DB_PATH` to the full database path.
+## License and trademarks
 
-### Query module does not show up
+Copyright (C) 2026 Save Oregon Schools, LLC. The software is licensed under the
+GNU Affero General Public License version 3; see [LICENSE](LICENSE). It is
+distributed without warranty.
 
-Check that the module is in `queries/`, does not start with `_`, and defines all required plugin functions. Refresh the page to trigger plugin auto-detection. If an import error occurs, it will be printed in the Flask console.
-
-### Database Statistics page is empty
-
-Run the stats refresh script:
-
-```powershell
-py refresh_data_stats.py --db db\irs990.db
-```
-
-The enhanced grant matching batch also refreshes these cached stats as part of its normal workflow.
-
-### Ask Database cannot reach Ollama
-
-Confirm `OLLAMA_ENDPOINTS` points to a reachable `/api/chat` endpoint and that `OLLAMA_MODEL` names an installed model. Try a smaller query complexity setting if generation times out.
-
-### CSV export looks large
-
-Several modules can return very large result sets. Use state, year, EIN, amount, or max-row filters where available before exporting.
-
----
-
-## Documentation index
-
-- [`docs/database-build.md`](docs/database-build.md) - database build/append guide
-- [`docs/preflight.md`](docs/preflight.md) - XML preflight scan guide
-- [`docs/grant-matching.md`](docs/grant-matching.md) - enhanced grant matching, AI assist, and batch adjudication guide
-- [`queries/README.md`](queries/README.md) - query module guide
-- [`ai/README.md`](ai/README.md) - Ask Database schema guide notes
-- [`config/README.md`](config/README.md) - Ollama complexity config notes
-- [`db/README.md`](db/README.md) - local database folder notes
+The Save Oregon Schools name, logo, and related branding are not licensed for
+reuse under the AGPL. See [TRADEMARKS.md](TRADEMARKS.md).
