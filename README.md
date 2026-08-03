@@ -101,6 +101,7 @@ Place an existing database at `db/irs990.db`, or use any other location through
 | `IRS_XML_INVENTORY_PATH` | XML source inventory sidecar. | `db/irs990_sources.db` |
 | `IRS_PROJECT_DIR` | Project/EO-BMF root used by grant-matching tools. | Project-specific |
 | `IRS_GRANT_WORK_DB_PATH` | Bulky grant-matching work sidecar. | Beside the main DB |
+| `TOOLBOX_HOME_URL` | Optional parent launcher URL shown as an **All tools** header link. | Hidden |
 | `OLLAMA_ENDPOINTS` | Comma-separated Ask Database `/api/chat` endpoints. | Local Ollama |
 | `OLLAMA_URL` | Ollama endpoint used by grant adjudication commands. | Local Ollama |
 | `OLLAMA_MODEL` | Installed Ollama model name. | Workflow-specific |
