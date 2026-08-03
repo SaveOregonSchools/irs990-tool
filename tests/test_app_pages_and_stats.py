@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -5,6 +6,7 @@ import zipfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import app as app_module
 import refresh_data_stats
@@ -213,6 +215,17 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertNotIn("Select the module to open", body)
         self.assertNotIn("Choose a research module", body)
         self.assertNotIn("Preview row limit", body)
+
+    def test_toolbox_home_link_is_opt_in(self):
+        client = app_module.app.test_client()
+
+        with patch.dict(os.environ, {"TOOLBOX_HOME_URL": ""}):
+            body = client.get("/").get_data(as_text=True)
+        self.assertNotIn('class="toolbox-link"', body)
+
+        with patch.dict(os.environ, {"TOOLBOX_HOME_URL": "/"}):
+            body = client.get("/").get_data(as_text=True)
+        self.assertIn('class="toolbox-link" href="/">All tools</a>', body)
 
     def test_query_page_has_home_link_and_runs_selected_module(self):
         client = app_module.app.test_client()

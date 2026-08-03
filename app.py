@@ -112,6 +112,23 @@ BASE_CSS = """
   }
   .home-link:hover { background: var(--panel); }
   .home-link svg { width: 20px; height: 20px; }
+  .header-actions { display: flex; gap: 10px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+  .toolbox-link {
+    display: inline-flex;
+    min-height: 34px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: var(--primary-dark);
+    background: #fff;
+    font-size: 14px;
+    font-weight: 650;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .toolbox-link:hover { background: var(--panel); }
   .brand-logo { width: 118px; height: auto; flex: 0 0 auto; }
   .footer {
     margin-top: 32px;
@@ -277,9 +294,12 @@ LAYOUT_START = """
     <a class="home-link" href="{{ url_for('home') }}" aria-label="Home">{{ home_icon | safe }}</a>
     <h1>IRS 990 - Query Console</h1>
   </div>
-  <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
-    <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
-  </a>
+  <div class="header-actions">
+    {% if toolbox_home_url %}<a class="toolbox-link" href="{{ toolbox_home_url }}">All tools</a>{% endif %}
+    <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
+      <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
+    </a>
+  </div>
 </header>
 <main>
 """
@@ -613,6 +633,7 @@ def _template_context(**extra):
     ctx = {
         "css": BASE_CSS,
         "home_icon": HOME_ICON,
+        "toolbox_home_url": os.environ.get("TOOLBOX_HOME_URL", "").strip() or None,
         "year": datetime.now().year,
     }
     ctx.update(extra)
