@@ -1,8 +1,11 @@
 import html
+import os
+import sqlite3
 from collections import defaultdict
+from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from common import connect_ro, normalize_eins
+from common import configured_xml_root, connect_ro, normalize_eins
 from queries import ngo_core_data, ngo_grants_in, ngo_grants_out
 
 
@@ -39,7 +42,13 @@ HIDE_PREVIEW_LIMIT = True
 HIDE_CSV_EXPORT = True
 DISABLE_ROW_LIMIT = True
 PDF_EXPORT = True
+DOWNLOAD_FILINGS = True
+EXPORTS_REQUIRE_RESULTS = True
 RUN_BUTTON_LABEL = "Open EIN"
+
+SOURCE_INVENTORY_DB_PATH = Path(
+    os.getenv("IRS_XML_INVENTORY_PATH", Path(__file__).resolve().parents[1] / "db" / "irs990_sources.db")
+).expanduser().resolve()
 
 
 _LAST_KEY = None
@@ -113,6 +122,137 @@ def _parse_ein(form) -> Optional[str]:
     if len(values) != 1:
         return None
     return values[0]
+
+
+def _object_id_from_filing_id(filing_id: str) -> str:
+    value = (filing_id or "").strip()
+    lower = value.lower()
+    for suffix in ("_public", "_private"):
+        if lower.endswith(suffix):
+            return value[:-len(suffix)]
+    return value
+
+
+def _portable_relative_path(value: object) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    pure = PurePosixPath(text)
+    if not text or pure.is_absolute() or (pure.parts and pure.parts[0].endswith(":")):
+        raise ValueError(f"inventory path must be relative: {value}")
+    parts = [part for part in pure.parts if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise ValueError(f"invalid inventory relative path: {value}")
+    return PurePosixPath(*parts).as_posix()
+
+
+def _path_key(value: object) -> str:
+    return str(value or "").replace("\\", "/").strip("/").casefold()
+
+
+def _resolved_inventory_source(relative_path: object, legacy_source_file: object) -> Optional[Path]:
+    xml_root = configured_xml_root()
+    if xml_root:
+        try:
+            relative = _portable_relative_path(relative_path)
+            candidate = xml_root.joinpath(*PurePosixPath(relative).parts).resolve()
+            if (candidate == xml_root or xml_root in candidate.parents) and candidate.is_file():
+                return candidate
+        except ValueError:
+            return None
+        return None
+
+    # Backward compatibility for Windows sidecars created before IRS_XML_ROOT.
+    # Once a root is configured it is authoritative and absolute legacy paths
+    # are not allowed to bypass it.
+    legacy = Path(str(legacy_source_file or ""))
+    return legacy if legacy.is_file() else None
+
+
+def _preferred_inventory_source(rows, filing_id: str) -> Optional[Path]:
+    candidates = []
+    for row in rows:
+        relative_path = row[2]
+        source_path = _resolved_inventory_source(relative_path, row[3])
+        quarantine_status = row[6]
+        if quarantine_status or source_path is None or not source_path.is_file():
+            continue
+        source_key = _path_key(relative_path)
+        keep_key = _path_key(row[5])
+        is_kept_source = bool(keep_key) and (
+            source_key == keep_key or keep_key.endswith(f"/{source_key}")
+        )
+        status_rank = {
+            "unique": 0,
+            "primary_duplicate_group": 0,
+            "exact_duplicate": 1,
+            "object_id_conflict": 2,
+        }.get(row[4], 3)
+        candidates.append((
+            0 if row[0] == filing_id else 1,
+            0 if is_kept_source else 1,
+            status_rank,
+            len(source_path.parts),
+            str(source_path).casefold(),
+            source_path,
+        ))
+    return min(candidates)[-1] if candidates else None
+
+
+def filing_xml_paths(form) -> List[Path]:
+    """Return one inventoried XML source for every filing displayed by this report."""
+    ein = _parse_ein(form)
+    if not ein:
+        raise ValueError("Open exactly one valid EIN before downloading filings.")
+    if not SOURCE_INVENTORY_DB_PATH.is_file():
+        raise FileNotFoundError(f"XML source inventory not found: {SOURCE_INVENTORY_DB_PATH}")
+
+    main_conn = connect_ro()
+    filing_ids = [
+        row[0]
+        for row in main_conn.execute(
+            """
+            SELECT filing_id
+            FROM canonical_by_ein_year
+            WHERE ein = ?
+            ORDER BY tax_year DESC, filing_id
+            """,
+            [ein],
+        )
+        if row[0]
+    ]
+    if not filing_ids:
+        raise FileNotFoundError(f"No displayed tax filings were found for EIN {ein}.")
+
+    inventory_uri = f"file:{SOURCE_INVENTORY_DB_PATH.as_posix()}?mode=ro&immutable=1"
+    inventory = sqlite3.connect(inventory_uri, uri=True)
+    try:
+        selected = []
+        missing = []
+        for filing_id in filing_ids:
+            rows = inventory.execute(
+                """
+                SELECT filing_id, object_id, relative_path, source_file,
+                       duplicate_status, keep_source_file, quarantine_status
+                FROM source_files
+                WHERE object_id = ?
+                ORDER BY source_file COLLATE NOCASE
+                """,
+                [_object_id_from_filing_id(filing_id)],
+            ).fetchall()
+            source_path = _preferred_inventory_source(rows, filing_id)
+            if source_path is None:
+                missing.append(filing_id)
+            else:
+                selected.append(source_path)
+    finally:
+        inventory.close()
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+        raise FileNotFoundError(
+            f"Original XML files could not be located for displayed filing(s): {preview}{more}."
+        )
+    return selected
 
 
 def _object_exists(conn, name: str) -> bool:

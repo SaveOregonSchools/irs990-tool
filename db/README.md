@@ -1,108 +1,92 @@
-# Database folder
+# Local database files
 
-This folder is the default location for the local IRS 990 SQLite database:
+The default main database location is:
 
 ```text
 db/irs990.db
 ```
 
-The database file is intentionally not tracked in GitHub.
+`common.py` loads `.env` and then uses `IRS_DB_PATH` when it is set. An absolute
+path is recommended on a server; the project-relative default is convenient for
+local use.
 
----
+Related local databases may include:
 
-## Default behavior
+| File | Purpose |
+|---|---|
+| `irs990.db` | Main application database and final enhanced grant results. |
+| `irs990_sources.db` | Regenerable original-XML inventory used for filing downloads. |
+| `grant_matching_work.db` | Bulky enhanced grant-matching workspace. |
 
-By default, `common.py` looks for the database at:
+All are ignored by Git.
+
+## Configuration
+
+Example `.env` values:
 
 ```text
-<project-root>/db/irs990.db
+IRS_DB_PATH=db/irs990.db
+IRS_XML_INVENTORY_PATH=db/irs990_sources.db
+IRS_GRANT_WORK_DB_PATH=db/grant_matching_work.db
 ```
 
-To use a database somewhere else, set `IRS_DB_PATH`.
+The original XML tree is configured separately with `IRS_XML_ROOT`; it does not
+need to be stored inside the repository.
 
-PowerShell:
+## Create or update data
+
+Full rebuild using the configured XML root in PowerShell:
 
 ```powershell
-$env:IRS_DB_PATH = "C:\Projects\irs990-tool\db\irs990.db"
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml
 ```
 
-Windows CMD:
+Append a reviewed XML batch:
 
-```bat
-set IRS_DB_PATH=C:\Projects\irs990-tool\db\irs990.db
+```powershell
+python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/new-xml --append
 ```
 
----
+Refresh the source inventory:
 
-## Files that should stay local
+```powershell
+python scan_xml_sources.py --sidecar-db db/irs990_sources.db --main-db db/irs990.db
+```
 
-Do not commit these files:
+See [Database Build Guide](../docs/database-build.md) before writing to the main
+database or quarantining source XML.
+
+## Cached web statistics
+
+The Database Statistics page reads cached rows from `app_data_stats` and
+`app_data_stats_meta`. Refresh them after a build, append, or matching change:
+
+```powershell
+python refresh_data_stats.py --db db/irs990.db
+```
+
+The standard enhanced grant-matching workflow performs this refresh
+automatically.
+
+## Backups and SQLite side files
+
+Before rebuilds, appends, migrations, or matching workflows, stop active writers
+and create a consistent backup. With the SQLite shell:
+
+```powershell
+sqlite3 db/irs990.db ".backup db/irs990_backup_YYYYMMDD.db"
+```
+
+A closed, checkpointed database can also be copied directly. Do not treat
+`-wal` or `-shm` files as standalone backups, and do not copy an actively
+changing database without SQLite's backup mechanism.
+
+Keep these local and out of Git:
 
 ```text
-irs990.db
-irs990.db-shm
-irs990.db-wal
 *.db
-*.db-shm
 *.db-wal
+*.db-shm
 *.db.sql
+backup/
 ```
-
-Large database files, WAL files, exports, logs, and schema dumps should remain local unless you intentionally publish a separate release artifact somewhere outside the repo.
-
----
-
-## Creating or updating the database
-
-Full rebuild:
-
-```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\XML
-```
-
-Append new XMLs:
-
-```powershell
-py rebuild_irs990_slim_clean.py --db db\irs990.db --xml-dir C:\IRSDB\NewXML --append
-```
-
-See [`../docs/database-build.md`](../docs/database-build.md) for details.
-
----
-
-## Web app statistics cache
-
-The Flask app's **Database Statistics** page reads cached summary rows from the local SQLite database instead of running expensive summaries each time the page opens.
-
-Refresh those cached rows with:
-
-```powershell
-py refresh_data_stats.py --db db\irs990.db
-```
-
-This creates or updates:
-
-```text
-app_data_stats
-app_data_stats_meta
-```
-
-The enhanced grant matching batch also refreshes these cached stats automatically.
-
----
-
-## Backup examples
-
-SQLite shell backup:
-
-```powershell
-sqlite3 db\irs990.db ".backup db\irs990_backup_YYYYMMDD.db"
-```
-
-Copy backup after closing writers:
-
-```powershell
-Copy-Item db\irs990.db db\irs990_backup_YYYYMMDD.db
-```
-
-When the app is only reading, copying is usually fine. Before major rebuilds, appends, or grant-recipient matching workflows, make a backup.

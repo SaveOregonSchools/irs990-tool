@@ -4,49 +4,49 @@ Use preflight scans to check a batch of IRS XML files before appending them to t
 
 Preflight does not write to SQLite.
 
-## Recommended Command
+## Recommended command
 
 The rebuild script has native preflight mode:
 
 ```powershell
-py rebuild_irs990_slim_clean.py `
-  --xml-dir C:\IRSDB\XML\17-18 `
+python rebuild_irs990_slim_clean.py `
+  --xml-dir C:/path/to/new-xml `
   --preflight `
   --workers 4 `
-  --preflight-report exports\preflight_summary.json `
-  --preflight-csv exports\preflight_files.csv
+  --preflight-report exports/preflight_summary.json `
+  --preflight-csv exports/preflight_files.csv
 ```
 
 For a smaller sample:
 
 ```powershell
-py rebuild_irs990_slim_clean.py `
-  --xml-dir C:\IRSDB\XML\17-18 `
+python rebuild_irs990_slim_clean.py `
+  --xml-dir C:/path/to/new-xml `
   --preflight `
   --workers 1 `
   --preflight-max-files 5000 `
-  --preflight-report exports\preflight_sample_summary.json `
-  --preflight-csv exports\preflight_sample_files.csv
+  --preflight-report exports/preflight_sample_summary.json `
+  --preflight-csv exports/preflight_sample_files.csv
 ```
 
 Use `--workers 1` when debugging a specific XML/parser issue. Use more workers for large scans after the sample looks good.
 
-## Standalone Scanner
+## Standalone scanner
 
 `irs990_preflight_scan.py` remains available as a companion scanner. It imports the current `rebuild_irs990_slim_clean.py` and runs the same extractor logic without writing a database.
 
 ```powershell
-py irs990_preflight_scan.py `
-  --xml-dir C:\IRSDB\XML\17-18 `
+python irs990_preflight_scan.py `
+  --xml-dir C:/path/to/new-xml `
   --loader rebuild_irs990_slim_clean.py `
   --workers 4 `
-  --report exports\preflight_summary.json `
-  --csv exports\preflight_files.csv
+  --report exports/preflight_summary.json `
+  --csv exports/preflight_files.csv
 ```
 
 The native `--preflight` mode is preferred for normal use because it is built directly into the rebuild workflow. The standalone scanner is useful when you want a separate entry point or are comparing scanner behavior.
 
-## What Preflight Checks
+## What preflight checks
 
 Preflight recursively finds XML files and reports:
 
@@ -65,7 +65,7 @@ The current grant-detail warning logic avoids warning merely because a 990-PF re
 - `MoreThan5000KToOrgInd` is true.
 - Grant amount fields are positive and the filing is not explicitly individual-only.
 
-## Reading Results
+## Reading results
 
 Start with the console summary:
 
@@ -95,14 +95,14 @@ Treat these as review/spot-check signals:
 - `pf_contributions_paid_without_detail_rows`
 - `filer_incareof_unmapped`
 
-## After Preflight Looks Good
+## After preflight looks good
 
 Run the normal append:
 
 ```powershell
-py rebuild_irs990_slim_clean.py `
-  --db db\irs990.db `
-  --xml-dir C:\IRSDB\XML\17-18 `
+python rebuild_irs990_slim_clean.py `
+  --db db/irs990.db `
+  --xml-dir C:/path/to/new-xml `
   --append `
   --workers 4 `
   --commit-every 1000
