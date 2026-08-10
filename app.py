@@ -9,7 +9,7 @@ import traceback
 import sys
 import zipfile
 from pathlib import Path
-from common import DB_PATH, connect_ro
+from common import DB_PATH, OLMS_DB_PATH, connect_olms_ro, connect_ro
 from datetime import datetime
 
 # --- Flask ---
@@ -267,7 +267,7 @@ HOME_ICON = """
 
 LAYOUT_START = """
 <!doctype html>
-<title>{{ title or "IRS 990 - Query Console" }}</title>
+<title>{{ title or "IRS 990 & OLMS - Research Console" }}</title>
 <meta charset="utf-8">
 <style>{{ css | safe }}</style>
 
@@ -275,7 +275,7 @@ LAYOUT_START = """
 <header class="site-header">
   <div class="title-wrap">
     <a class="home-link" href="{{ url_for('home') }}" aria-label="Home">{{ home_icon | safe }}</a>
-    <h1>IRS 990 - Query Console</h1>
+    <h1>IRS 990 &amp; OLMS - Research Console</h1>
   </div>
   <a class="brand-link" href="https://www.saveoregonschools.com" aria-label="Save Oregon Schools website">
     <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
@@ -367,6 +367,53 @@ HOME_MENU = [
                 "people_lookup_v2",
                 "Find Filings by Person Name",
                 "Find where person names appear in tax filings.",
+            ),
+        ],
+    ),
+    (
+        "Labor / OLMS",
+        [
+            (
+                "query",
+                "olms_union_deep_dive",
+                "Union Deep Dive",
+                "Single-union identity, trends, filing history, grants, payees, and compensation.",
+            ),
+            (
+                "query",
+                "olms_filing_compliance",
+                "Filing Compliance / Timeliness",
+                "Separate observed late filings from conservative potential-missing filing flags.",
+            ),
+            (
+                "query",
+                "olms_grants_paid",
+                "Grants / Contributions Paid",
+                "Explore code 503 annual payee totals or itemized transactions.",
+            ),
+            (
+                "query",
+                "olms_vendors_paid",
+                "Vendors / Contractors / Payees",
+                "Explore union-reported vendors, consultants, service providers, and other payees.",
+            ),
+            (
+                "query",
+                "olms_counterparty_explorer",
+                "Grantee / Vendor Explorer",
+                "Find a counterparty and see all OLMS unions that reported paying it.",
+            ),
+            (
+                "query",
+                "olms_irs_match_audit",
+                "OLMS / IRS Match Audit",
+                "Review deterministic F_NUM-to-EIN matches and candidates.",
+            ),
+            (
+                "query",
+                "olms_import_audit",
+                "OLMS Import / Data Quality",
+                "Review source hashes, row counts, repairs, quarantines, duplicates, and orphans.",
             ),
         ],
     ),
@@ -841,6 +888,54 @@ def _read_stats_cache():
     if enhanced:
         summary.append({"label": "Enhanced Matches", "value": _fmt_int(enhanced.get("count"))})
 
+    olms_conn = None
+    if OLMS_DB_PATH.exists():
+        try:
+            summary.append({"label": "OLMS Database File", "value": _fmt_bytes(OLMS_DB_PATH.stat().st_size)})
+            olms_conn = connect_olms_ro()
+            cache_exists = olms_conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='olms_stats_cache'"
+            ).fetchone()
+            if cache_exists:
+                olms_stat_rows = olms_conn.execute(
+                    "SELECT metric,bucket,value,notes,updated_at FROM olms_stats_cache ORDER BY metric,bucket"
+                ).fetchall()
+                for metric, bucket, value, notes, stat_updated in olms_stat_rows:
+                    rows.append(
+                        {
+                            "section": "olms",
+                            "metric": metric,
+                            "bucket": bucket,
+                            "count": value,
+                            "signatures": None,
+                            "grants_represented": None,
+                            "total_amount": None,
+                            "pct_of_grants": None,
+                            "pct_of_section": None,
+                            "notes": notes,
+                            "count_fmt": _fmt_int(value),
+                            "signatures_fmt": "",
+                            "grants_represented_fmt": "",
+                            "total_amount_fmt": "",
+                            "pct_of_grants_fmt": "",
+                            "pct_of_section_fmt": "",
+                        }
+                    )
+                    if metric == "unique_labor_organizations" and not bucket:
+                        summary.append({"label": "OLMS Organizations", "value": _fmt_int(value)})
+                    elif metric == "total_reports" and not bucket:
+                        summary.append({"label": "OLMS Reports", "value": _fmt_int(value)})
+                    elif metric == "potential_missing_filings" and not bucket:
+                        summary.append({"label": "Potential Missing LM Filings", "value": _fmt_int(value)})
+                if not updated_at and olms_stat_rows:
+                    updated_at = olms_stat_rows[-1][4]
+        except Exception:
+            olms_error = traceback.format_exc()
+            error = (error + "\n" if error else "") + olms_error
+        finally:
+            if olms_conn is not None:
+                olms_conn.close()
+
     return summary, rows, updated_at, error
 
 
@@ -854,7 +949,7 @@ def query_page(qkey):
     ensure_registry()
     if qkey not in REGISTRY:
         return redirect(url_for("home"))
-    return _render_query(qkey, form={}, headers=None, rows=None, error=None)
+    return _render_query(qkey, form=request.args.to_dict(flat=True), headers=None, rows=None, error=None)
 
 
 @app.route("/stats", methods=["GET"])

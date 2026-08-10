@@ -1,13 +1,16 @@
-# IRS Form 990 Research Tool
+# IRS Form 990 & OLMS Research Tool
 
-A local research application for building, searching, analyzing, and exporting a
-slim SQLite database derived from IRS Form 990 e-file XML returns.
+A local research application for building, searching, analyzing, and exporting
+slim SQLite databases derived from IRS Form 990 e-file XML returns and OLMS
+annual labor-organization bulk filings.
 
-The repository includes two related systems:
+The repository includes three related systems:
 
 1. A Flask research console with purpose-built nonprofit, grant, people,
    contractor, lobbying, related-organization, and risk-analysis modules.
-2. Data-maintenance tools for preflighting XML, building or appending the main
+2. An OLMS labor-union research and filing-timeliness suite backed by an isolated
+   SQLite sidecar.
+3. Data-maintenance tools for preflighting XML, building or appending the main
    database, inventorying original XML files, and improving grant-recipient EIN
    matching.
 
@@ -31,6 +34,8 @@ clean, consistent snapshot.
 - Inventory source XML, detect duplicates/conflicts, and quarantine reviewed
   duplicate files without changing the production database.
 - Run optional deterministic and AI-assisted grant-recipient resolution.
+- Research OLMS labor organizations, annual filing timeliness, grants,
+  vendors/payees, counterparties, and high-confidence IRS matches.
 
 This is a research-oriented slim schema, not a complete mirror of every field in
 every IRS form and schedule.
@@ -76,6 +81,8 @@ the XML settings if you want source-file inventory or filing downloads:
 IRS_DB_PATH=db/irs990.db
 IRS_XML_ROOT=C:/Projects/IRSDB/XML
 IRS_XML_INVENTORY_PATH=db/irs990_sources.db
+OLMS_DB_PATH=db/olms.db
+OLMS_DATA_ROOT=C:/Projects/IRSDB/OLMS/unpacked
 ```
 
 Linux example:
@@ -101,6 +108,8 @@ Place an existing database at `db/irs990.db`, or use any other location through
 | `IRS_XML_INVENTORY_PATH` | XML source inventory sidecar. | `db/irs990_sources.db` |
 | `IRS_PROJECT_DIR` | Project/EO-BMF root used by grant-matching tools. | Project-specific |
 | `IRS_GRANT_WORK_DB_PATH` | Bulky grant-matching work sidecar. | Beside the main DB |
+| `OLMS_DB_PATH` | OLMS application sidecar. | `db/olms.db` |
+| `OLMS_DATA_ROOT` | Unpacked OLMS annual folders. | None |
 | `OLLAMA_ENDPOINTS` | Comma-separated Ask Database `/api/chat` endpoints. | Local Ollama |
 | `OLLAMA_URL` | Ollama endpoint used by grant adjudication commands. | Local Ollama |
 | `OLLAMA_MODEL` | Installed Ollama model name. | Workflow-specific |
@@ -124,6 +133,26 @@ terminal, normally `http://127.0.0.1:5000`.
 should import `app:app` through a production WSGI server and place it behind the
 same private proxy, VPN, or authentication layer used for other internal tools.
 The application does not currently provide its own user authentication.
+
+## Build or refresh the OLMS sidecar
+
+Full atomic rebuild from unpacked annual folders:
+
+```powershell
+python build_olms_db.py --input-dir C:/Projects/IRSDB/OLMS/unpacked --db db/olms.db --rebuild
+```
+
+Atomic current-year refresh:
+
+```powershell
+python build_olms_db.py --refresh-year 2026
+```
+
+The importer discovers metadata schemas, audits source hashes and row
+provenance, performs schema-guided repair or quarantine, derives union and
+counterparty identities, calculates conservative filing-timeliness results,
+and builds separate payee-summary and transaction views. See the
+[OLMS Sidecar Guide](docs/olms.md).
 
 ## Original XML and the source inventory
 
@@ -229,6 +258,13 @@ database.
 | Schedule R: Related Organizations | Related organizations and supported transaction fields. |
 | Filings by EIN(s) | Basic canonical filing availability. |
 | Database Statistics | Cached coverage and enhanced grant-matching summaries. |
+| OLMS Union Deep Dive | Union identity, trends, filing history, grants, payees, and compensation. |
+| OLMS Filing Compliance | Observed late filings and conservative potential-missing flags. |
+| OLMS Grants / Contributions | Code 503 payee summaries and itemized transactions. |
+| OLMS Vendors / Payees | Non-grant union-reported vendors, consultants, and other payees. |
+| OLMS Counterparty Explorer | All unions that reported paying one grantee/vendor identity. |
+| OLMS / IRS Match Audit | Deterministic F_NUM-to-EIN evidence and manual overrides. |
+| OLMS Import Audit | Source hashes, coverage, repairs, quarantines, duplicates, and orphans. |
 
 Query modules are discovered from `queries/` and reloaded when their files
 change. See [Query Module Guide](queries/README.md) for the plugin contract.
@@ -271,6 +307,8 @@ before running the workflow. It can take many hours.
 | `irs990_sources.db` | Only for XML downloads | Regenerable inventory of the original XML tree. |
 | Original XML tree | Only for XML downloads/updates | Keep outside Git; configure with `IRS_XML_ROOT`. |
 | `grant_matching_work.db` | No | Preserve to continue enhanced matching without rebuilding working tables. |
+| `olms.db` | Only for OLMS modules | Rebuildable OLMS sidecar; never commit it. |
+| Unpacked OLMS annual folders | Only for OLMS rebuilds/refreshes | Keep outside Git; configure with `OLMS_DATA_ROOT`. |
 | `eo-bmf/` | No | Required when rebuilding the enhanced identity layer. |
 | `exports/`, `imports/`, `adj/` | No | Reports, packets, decisions, and audit artifacts. |
 
@@ -313,6 +351,8 @@ production database.
 | `rebuild_irs990_slim_clean.py` | Full database rebuild, append, and preflight entry point. |
 | `scan_xml_sources.py` | Portable XML inventory, duplicate/conflict analysis, and quarantine workflow. |
 | `refresh_data_stats.py` | Cached web statistics refresh. |
+| `build_olms_db.py` | Atomic OLMS sidecar rebuild and targeted annual refresh. |
+| `olms.py` | OLMS discovery, parsing, audit, derivation, compliance, and matching logic. |
 | `resolve_grant_recipients.py` | Deterministic grant-recipient resolution. |
 | `grant_ai_assist_v1.py` | Enhanced identity, candidates, decisions, adjudication, and final views. |
 | `migrate_grant_work_sidecar.py` | Moves bulky matching work tables out of the main database. |
@@ -320,6 +360,7 @@ production database.
 | `docs/database-build.md` | Build, append, inventory, validation, and caveats. |
 | `docs/preflight.md` | XML batch preflight and report interpretation. |
 | `docs/grant-matching.md` | Enhanced grant matching and adjudication. |
+| `docs/olms.md` | OLMS architecture, build, audit, compliance, matching, and query guide. |
 | `queries/README.md` | Query plugin contract and current modules. |
 | `config/README.md` | Ollama complexity configuration. |
 | `db/README.md` | Database placement, backup, and local-file hygiene. |
