@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template_string, Response, redirect, url_for
+from flask import Flask, jsonify, request, render_template_string, Response, redirect, url_for
 import importlib
 import pkgutil
 import io
@@ -10,10 +10,12 @@ import sys
 import zipfile
 from pathlib import Path
 from common import DB_PATH, OLMS_DB_PATH, connect_olms_ro, connect_ro
+from data_import import ImportManager, ImportOptions, PROJECT_ROOT
 from datetime import datetime
 
 # --- Flask ---
 app = Flask(__name__)
+DATA_IMPORT_MANAGER = ImportManager()
 
 PLUGIN_PACKAGE = "queries"
 PLUGIN_DIR = Path(__file__).parent / "queries"
@@ -438,6 +440,17 @@ HOME_MENU = [
         ],
     ),
     (
+        "Data Maintenance",
+        [
+            (
+                "data_import",
+                "data_import",
+                "Import New IRS Data",
+                "Guided XML append, optional EO-BMF installation, and deterministic enhanced grant matching.",
+            ),
+        ],
+    ),
+    (
         "Other Modules",
         [
             (
@@ -615,6 +628,177 @@ QUERY_HTML = LAYOUT_START + """
 </script>
 """ + LAYOUT_END
 
+DATA_IMPORT_HTML = LAYOUT_START + """
+<div class="home-title-row">
+  <h2>Import New IRS Data</h2>
+  <p class="note">Append XML filings and run deterministic post-import processing</p>
+</div>
+
+{% if error %}<pre class="err">{{ error }}</pre>{% endif %}
+
+{% if state.status == 'running' %}
+  <p><b>An import is running.</b> This page refreshes automatically. Keep the IRS 990 app process open.</p>
+{% elif state.status == 'completed' %}
+  <p><b>Import and deterministic matching completed.</b> AI adjudication was not run.</p>
+{% elif state.status == 'failed' %}
+  <p><b>The import stopped at a failed step.</b> No later steps were run.</p>
+{% endif %}
+
+{% if state.status in ('running', 'completed', 'failed') %}
+  <h3>Run {{ state.run_id }}</h3>
+  <ol>
+    {% for step in state.steps %}
+      <li><b>{{ step.status|upper }}</b> — {{ step.label }}</li>
+    {% endfor %}
+  </ol>
+  {% if state.error %}<pre class="err">{{ state.error }}</pre>{% endif %}
+  {% if state.log_path %}<p class="note">Full log: <code>{{ state.log_path }}</code></p>{% endif %}
+  <h3>Recent output</h3>
+  <pre class="sql-box" style="max-height:460px; overflow:auto; white-space:pre-wrap;">{{ state.logs|join('\n') }}</pre>
+{% endif %}
+
+{% if state.status == 'completed' and state.instructions %}
+  <h3>Next: external AI adjudication</h3>
+  <p>Generate packet batches, process them with <code>grant_ai_batch_worker.py</code>, then dry-run and perform the decision import. Finally, rebuild the applied layer:</p>
+  {% for command in state.instructions %}
+    <pre class="sql-box" style="white-space:pre-wrap;">{{ command }}</pre>
+  {% endfor %}
+  <p>See <code>docs/grant-matching.md</code> for the Linux worker command and audit fields to review.</p>
+{% endif %}
+
+{% if state.status != 'running' %}
+  <form method="post" action="{{ url_for('data_import_page') }}">
+    <div class="row">
+      <label><b>Directories containing new IRS XML files:</b></label>
+      <div id="xml-directory-list">
+        {% for xml_dir in form.xml_dirs %}
+          <div class="xml-directory-row" style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+            <input name="xml_dir" value="{{ xml_dir }}" required style="width:min(100%,700px); flex:1;">
+            <button type="button" class="secondary browse-directory">Browse</button>
+            <button type="button" class="secondary remove-directory" title="Remove this directory">−</button>
+          </div>
+        {% endfor %}
+      </div>
+      <button type="button" id="add-xml-directory" class="secondary" style="margin-top:8px;" title="Add another XML directory">+ Add directory</button>
+      <div class="note">Each directory is searched recursively, preflighted, and appended in order. Duplicate paths and existing filings are skipped.</div>
+    </div>
+
+    <div class="row">
+      <label><input type="checkbox" name="bmf_updated" {% if form.bmf_updated %}checked{% endif %}> <b>EO-BMF files were also updated</b></label>
+    </div>
+
+    <div class="row">
+      <label for="bmf_source_dir"><b>Optional directory containing downloaded eo1.csv through eo4.csv:</b></label><br>
+      <input id="bmf_source_dir" name="bmf_source_dir" value="{{ form.bmf_source_dir }}" style="width:min(100%,760px);">
+      <div class="note">If supplied, the current project copies are backed up before the new files are installed. Leave blank if you already replaced the project files.</div>
+    </div>
+
+    <details>
+      <summary>Database paths</summary>
+      <div class="row">
+        <label for="db_path"><b>Main IRS database:</b></label><br>
+        <input id="db_path" name="db_path" value="{{ form.db_path }}" required style="width:min(100%,760px);">
+      </div>
+      <div class="row">
+        <label for="work_db_path"><b>Enhanced grant work database:</b></label><br>
+        <input id="work_db_path" name="work_db_path" value="{{ form.work_db_path }}" style="width:min(100%,760px);">
+      </div>
+    </details>
+
+    <div class="row" style="margin-top:18px;">
+      <label><input type="checkbox" name="confirm" required> I understand this will write to the databases and can take many hours.</label>
+    </div>
+    <div class="toolbar"><button type="submit">Start Data Import</button></div>
+  </form>
+
+  <dialog id="directory-browser" style="width:min(760px,94vw); border:1px solid var(--border); border-radius:8px; padding:18px;">
+    <h3 style="margin-top:0;">Choose an XML directory</h3>
+    <div id="browser-current" class="sql-box" style="word-break:break-all;"></div>
+    <div class="toolbar">
+      <button type="button" id="browser-parent" class="secondary">Up one level</button>
+      <button type="button" id="browser-select">Select this directory</button>
+      <button type="button" id="browser-cancel" class="secondary">Cancel</button>
+    </div>
+    <div id="browser-directories" style="display:grid; gap:6px; max-height:430px; overflow:auto;"></div>
+    <div id="browser-error" class="err" style="display:none; margin-top:8px;"></div>
+  </dialog>
+
+  <script>
+  (function () {
+    const list = document.getElementById('xml-directory-list');
+    const dialog = document.getElementById('directory-browser');
+    const currentLabel = document.getElementById('browser-current');
+    const children = document.getElementById('browser-directories');
+    const errorBox = document.getElementById('browser-error');
+    const parentButton = document.getElementById('browser-parent');
+    let activeInput = null;
+    let currentPath = {{ directory_browser_start|tojson }};
+    let parentPath = null;
+
+    function addDirectory(value) {
+      const row = document.createElement('div');
+      row.className = 'xml-directory-row';
+      row.style.cssText = 'display:flex; gap:8px; margin-top:8px; align-items:center;';
+      const input = document.createElement('input');
+      input.name = 'xml_dir'; input.required = true; input.value = value || '';
+      input.style.cssText = 'width:min(100%,700px); flex:1;';
+      const browse = document.createElement('button');
+      browse.type = 'button'; browse.className = 'secondary browse-directory'; browse.textContent = 'Browse';
+      const remove = document.createElement('button');
+      remove.type = 'button'; remove.className = 'secondary remove-directory'; remove.title = 'Remove this directory'; remove.textContent = '−';
+      row.append(input, browse, remove); list.appendChild(row);
+    }
+
+    document.getElementById('add-xml-directory').addEventListener('click', function () { addDirectory(''); });
+    list.addEventListener('click', function (event) {
+      const row = event.target.closest('.xml-directory-row');
+      if (!row) return;
+      if (event.target.classList.contains('remove-directory')) {
+        if (list.children.length > 1) row.remove(); else row.querySelector('input').value = '';
+      }
+      if (event.target.classList.contains('browse-directory')) {
+        activeInput = row.querySelector('input');
+        loadDirectory(activeInput.value || {{ directory_browser_start|tojson }});
+        dialog.showModal();
+      }
+    });
+
+    async function loadDirectory(path) {
+      errorBox.style.display = 'none';
+      try {
+        const response = await fetch({{ url_for('data_import_directories')|tojson }} + '?path=' + encodeURIComponent(path));
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || 'Could not list that directory.');
+        currentPath = payload.path; parentPath = payload.parent;
+        currentLabel.textContent = currentPath;
+        parentButton.disabled = !parentPath;
+        children.replaceChildren();
+        payload.directories.forEach(function (entry) {
+          const button = document.createElement('button');
+          button.type = 'button'; button.className = 'secondary'; button.style.justifyContent = 'flex-start';
+          button.textContent = entry.name; button.addEventListener('click', function () { loadDirectory(entry.path); });
+          children.appendChild(button);
+        });
+      } catch (error) {
+        errorBox.textContent = error.message; errorBox.style.display = 'block';
+      }
+    }
+
+    parentButton.addEventListener('click', function () { if (parentPath) loadDirectory(parentPath); });
+    document.getElementById('browser-select').addEventListener('click', function () {
+      if (activeInput) activeInput.value = currentPath;
+      dialog.close();
+    });
+    document.getElementById('browser-cancel').addEventListener('click', function () { dialog.close(); });
+  }());
+  </script>
+{% endif %}
+
+{% if state.status == 'running' %}
+<script>window.setTimeout(function () { window.location.reload(); }, 3000);</script>
+{% endif %}
+""" + LAYOUT_END
+
 STATS_HTML = LAYOUT_START + """
 <h2>Database Statistics</h2>
 
@@ -701,6 +885,15 @@ def _build_home_sections():
                         "label": label,
                         "href": url_for("stats_page"),
                         "description": description,
+                    }
+                )
+                continue
+            if item_type == "data_import":
+                items.append(
+                    {
+                        "label": label,
+                        "href": url_for("data_import_page"),
+                        "description": entry[3] if len(entry) > 3 else "",
                     }
                 )
                 continue
@@ -987,6 +1180,84 @@ def stats_page():
             error=error,
         ),
     )
+
+
+def _data_import_form(values=None):
+    values = values or {}
+    default_work_db = Path(os.getenv("IRS_GRANT_WORK_DB_PATH", DB_PATH.parent / "grant_matching_work.db"))
+    return {
+        "xml_dirs": values.get("xml_dirs") or [""],
+        "bmf_updated": values.get("bmf_updated") in (True, "on", "1", "true"),
+        "bmf_source_dir": values.get("bmf_source_dir", ""),
+        "db_path": values.get("db_path", str(DB_PATH)),
+        "work_db_path": values.get("work_db_path", str(default_work_db)),
+    }
+
+
+@app.route("/data-import", methods=["GET", "POST"])
+def data_import_page():
+    error = None
+    posted = request.form.to_dict(flat=True) if request.method == "POST" else None
+    if posted is not None:
+        posted["xml_dirs"] = request.form.getlist("xml_dir")
+    form = _data_import_form(posted)
+    if request.method == "POST":
+        try:
+            if request.form.get("confirm") != "on":
+                raise ValueError("Confirm the database update before starting.")
+            options = ImportOptions.from_values(
+                xml_dirs=form["xml_dirs"],
+                db_path=form["db_path"],
+                work_db_path=form["work_db_path"],
+                bmf_updated=form["bmf_updated"],
+                bmf_source_dir=form["bmf_source_dir"],
+                project_dir=PROJECT_ROOT,
+            )
+            DATA_IMPORT_MANAGER.start(options)
+            return redirect(url_for("data_import_page"))
+        except Exception as exc:
+            error = str(exc)
+    return render_template_string(
+        DATA_IMPORT_HTML,
+        **_template_context(
+            title="IRS 990 - Import New Data",
+            qkey=None,
+            form=form,
+            state=DATA_IMPORT_MANAGER.snapshot(),
+            error=error,
+            directory_browser_start=str(_directory_browser_root()),
+        ),
+    )
+
+
+def _directory_browser_root():
+    configured = (os.getenv("IRS_XML_ROOT") or "").strip()
+    root = Path(configured).expanduser().resolve() if configured else PROJECT_ROOT
+    return root if root.is_dir() else PROJECT_ROOT
+
+
+@app.route("/data-import/directories", methods=["GET"])
+def data_import_directories():
+    root = _directory_browser_root()
+    requested = (request.args.get("path") or "").strip()
+    candidate = Path(requested).expanduser().resolve() if requested else root
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return jsonify({"error": f"Browse selections must stay beneath {root}"}), 400
+    if not candidate.is_dir():
+        return jsonify({"error": f"Directory does not exist: {candidate}"}), 404
+
+    directories = []
+    try:
+        for child in candidate.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                directories.append({"name": child.name, "path": str(child.resolve())})
+    except OSError as exc:
+        return jsonify({"error": f"Could not read {candidate}: {exc}"}), 403
+    directories.sort(key=lambda item: item["name"].casefold())
+    parent = str(candidate.parent) if candidate != root else None
+    return jsonify({"path": str(candidate), "parent": parent, "directories": directories})
 
 
 @app.route("/refresh", methods=["POST"])
