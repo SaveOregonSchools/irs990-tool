@@ -79,6 +79,17 @@ Use append mode when:
 - you found missing XMLs and want to add them;
 - you want to add a small batch without rebuilding the full database.
 
+To download one known filing from the public GivingTuesday Data Commons S3
+mirror, pass its IRS object ID (or full XML filename/HTTPS URL) and an output
+directory:
+
+```powershell
+python download_irs990_xml.py 201821349349309507 C:\path\to\new-xml
+```
+
+The downloader validates that the response is IRS return XML and refuses to
+replace an existing file unless `--overwrite` is supplied.
+
 Append mode still rebuilds `canonical_by_ein_year`, views, and indexes after loading. A newly added filing may become the canonical filing for an EIN/tax year.
 
 ---

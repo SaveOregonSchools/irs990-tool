@@ -110,6 +110,7 @@ Place an existing database at `db/irs990.db`, or use any other location through
 | `IRS_GRANT_WORK_DB_PATH` | Bulky grant-matching work sidecar. | Beside the main DB |
 | `OLMS_DB_PATH` | OLMS application sidecar. | `db/olms.db` |
 | `OLMS_DATA_ROOT` | Unpacked OLMS annual folders. | None |
+| `TOOLBOX_HOME_URL` | Optional parent launcher URL shown as an **All tools** header link. | Hidden |
 | `OLLAMA_ENDPOINTS` | Comma-separated Ask Database `/api/chat` endpoints. | Local Ollama |
 | `OLLAMA_URL` | Ollama endpoint used by grant adjudication commands. | Local Ollama |
 | `OLLAMA_MODEL` | Installed Ollama model name. | Workflow-specific |
