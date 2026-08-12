@@ -193,6 +193,13 @@ classification, conflict analysis, quarantine safeguards, and inventory reports.
 
 ## Build or update the database
 
+For routine incremental updates, the Flask home page includes **Data
+Maintenance → Import New IRS Data**. It guides you through selecting one or
+more new XML directories, optionally installing updated EO-BMF files, appending the filings,
+and running all deterministic enhanced grant-matching stages. AI adjudication
+remains a separate reviewed step. See the [Guided IRS Data Import](docs/data-import.md)
+guide.
+
 The build script requires an explicit XML directory. You can pass the configured
 root from the shell.
 
