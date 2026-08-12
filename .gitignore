@@ -35,6 +35,7 @@ downloads/
 exports/
 imports/
 cache/
+tmp/
 
 # IRS Exempt Org business master files
 eo-bmf/

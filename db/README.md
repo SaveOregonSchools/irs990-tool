@@ -17,6 +17,7 @@ Related local databases may include:
 | `irs990.db` | Main application database and final enhanced grant results. |
 | `irs990_sources.db` | Regenerable original-XML inventory used for filing downloads. |
 | `grant_matching_work.db` | Bulky enhanced grant-matching workspace. |
+| `olms.db` | Rebuildable OLMS labor-organization research sidecar. |
 
 All are ignored by Git.
 
@@ -28,6 +29,8 @@ Example `.env` values:
 IRS_DB_PATH=db/irs990.db
 IRS_XML_INVENTORY_PATH=db/irs990_sources.db
 IRS_GRANT_WORK_DB_PATH=db/grant_matching_work.db
+OLMS_DB_PATH=db/olms.db
+OLMS_DATA_ROOT=C:/Projects/IRSDB/OLMS/unpacked
 ```
 
 The original XML tree is configured separately with `IRS_XML_ROOT`; it does not
@@ -55,6 +58,10 @@ python scan_xml_sources.py --sidecar-db db/irs990_sources.db --main-db db/irs990
 
 See [Database Build Guide](../docs/database-build.md) before writing to the main
 database or quarantining source XML.
+
+Build the isolated OLMS sidecar with `python build_olms_db.py --rebuild`; see
+[OLMS Sidecar Guide](../docs/olms.md). OLMS source folders and audit exports are
+also local-only data.
 
 ## Cached web statistics
 

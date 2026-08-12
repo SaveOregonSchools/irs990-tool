@@ -57,3 +57,14 @@ OLLAMA_MODEL=qwen3.5:9b
 `OLLAMA_ENDPOINTS` may contain a comma-separated fallback list. The separate
 grant-adjudication CLI uses `OLLAMA_URL`; set both when the same Ollama server
 supports the web app and grant workflows.
+
+## OLMS durable overrides
+
+`olms_scope_overrides.csv` preserves manual education-scope includes/excludes
+across sidecar rebuilds. Its columns are `f_num,action,note`, where `action` is
+`include` or `exclude`.
+
+`olms_irs_match_overrides.csv` preserves deterministic match decisions. Its
+columns are `f_num,ein,action,note`, where `action` is `accept`, `reject`, or
+`unmatch`. The Flask audit pages are intentionally read-only; edit these tracked
+CSV files and rebuild/refresh the sidecar to apply a decision.

@@ -63,6 +63,13 @@ Use `export_headers()` when the CSV export should omit helper columns that are u
 | `lobbying_political_activity.py` | Explore expanded Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators. |
 | `ngo_related_orgs_sched_r.py` | Return Schedule R related organization entries by EIN, filer state, and year range. |
 | `people_lookup.py` | Search person names across officers, highly compensated employees, contractors, grant recipients, return headers, books-in-care-of, Schedule J, Schedule L, and 990-PF officer data. |
+| `olms_union_deep_dive.py` | Single-union OLMS identity, trends, filing history, grants, payees, and compensation. |
+| `olms_filing_compliance.py` | Observed timeliness and conservative potential-missing filing research flags. |
+| `olms_grants_paid.py` | OLMS code 503 annual payee summaries and itemized transactions. |
+| `olms_vendors_paid.py` | Union-reported vendors, consultants, service providers, and other payees. |
+| `olms_counterparty_explorer.py` | Inverse view of all unions that reported paying a selected counterparty. |
+| `olms_irs_match_audit.py` | Deterministic and manual F_NUM-to-EIN match evidence. |
+| `olms_import_audit.py` | OLMS source hashes, build counts, repairs, quarantines, duplicates, and orphans. |
 
 ---
 
@@ -77,6 +84,9 @@ from common import connect_ro, normalize_eins
 ```
 
 Use `connect_ro()` for query modules. Query modules should not mutate the database.
+
+OLMS modules use `connect_olms_ro()`. Explicit cross-database research can use
+`connect_olms_irs_ro()`; both attach/open application data read-only.
 
 ### Prefer canonical filings for year-based research
 
