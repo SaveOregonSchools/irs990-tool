@@ -8,6 +8,7 @@ status page.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -24,6 +25,18 @@ from typing import Callable, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 BMF_FILENAMES = ("eo1.csv", "eo2.csv", "eo3.csv", "eo4.csv")
+GUIDED_CANDIDATE_RULES = ",".join(
+    (
+        "exact_name_zip",
+        "exact_name_city_state",
+        "exact_address_zip_good_name",
+        "single_candidate_high_score",
+        "exact_name_state_only",
+        "large_safe_remaining",
+        "address_name_remaining",
+        "exact_name_no_geo_distinctive",
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -180,18 +193,18 @@ def build_pipeline(options: ImportOptions, run_id: str) -> list[PipelineStep]:
             )
         )
 
-    for index, xml_dir in enumerate(options.xml_dirs, 1):
-        steps.append(
-            _python_step(
-                options,
-                f"append_xml_{index}",
-                f"Append XML directory {index} of {len(options.xml_dirs)}",
-                "rebuild_irs990_slim_clean.py",
-                "--db", db,
-                "--xml-dir", str(xml_dir),
-                "--append",
-            )
+    append_args: list[str] = ["rebuild_irs990_slim_clean.py", "--db", db]
+    for xml_dir in options.xml_dirs:
+        append_args.extend(("--xml-dir", str(xml_dir)))
+    append_args.append("--append")
+    steps.append(
+        _python_step(
+            options,
+            "append_xml",
+            f"Append {len(options.xml_dirs)} XML director{'y' if len(options.xml_dirs) == 1 else 'ies'}",
+            *append_args,
         )
+    )
 
     steps.extend(
         [
@@ -255,26 +268,20 @@ def build_pipeline(options: ImportOptions, run_id: str) -> list[PipelineStep]:
         ]
     )
 
-    rule_groups = (
-        ("rules_high_confidence", "Apply highest-confidence candidate rules", "exact_name_zip,exact_name_city_state,exact_address_zip_good_name", ()),
-        ("rules_single_high", "Apply single high-score candidate rule", "single_candidate_high_score", ()),
-        ("rules_exact_state", "Apply exact name/address/state rule", "exact_name_state_only", ()),
-        ("rules_large_safe", "Apply large safe remaining candidate rules", "large_safe_remaining", ()),
-        (
-            "rules_address_name",
-            "Apply reviewed address/name candidate rules",
-            "address_name_remaining",
-            ("--addr-name-min-name-score", "0.70", "--high-address-geo-min-name-score", "0.70"),
-        ),
-        ("rules_distinctive_name", "Apply distinctive exact-name/no-geo rule", "exact_name_no_geo_distinctive", ()),
-    )
-    for key, label, rules, extras in rule_groups:
-        steps.append(
-            _python_step(
-                options, key, label, "grant_ai_assist_v1.py", "candidate-rule-decisions",
-                *common_ai, "--rules", rules, *extras,
-            )
+    # The CLI's guided plan replays the old default/address-override/default
+    # threshold phases per row while scanning the ranked candidate population
+    # once. This preserves the old stored-decision behavior.
+    steps.append(
+        _python_step(
+            options,
+            "candidate_rules",
+            "Apply deterministic candidate rules",
+            "grant_ai_assist_v1.py", "candidate-rule-decisions",
+            *common_ai,
+            "--rules", GUIDED_CANDIDATE_RULES,
+            "--guided-import-rule-plan",
         )
+    )
 
     steps.extend(
         [
@@ -286,16 +293,12 @@ def build_pipeline(options: ImportOptions, run_id: str) -> list[PipelineStep]:
             ),
             _python_step(
                 options,
-                "grant_stats",
-                "Write enhanced grant-match statistics",
-                "grant_ai_assist_v1.py", "stats", *common_ai,
-                "--csv-out", str(run_dir / "grant_match_stats.csv"),
-            ),
-            _python_step(
-                options,
                 "app_stats",
-                "Refresh web database statistics",
-                "refresh_data_stats.py", "--db", db,
+                "Write grant-match statistics and refresh web database statistics",
+                "refresh_data_stats.py",
+                "--db", db,
+                "--work-db", work_db,
+                "--grant-stats-csv", str(run_dir / "grant_match_stats.csv"),
             ),
             PipelineStep(
                 key="checkpoint",
@@ -340,17 +343,18 @@ def _source_inventory_step(options: ImportOptions, run_dir: Path) -> PipelineSte
     sidecar = Path(
         os.getenv("IRS_XML_INVENTORY_PATH", options.db_path.parent / "irs990_sources.db")
     ).expanduser().resolve()
-    return _python_step(
-        options,
-        "source_inventory",
-        "Rebuild source XML inventory",
+    args = [
         "scan_xml_sources.py",
         "--xml-dir", str(xml_root),
         "--sidecar-db", str(sidecar),
         "--main-db", str(options.db_path),
-        "--report-csv", str(run_dir / "xml_source_audit.csv"),
         "--duplicates-csv", str(run_dir / "xml_source_duplicates.csv"),
-    )
+    ]
+    if (os.getenv("IRS_XML_WRITE_FULL_AUDIT_CSV") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        args.extend(("--report-csv", str(run_dir / "xml_source_audit.csv")))
+    return _python_step(options, "source_inventory", "Rebuild source XML inventory", *args)
 
 
 def checkpoint_databases(options: ImportOptions, log: Callable[[str], None]) -> None:
@@ -416,10 +420,21 @@ class ImportManager:
                 "started_at": datetime.now().isoformat(timespec="seconds"),
                 "finished_at": "",
                 "current_step": "",
-                "steps": [{"key": s.key, "label": s.label, "status": "pending"} for s in plan],
+                "steps": [
+                    {
+                        "key": s.key,
+                        "label": s.label,
+                        "status": "pending",
+                        "started_at": "",
+                        "finished_at": "",
+                        "duration_seconds": None,
+                    }
+                    for s in plan
+                ],
                 "logs": [],
                 "error": "",
                 "log_path": str(self._log_path),
+                "summary_path": str(run_dir / "run_summary.json"),
                 "instructions": [],
             }
             self._thread = threading.Thread(
@@ -432,27 +447,65 @@ class ImportManager:
         return run_id
 
     def _log(self, message: str) -> None:
-        line = message.rstrip()
-        if not line:
+        message = message.rstrip()
+        if not message:
             return
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        lines = [f"[{timestamp}] {line}" for line in message.splitlines()]
         with self._lock:
             logs = self._state.setdefault("logs", [])
-            logs.append(line)
+            logs.extend(lines)
             del logs[:-self._max_log_lines]
             if self._log_path:
                 with self._log_path.open("a", encoding="utf-8") as handle:
-                    handle.write(line + "\n")
+                    handle.write("\n".join(lines) + "\n")
 
     def _set_step(self, key: str, status: str) -> None:
+        now = datetime.now()
         with self._lock:
             for step in self._state["steps"]:
                 if step["key"] == key:
                     step["status"] = status
+                    if status == "running":
+                        step["started_at"] = now.isoformat(timespec="milliseconds")
+                        step["finished_at"] = ""
+                        step["duration_seconds"] = None
+                    elif status in {"completed", "failed"}:
+                        step["finished_at"] = now.isoformat(timespec="milliseconds")
+                        if step.get("started_at"):
+                            started = datetime.fromisoformat(step["started_at"])
+                            step["duration_seconds"] = round(
+                                max(0.0, (now - started).total_seconds()), 3
+                            )
                     break
             self._state["current_step"] = key if status == "running" else ""
 
+    def _step_duration(self, key: str) -> float:
+        with self._lock:
+            for step in self._state.get("steps", []):
+                if step["key"] == key:
+                    return float(step.get("duration_seconds") or 0.0)
+        return 0.0
+
+    def _write_summary(self) -> None:
+        with self._lock:
+            summary_path_value = self._state.get("summary_path")
+            if not summary_path_value:
+                return
+            payload = {
+                key: value
+                for key, value in self._state.items()
+                if key != "logs"
+            }
+            payload["steps"] = [dict(step) for step in self._state.get("steps", [])]
+        summary_path = Path(summary_path_value)
+        temporary = summary_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(temporary, summary_path)
+
     def _run(self, options: ImportOptions, plan: Sequence[PipelineStep]) -> None:
         try:
+            self._write_summary()
             for step in plan:
                 self._set_step(step.key, "running")
                 self._log(f"==> {step.label}")
@@ -461,23 +514,29 @@ class ImportManager:
                 else:
                     self._run_command(step.command, options.project_dir)
                 self._set_step(step.key, "completed")
+                self._log(
+                    f"<== {step.label} completed in {self._step_duration(step.key):,.1f} seconds"
+                )
+                self._write_summary()
             with self._lock:
                 self._state["status"] = "completed"
                 self._state["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 self._state["instructions"] = adjudication_instructions(
                     options, self._state["run_id"]
                 )
+            self._write_summary()
         except Exception as exc:
-            self._log(traceback.format_exc())
             with self._lock:
                 current = self._state.get("current_step")
-                for step in self._state["steps"]:
-                    if step["key"] == current:
-                        step["status"] = "failed"
+            if current:
+                self._set_step(current, "failed")
+            self._log(traceback.format_exc())
+            with self._lock:
                 self._state["status"] = "failed"
                 self._state["error"] = str(exc)
                 self._state["finished_at"] = datetime.now().isoformat(timespec="seconds")
                 self._state["current_step"] = ""
+            self._write_summary()
 
     def _run_command(self, command: Sequence[str], cwd: Path) -> None:
         self._log("Command: " + subprocess.list2cmdline(list(command)))

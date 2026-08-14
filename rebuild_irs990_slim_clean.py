@@ -1779,7 +1779,7 @@ def existing_filing_keys(conn: sqlite3.Connection) -> Tuple[set, set]:
     return filing_ids, object_ids
 
 
-def select_xml_files(xml_dir: Path, append_only: bool, conn: sqlite3.Connection) -> Tuple[List[str], Dict[str, int]]:
+def select_xml_files(xml_dirs: Sequence[Path], append_only: bool, conn: sqlite3.Connection) -> Tuple[List[str], Dict[str, int]]:
     existing_ids, existing_object_ids = existing_filing_keys(conn) if append_only else (set(), set())
     selected: List[str] = []
     seen_input_object_ids = set()
@@ -1789,19 +1789,20 @@ def select_xml_files(xml_dir: Path, append_only: bool, conn: sqlite3.Connection)
         'skipped_existing': 0,
         'skipped_duplicate_input': 0,
     }
-    for fp in iter_xml_files(xml_dir):
-        stats['total'] += 1
-        stem = Path(fp).stem
-        object_id = object_id_from_filing_id(stem)
-        if append_only and (stem in existing_ids or object_id in existing_object_ids):
-            stats['skipped_existing'] += 1
-            continue
-        if object_id in seen_input_object_ids:
-            stats['skipped_duplicate_input'] += 1
-            continue
-        seen_input_object_ids.add(object_id)
-        selected.append(fp)
-        stats['selected'] += 1
+    for xml_dir in xml_dirs:
+        for fp in iter_xml_files(xml_dir):
+            stats['total'] += 1
+            stem = Path(fp).stem
+            object_id = object_id_from_filing_id(stem)
+            if append_only and (stem in existing_ids or object_id in existing_object_ids):
+                stats['skipped_existing'] += 1
+                continue
+            if object_id in seen_input_object_ids:
+                stats['skipped_duplicate_input'] += 1
+                continue
+            seen_input_object_ids.add(object_id)
+            selected.append(fp)
+            stats['selected'] += 1
     return selected, stats
 
 
@@ -1832,16 +1833,16 @@ def rebuild_canonical(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def load_data(conn: sqlite3.Connection, xml_dir: Path, workers: int, chunksize: int, commit_every: int, append_only: bool = False) -> None:
-    err_log = xml_dir.parent / 'rebuild_irs990_slim_errors.log'
+def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, chunksize: int, commit_every: int, append_only: bool = False) -> None:
+    err_log = xml_dirs[0].parent / 'rebuild_irs990_slim_errors.log'
     processed = 0
 
     def ins(sql, vals):
         conn.execute(sql, vals)
 
-    files_iter, file_stats = select_xml_files(xml_dir, append_only, conn)
+    files_iter, file_stats = select_xml_files(xml_dirs, append_only, conn)
     print(
-        f"[load] XML files found: {file_stats['total']:,}; "
+        f"[load] XML roots: {len(xml_dirs):,}; files found: {file_stats['total']:,}; "
         f"selected: {file_stats['selected']:,}; "
         f"skipped existing: {file_stats['skipped_existing']:,}; "
         f"skipped duplicate input: {file_stats['skipped_duplicate_input']:,}"
@@ -2409,7 +2410,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description='Slim rebuild for current IRS 990 query modules')
     ap.add_argument('--db', required=False,
                     help='SQLite database to create/rebuild/append. Required unless --preflight is used.')
-    ap.add_argument('--xml-dir', required=True)
+    ap.add_argument('--xml-dir', required=True, action='append',
+                    help='XML directory to scan. Repeat the option to load multiple roots in one maintenance pass.')
     ap.add_argument('--preflight', action='store_true',
                     help='Scan XML files recursively and report parser/extraction compatibility without writing to SQLite.')
     ap.add_argument('--preflight-report', default=None,
@@ -2433,15 +2435,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    xml_dir = Path(args.xml_dir)
+    xml_dirs = [Path(value) for value in args.xml_dir]
 
-    if not xml_dir.exists():
-        print(f'ERROR: xml dir not found: {xml_dir}', file=sys.stderr)
-        return 2
+    for xml_dir in xml_dirs:
+        if not xml_dir.exists():
+            print(f'ERROR: xml dir not found: {xml_dir}', file=sys.stderr)
+            return 2
 
     if args.preflight:
+        if len(xml_dirs) != 1:
+            print('ERROR: --preflight accepts exactly one --xml-dir so each root has its own report', file=sys.stderr)
+            return 2
         return run_preflight(
-            xml_dir=xml_dir,
+            xml_dir=xml_dirs[0],
             workers=args.workers,
             chunksize=args.chunksize,
             max_files=args.preflight_max_files,
@@ -2472,7 +2478,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ensure_schema_columns(conn)
 
         print('[load] loading XML into slim schema...')
-        load_data(conn, xml_dir, args.workers, args.chunksize, args.commit_every, append_only=append_mode)
+        load_data(conn, xml_dirs, args.workers, args.chunksize, args.commit_every, append_only=append_mode)
 
         print('[canon] rebuilding canonical_by_ein_year...')
         rebuild_canonical(conn)

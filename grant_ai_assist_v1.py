@@ -1398,13 +1398,14 @@ def cmd_build_signatures(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_candidate_indexes(conn: sqlite3.Connection) -> None:
+def create_candidate_indexes(conn: sqlite3.Connection, *, analyze: bool = True) -> None:
     statements = [
         _index_sql("idx_ai_cand_sig_rank", CAND_TABLE, "signature_hash, candidate_rank"),
         _index_sql("idx_ai_cand_ein", CAND_TABLE, "ein"),
     ]
     run_index_statements(conn, statements, "candidate")
-    analyze_tables(conn, [CAND_TABLE])
+    if analyze:
+        analyze_tables(conn, [CAND_TABLE])
 
 
 def create_candidate_schema(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True) -> None:
@@ -1441,7 +1442,10 @@ def create_candidate_schema(conn: sqlite3.Connection, full_refresh: bool = False
     """)
     conn.commit()
     if create_indexes:
-        create_candidate_indexes(conn)
+        # Non-full-refresh passes normally run immediately after a full fast
+        # pass. Ensure interrupted/migrated databases have the indexes, but do
+        # not rescan the entire candidate table with ANALYZE before appending.
+        create_candidate_indexes(conn, analyze=False)
 
 
 def identity_rows_by_sql(conn: sqlite3.Connection, sql: str, params: Sequence[Any]) -> List[sqlite3.Row]:
@@ -4557,6 +4561,18 @@ CANDIDATE_RULE_ALIASES = {
     "exact_name_no_geo_distinctive": CANDIDATE_RULES_EXACT_NAME_NO_GEO,
     "distinctive_exact_name_no_geo_safe": CANDIDATE_RULES_EXACT_NAME_NO_GEO,
 }
+GUIDED_IMPORT_RULE_PHASES = (
+    {
+        "exact_name_zip",
+        "exact_name_city_state",
+        "exact_address_zip_good_name",
+        "single_candidate_high_score",
+        "exact_name_state_only",
+        *CANDIDATE_RULES_LARGE_SAFE_REMAINING,
+    },
+    CANDIDATE_RULES_ADDRESS_NAME_REMAINING,
+    CANDIDATE_RULES_EXACT_NAME_NO_GEO,
+)
 CANDIDATE_RULES_ALL = {
     "reported_ein_candidate",
     "single_candidate_high_score",
@@ -4613,6 +4629,48 @@ def parse_rule_list(text_value: str) -> set:
         valid = sorted(CANDIDATE_RULES_ALL | set(CANDIDATE_RULE_ALIASES))
         raise ValueError(f"Unknown candidate rule(s): {', '.join(sorted(unknown))}. Valid: {', '.join(valid)}")
     return rules
+
+
+def classify_selected_candidate_rule(
+    row: sqlite3.Row,
+    args: argparse.Namespace,
+    selected_rules: set,
+) -> Tuple[str, str, float]:
+    """Classify one row while preserving the guided workflow's rule phases.
+
+    The historical guided import invoked four default-threshold rule groups,
+    then the reviewed address/name group with two 0.70 thresholds, then the
+    distinctive-name group with defaults.  Replaying those argument phases for
+    each row produces the same decision priority without rerunning the large
+    ranked-candidate SQL query for every phase.
+    """
+    if not getattr(args, "guided_import_rule_plan", False):
+        bucket, skip_reason, confidence = classify_candidate_rule(row, args)
+        if bucket not in selected_rules:
+            skip_reason = skip_reason or (
+                "rule_not_selected:" + (bucket or "needs_ai_or_review")
+            )
+        return bucket, skip_reason, confidence
+
+    default_args = argparse.Namespace(**vars(args))
+    address_args = argparse.Namespace(**vars(args))
+    address_args.addr_name_min_name_score = 0.70
+    address_args.high_address_geo_min_name_score = 0.70
+    phase_args = (default_args, address_args, default_args)
+    last_bucket = ""
+    last_skip_reason = ""
+    for phase_rules, current_args in zip(GUIDED_IMPORT_RULE_PHASES, phase_args):
+        bucket, skip_reason, confidence = classify_candidate_rule(row, current_args)
+        last_bucket = bucket
+        last_skip_reason = skip_reason
+        if bucket in phase_rules and bucket in selected_rules and not skip_reason:
+            return bucket, "", confidence
+    return (
+        last_bucket,
+        last_skip_reason
+        or "rule_not_selected:" + (last_bucket or "needs_ai_or_review"),
+        0.0,
+    )
 
 
 def iter_candidate_rule_best_rows(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
@@ -5017,9 +5075,9 @@ def cmd_candidate_rule_decisions(args: argparse.Namespace) -> None:
     skip_counts: Counter = Counter(); bucket_counts: Counter = Counter(); started = time.time()
     for row in iter_candidate_rule_best_rows(conn, args):
         scanned += 1
-        bucket, skip_reason, confidence = classify_candidate_rule(row, args)
-        if bucket not in rules:
-            skip_reason = skip_reason or ("rule_not_selected:" + (bucket or "needs_ai_or_review"))
+        bucket, skip_reason, confidence = classify_selected_candidate_rule(
+            row, args, rules
+        )
         if skip_reason:
             skipped += 1; skip_counts[skip_reason] += 1
             if writer and args.include_skipped: writer.writerow(candidate_rule_audit_row(row, "skip", bucket, skip_reason, None, None))
@@ -5666,16 +5724,28 @@ def print_stats(rows: Sequence[Dict[str, Any]], section_filter: Optional[str] = 
             )
 
 
+GRANT_STATS_FIELDNAMES = [
+    "section", "metric", "bucket", "count", "signatures",
+    "grants_represented", "total_amount", "pct_of_grants",
+    "pct_of_section", "notes",
+]
+
+
+def write_stats_csv(rows: Sequence[Dict[str, Any]], output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=GRANT_STATS_FIELDNAMES)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in GRANT_STATS_FIELDNAMES})
+
+
 def cmd_stats(args: argparse.Namespace) -> None:
     conn = connect(args.db, readonly=True)
     rows = collect_stats(conn, top_n=args.top_n, include_final_view=not args.skip_final_view)
     if args.csv_out:
-        fieldnames = ["section", "metric", "bucket", "count", "signatures", "grants_represented", "total_amount", "pct_of_grants", "pct_of_section", "notes"]
-        with open(args.csv_out, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for row in rows:
-                w.writerow({k: row.get(k, "") for k in fieldnames})
+        write_stats_csv(rows, args.csv_out)
         print(f"Wrote stats CSV: {args.csv_out}", flush=True)
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as f:
@@ -6073,6 +6143,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max-candidates", type=int, default=20)
     p.add_argument("--rules", default=CANDIDATE_RULES_DEFAULT, help="Comma-separated rule buckets. Aliases include large_safe_remaining, address_name_remaining, and exact_name_no_geo_distinctive (v1.25).")
+    p.add_argument(
+        "--guided-import-rule-plan",
+        action="store_true",
+        help="Evaluate the guided import's historical rule/threshold phases in one candidate-table scan",
+    )
     p.add_argument("--include-reported-ein", action="store_true", help="Include signatures with valid reported EINs; default excludes them")
     p.add_argument("--include-contradictions", action="store_true", help="Include strong reported-EIN conflict/possible-bad-EIN cases")
     p.add_argument("--include-nonadjudicable-placeholders", action="store_true")

@@ -648,11 +648,23 @@ DATA_IMPORT_HTML = LAYOUT_START + """
   <h3>Run {{ state.run_id }}</h3>
   <ol>
     {% for step in state.steps %}
-      <li><b>{{ step.status|upper }}</b> — {{ step.label }}</li>
+      <li>
+        <b>{{ step.status|upper }}</b> — {{ step.label }}
+        {% if step.duration_seconds is not none %}
+          {% if step.duration_seconds >= 3600 %}
+            ({{ (step.duration_seconds / 3600)|round(2) }} hours)
+          {% elif step.duration_seconds >= 60 %}
+            ({{ (step.duration_seconds / 60)|round(1) }} minutes)
+          {% else %}
+            ({{ step.duration_seconds|round(1) }} seconds)
+          {% endif %}
+        {% endif %}
+      </li>
     {% endfor %}
   </ol>
   {% if state.error %}<pre class="err">{{ state.error }}</pre>{% endif %}
   {% if state.log_path %}<p class="note">Full log: <code>{{ state.log_path }}</code></p>{% endif %}
+  {% if state.summary_path %}<p class="note">Timing summary: <code>{{ state.summary_path }}</code></p>{% endif %}
   <h3>Recent output</h3>
   <pre class="sql-box" style="max-height:460px; overflow:auto; white-space:pre-wrap;">{{ state.logs|join('\n') }}</pre>
 {% endif %}

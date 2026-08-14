@@ -317,7 +317,13 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def refresh_stats(db_path: str, top_n: int = 50, include_final_view: bool = True, work_db_path: Optional[str] = None) -> int:
+def refresh_stats(
+    db_path: str,
+    top_n: int = 50,
+    include_final_view: bool = True,
+    work_db_path: Optional[str] = None,
+    grant_stats_csv_path: Optional[str] = None,
+) -> int:
     db = Path(db_path).expanduser().resolve()
     work_db: Optional[Path] = None
     candidate_work_db = Path(work_db_path or grant_stats.default_grant_work_db_path(str(db))).expanduser().resolve()
@@ -326,11 +332,18 @@ def refresh_stats(db_path: str, top_n: int = 50, include_final_view: bool = True
         work_db = candidate_work_db
     conn = grant_stats.connect(str(db), readonly=False)
     try:
+        grant_match_rows = grant_stats.collect_stats(
+            conn, top_n=top_n, include_final_view=include_final_view
+        )
+        if grant_stats_csv_path:
+            grant_stats.write_stats_csv(grant_match_rows, grant_stats_csv_path)
+            print(f"Wrote stats CSV: {grant_stats_csv_path}")
+
         rows: List[Dict[str, Any]] = []
         rows.extend(_database_file_stats(db, work_db))
         rows.extend(_filing_stats(conn))
         rows.extend(_grant_match_summary(conn))
-        rows.extend(grant_stats.collect_stats(conn, top_n=top_n, include_final_view=include_final_view))
+        rows.extend(grant_match_rows)
 
         refreshed_at = grant_stats.now_stamp()
         _create_schema(conn)
@@ -375,13 +388,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--work-db", default=None, help="Enhanced grant-matching sidecar DB path")
     parser.add_argument("--top-n", type=int, default=50, help="Maximum rows for grouped grant matching breakdowns")
     parser.add_argument("--skip-final-view", action="store_true", help="Skip final resolved view counts")
+    parser.add_argument(
+        "--grant-stats-csv",
+        default=None,
+        help="Write the collected enhanced grant-match statistics to this CSV while refreshing the cache",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        count = refresh_stats(args.db, top_n=args.top_n, include_final_view=not args.skip_final_view, work_db_path=args.work_db)
+        count = refresh_stats(
+            args.db,
+            top_n=args.top_n,
+            include_final_view=not args.skip_final_view,
+            work_db_path=args.work_db,
+            grant_stats_csv_path=args.grant_stats_csv,
+        )
         print(f"Refreshed {count} cached data-stat rows.")
         return 0
     except Exception as e:
