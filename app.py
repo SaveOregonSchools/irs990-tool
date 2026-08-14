@@ -75,6 +75,12 @@ BASE_CSS = """
     --panel: #f7f9fc;
     --primary: #1c78a6;
     --primary-dark: #125f85;
+    --irs-accent: #2f6fad;
+    --irs-panel: #f5f9fd;
+    --olms-accent: #7653a6;
+    --olms-panel: #faf7fd;
+    --maintenance-accent: #b56b22;
+    --maintenance-panel: #fff9f2;
   }
   * { box-sizing: border-box; }
   body {
@@ -150,13 +156,37 @@ BASE_CSS = """
   }
   .home-title-row h2 { margin: 0; }
   .home-title-row .note { margin: 0; }
-  .module-sections { display: grid; gap: 26px; max-width: 900px; margin-top: 18px; }
+  .module-columns {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 20px;
+    align-items: start;
+    margin-top: 18px;
+  }
+  .module-column { display: grid; gap: 20px; }
+  .module-group {
+    border: 2px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    background: #fff;
+  }
+  .module-group-irs { border-color: var(--irs-accent); background: var(--irs-panel); }
+  .module-group-olms { border-color: var(--olms-accent); background: var(--olms-panel); }
+  .module-group-maintenance {
+    border-color: var(--maintenance-accent);
+    background: var(--maintenance-panel);
+  }
+  .module-group-irs .module-section + .module-section {
+    margin-top: 20px;
+    padding-top: 18px;
+    border-top: 1px solid color-mix(in srgb, var(--irs-accent) 35%, transparent);
+  }
   .module-section h3 { margin: 0 0 8px; font-size: 18px; }
   .module-list { display: grid; gap: 10px; }
   .module-row {
     display: grid;
-    grid-template-columns: minmax(210px, 280px) 1fr;
-    gap: 14px;
+    grid-template-columns: minmax(190px, 240px) 1fr;
+    gap: 12px;
     align-items: center;
     padding: 10px 0;
     border-bottom: 1px solid #eef1f5;
@@ -265,6 +295,9 @@ BASE_CSS = """
   .stat-value { font-size: 22px; font-weight: 750; margin-top: 4px; }
   .stats-table-wrap { overflow:auto; max-height: 62vh; border: 1px solid var(--border); }
   .note { color: var(--muted); }
+  @media (max-width: 900px) {
+    .module-columns { grid-template-columns: 1fr; }
+  }
   @media (max-width: 700px) {
     body { padding: 14px 14px 0; }
     .site-header { align-items: flex-start; }
@@ -327,38 +360,117 @@ HOME_HTML = LAYOUT_START + """
   <p class="note">Select a module from the list below</p>
 </div>
 
-<div class="module-sections">
-  {% for section in home_sections %}
-    <section class="module-section">
-      <h3>{{ section.title }}</h3>
-      <div class="module-list">
-        {% for item in section.entries %}
-          <div class="module-row">
-            <a class="module-button" href="{{ item.href }}">{{ item.label }}</a>
-            <div class="description">{{ item.description }}</div>
+<div class="module-columns">
+  <div class="module-column">
+    <div class="module-group module-group-irs">
+      {% for section in home_sections if section.column == 'left' %}
+        <section class="module-section">
+          <h3>{{ section.title }}</h3>
+          <div class="module-list">
+            {% for item in section.entries %}
+              <div class="module-row">
+                <a class="module-button" href="{{ item.href }}">{{ item.label }}</a>
+                <div class="description">{{ item.description }}</div>
+              </div>
+            {% endfor %}
           </div>
-        {% endfor %}
+        </section>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="module-column">
+    {% for section in home_sections if section.column == 'right' %}
+      <div class="module-group module-group-{{ section.group }}">
+        <section class="module-section">
+          <h3>{{ section.title }}</h3>
+          <div class="module-list">
+            {% for item in section.entries %}
+              <div class="module-row">
+                <a class="module-button" href="{{ item.href }}">{{ item.label }}</a>
+                <div class="description">{{ item.description }}</div>
+              </div>
+            {% endfor %}
+          </div>
+        </section>
       </div>
-    </section>
-  {% endfor %}
+    {% endfor %}
+  </div>
 </div>
 """ + LAYOUT_END
 
 HOME_MENU = [
     (
-        "Most Popular",
+        "IRS 990 - Most Popular",
+        "irs",
+        "left",
         [
             (
                 "query",
-                "ngo_core_data_lookup",
-                "Core Data Lookup",
-                "High-level info and financials by tax year for one or more nonprofits.",
+                "nonprofit_deep_dive",
+                "Nonprofit Deep Dive",
+                "Single-EIN profile with trend charts, yearly summaries, top grantors, and compensation.",
+            ),
+            (
+                "query",
+                "ngo_ein_by_name",
+                "Find EINs by Organization Name",
+                "Look up an EIN (Federal Tax ID) by organization name.",
+            ),
+            (
+                "query",
+                "ngo_grants_io",
+                "Grants Paid/Received",
+                "See grants paid and received by a nonprofit by tax year.",
+            ),
+            (
+                "query",
+                "fraud_risk_dashboard",
+                "Fraud & Risk Indicators",
+                "Single-EIN dashboard of financial, governance, lobbying, grant, contractor, and related-org indicators.",
+            ),
+            (
+                "query",
+                "ngo_contractors_out",
+                "Contractors",
+                "Show top contractors paid by a nonprofit by tax year.",
+            ),
+            (
+                "query",
+                "lobbying_political_activity",
+                "Lobbying & Political Activity",
+                "Explore Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators.",
             ),
             (
                 "query",
                 "ask_database",
                 "Ask Database",
                 "Ask a plain-English question involving nonprofit tax data.",
+            ),
+            (
+                "query",
+                "ngo_related_orgs_sched_r",
+                "Schedule R: Related Orgs",
+                "Show related organizations, if applicable, by nonprofit and tax year.",
+            ),
+            (
+                "query",
+                "people_lookup_v2",
+                "Find Filings by Person Name",
+                "Find where person names appear in tax filings.",
+            ),
+        ],
+    ),
+    (
+        "IRS 990 - Other Modules",
+        "irs",
+        "left",
+        [
+            (
+                "query",
+                "ngo_core_data_lookup",
+                "Core Data Lookup",
+                "High-level info and financials by tax year for one or more nonprofits.",
             ),
             (
                 "query",
@@ -374,26 +486,16 @@ HOME_MENU = [
             ),
             (
                 "query",
-                "ngo_grants_io",
-                "Grants Paid/Received",
-                "See grants paid and received by a nonprofit by tax year.",
-            ),
-            (
-                "query",
-                "ngo_ein_by_name",
-                "Find EINs by Organization Name",
-                "Look up an EIN (Federal Tax ID) by organization name.",
-            ),
-            (
-                "query",
-                "people_lookup_v2",
-                "Find Filings by Person Name",
-                "Find where person names appear in tax filings.",
+                "filings_by_eins",
+                "Filings by EINs",
+                "Basic list of available tax filings by EIN.",
             ),
         ],
     ),
     (
         "Labor / OLMS",
+        "olms",
+        "right",
         [
             (
                 "query",
@@ -431,27 +533,12 @@ HOME_MENU = [
                 "OLMS / IRS Match Audit",
                 "Review deterministic F_NUM-to-EIN matches and candidates.",
             ),
-            (
-                "query",
-                "olms_import_audit",
-                "OLMS Import / Data Quality",
-                "Review source hashes, row counts, repairs, quarantines, duplicates, and orphans.",
-            ),
         ],
     ),
     (
         "Data Maintenance",
-        [
-            (
-                "data_import",
-                "data_import",
-                "Import New IRS Data",
-                "Guided XML append, optional EO-BMF installation, and deterministic enhanced grant matching.",
-            ),
-        ],
-    ),
-    (
-        "Other Modules",
+        "maintenance",
+        "right",
         [
             (
                 "stats",
@@ -460,40 +547,16 @@ HOME_MENU = [
                 "Review statistics of what is in this IRS database.",
             ),
             (
-                "query",
-                "nonprofit_deep_dive",
-                "Nonprofit Deep Dive",
-                "Single-EIN profile with trend charts, yearly summaries, top grantors, and compensation.",
+                "data_import",
+                "data_import",
+                "Import New IRS Data",
+                "Guided XML append, optional EO-BMF installation, and deterministic enhanced grant matching.",
             ),
             (
                 "query",
-                "fraud_risk_dashboard",
-                "Fraud & Risk Indicators",
-                "Single-EIN dashboard of financial, governance, lobbying, grant, contractor, and related-org indicators.",
-            ),
-            (
-                "query",
-                "filings_by_eins",
-                "Filings by EIN(s)",
-                "Basic list of available tax filings by EIN.",
-            ),
-            (
-                "query",
-                "ngo_contractors_out",
-                "Contractors",
-                "Show top contractors paid by a nonprofit by tax year.",
-            ),
-            (
-                "query",
-                "lobbying_political_activity",
-                "Lobbying & Political Activity",
-                "Explore Schedule C lobbying, political campaign, 527, dues/proxy-tax, and 990-PF indicators.",
-            ),
-            (
-                "query",
-                "ngo_related_orgs_sched_r",
-                "Schedule R: Related Orgs",
-                "Show related organizations, if applicable, by nonprofit and tax year.",
+                "olms_import_audit",
+                "OLMS Import / Data Quality",
+                "Review source hashes, row counts, repairs, quarantines, duplicates, and orphans.",
             ),
         ],
     ),
@@ -518,7 +581,7 @@ QUERY_HTML = LAYOUT_START + """
   <h2>{{ registry[qkey].META["name"] }}</h2>
   <p>{{ registry[qkey].META.get("description","") }}</p>
 
-  <form method="post" action="{{ url_for('run') }}" onsubmit="return showRunningMessage(event, this);">
+  <form method="post" action="{{ url_for('query_page', qkey=qkey) }}" onsubmit="return showRunningMessage(event, this);">
     <input type="hidden" name="qkey" value="{{ qkey }}">
     {{ registry[qkey].render_fields(form or {}) | safe }}
     <div class="toolbar">
@@ -886,7 +949,7 @@ def _template_context(**extra):
 def _build_home_sections():
     seen_query_keys = set()
     sections = []
-    for title, entries in HOME_MENU:
+    for title, group, column, entries in HOME_MENU:
         items = []
         for entry in entries:
             item_type, key, label = entry[:3]
@@ -923,7 +986,14 @@ def _build_home_sections():
                 }
             )
         if items:
-            sections.append({"title": title, "entries": items})
+            sections.append(
+                {
+                    "title": title,
+                    "group": group,
+                    "column": column,
+                    "entries": items,
+                }
+            )
 
     extra_items = []
     for key, mod in REGISTRY.items():
@@ -937,10 +1007,21 @@ def _build_home_sections():
             }
         )
     if extra_items:
-        if sections and sections[-1]["title"] == "Other Modules":
-            sections[-1]["entries"].extend(extra_items)
+        other_section = next(
+            (section for section in sections if section["title"] == "IRS 990 - Other Modules"),
+            None,
+        )
+        if other_section:
+            other_section["entries"].extend(extra_items)
         else:
-            sections.append({"title": "Other Modules", "entries": extra_items})
+            sections.append(
+                {
+                    "title": "IRS 990 - Other Modules",
+                    "group": "irs",
+                    "column": "left",
+                    "entries": extra_items,
+                }
+            )
     return sections
 
 
@@ -1170,12 +1251,22 @@ def home():
     return _render_home()
 
 
-@app.route("/query/<qkey>", methods=["GET"])
+@app.route("/query/<qkey>", methods=["GET", "POST"])
 def query_page(qkey):
     ensure_registry()
     if qkey not in REGISTRY:
         return redirect(url_for("home"))
-    return _render_query(qkey, form=request.args.to_dict(flat=True), headers=None, rows=None, error=None)
+    if request.method == "POST":
+        form = request.form.to_dict(flat=True)
+        form["qkey"] = qkey
+        return _run_query(qkey, form)
+    return _render_query(
+        qkey,
+        form=request.args.to_dict(flat=True),
+        headers=None,
+        rows=None,
+        error=None,
+    )
 
 
 @app.route("/stats", methods=["GET"])
@@ -1297,6 +1388,10 @@ def run():
     if qkey not in REGISTRY:
         return redirect(url_for("home"))
     form = request.form.to_dict(flat=True)
+    return _run_query(qkey, form)
+
+
+def _run_query(qkey, form):
     error = None
     headers, rows = None, None
     try:

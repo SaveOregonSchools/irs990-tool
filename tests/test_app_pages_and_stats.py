@@ -199,9 +199,12 @@ class AppPagesAndStatsTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("Database Statistics", body)
-        self.assertIn("Most Popular", body)
-        self.assertIn("Other Modules", body)
+        self.assertIn("IRS 990 - Most Popular", body)
+        self.assertIn("IRS 990 - Other Modules", body)
         self.assertIn("Ask Database", body)
+        self.assertIn('class="module-columns"', body)
+        self.assertIn('class="module-group module-group-irs"', body)
+        self.assertIn('class="module-group module-group-maintenance"', body)
         self.assertIn("Select a module from the list below", body)
         self.assertIn("Ask a plain-English question involving nonprofit tax data.", body)
         self.assertIn("Review statistics of what is in this IRS database.", body)
@@ -216,6 +219,55 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertNotIn("Select the module to open", body)
         self.assertNotIn("Choose a research module", body)
         self.assertNotIn("Preview row limit", body)
+
+    def test_home_menu_matches_requested_groups_and_order(self):
+        actual = {
+            title: [entry[2] for entry in entries]
+            for title, _group, _column, entries in app_module.HOME_MENU
+        }
+        self.assertEqual(
+            actual,
+            {
+                "IRS 990 - Most Popular": [
+                    "Nonprofit Deep Dive",
+                    "Find EINs by Organization Name",
+                    "Grants Paid/Received",
+                    "Fraud & Risk Indicators",
+                    "Contractors",
+                    "Lobbying & Political Activity",
+                    "Ask Database",
+                    "Schedule R: Related Orgs",
+                    "Find Filings by Person Name",
+                ],
+                "IRS 990 - Other Modules": [
+                    "Core Data Lookup",
+                    "Grants Received",
+                    "Grants Paid",
+                    "Filings by EINs",
+                ],
+                "Labor / OLMS": [
+                    "Union Deep Dive",
+                    "Filing Compliance / Timeliness",
+                    "Grants / Contributions Paid",
+                    "Vendors / Contractors / Payees",
+                    "Grantee / Vendor Explorer",
+                    "OLMS / IRS Match Audit",
+                ],
+                "Data Maintenance": [
+                    "Database Statistics",
+                    "Import New IRS Data",
+                    "OLMS Import / Data Quality",
+                ],
+            },
+        )
+        placements = {
+            title: (group, column)
+            for title, group, column, _entries in app_module.HOME_MENU
+        }
+        self.assertEqual(placements["IRS 990 - Most Popular"], ("irs", "left"))
+        self.assertEqual(placements["IRS 990 - Other Modules"], ("irs", "left"))
+        self.assertEqual(placements["Labor / OLMS"], ("olms", "right"))
+        self.assertEqual(placements["Data Maintenance"], ("maintenance", "right"))
 
     def test_toolbox_home_link_is_opt_in(self):
         client = app_module.app.test_client()
@@ -237,12 +289,17 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertIn('aria-label="Home"', body)
         self.assertIn("Preview row limit", body)
         self.assertIn('onchange="this.form.submit()"', body)
+        self.assertIn('action="/query/fixture_query"', body)
         self.assertNotIn("loadBtn", body)
         self.assertNotIn(">Load<", body)
         self.assertNotIn("Refresh Queries", body)
 
-        run_response = client.post("/run", data={"qkey": "fixture_query", "_limit": "5"})
+        run_response = client.post(
+            "/query/fixture_query",
+            data={"qkey": "fixture_query", "_limit": "5"},
+        )
         run_body = run_response.get_data(as_text=True)
+        self.assertEqual(run_response.request.path, "/query/fixture_query")
         self.assertIn("value", run_body)
 
     def test_pdf_query_hides_generic_preview_and_csv_controls(self):
