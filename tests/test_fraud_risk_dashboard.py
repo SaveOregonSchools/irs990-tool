@@ -185,6 +185,7 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertEqual(rows, [])
         html = mod.render_results({"org_search": "Risky"}, headers, rows)
         self.assertIn("Organization Matches", html)
+        self.assertIn('action="/query/fraud_risk_dashboard"', html)
         self.assertIn("Risky Org", html)
         self.assertIn("Analyze</button>", html)
         self.assertIn('name="qkey" value="fraud_risk_dashboard"', html)

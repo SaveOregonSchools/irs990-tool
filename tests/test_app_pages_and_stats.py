@@ -237,12 +237,17 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertIn('aria-label="Home"', body)
         self.assertIn("Preview row limit", body)
         self.assertIn('onchange="this.form.submit()"', body)
+        self.assertIn('action="/query/fixture_query"', body)
         self.assertNotIn("loadBtn", body)
         self.assertNotIn(">Load<", body)
         self.assertNotIn("Refresh Queries", body)
 
-        run_response = client.post("/run", data={"qkey": "fixture_query", "_limit": "5"})
+        run_response = client.post(
+            "/query/fixture_query",
+            data={"qkey": "fixture_query", "_limit": "5"},
+        )
         run_body = run_response.get_data(as_text=True)
+        self.assertEqual(run_response.request.path, "/query/fixture_query")
         self.assertIn("value", run_body)
 
     def test_pdf_query_hides_generic_preview_and_csv_controls(self):

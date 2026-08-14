@@ -203,6 +203,7 @@ class NonprofitDeepDiveTests(unittest.TestCase):
 
         html = mod.render_results({"org_search": "Deep Dive"}, headers, rows)
         self.assertIn("Organization Matches", html)
+        self.assertIn('action="/query/nonprofit_deep_dive"', html)
         self.assertIn("Deep Dive Org", html)
         self.assertIn("111111111", html)
         self.assertIn("Portland, OR", html)

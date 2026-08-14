@@ -518,7 +518,7 @@ QUERY_HTML = LAYOUT_START + """
   <h2>{{ registry[qkey].META["name"] }}</h2>
   <p>{{ registry[qkey].META.get("description","") }}</p>
 
-  <form method="post" action="{{ url_for('run') }}" onsubmit="return showRunningMessage(event, this);">
+  <form method="post" action="{{ url_for('query_page', qkey=qkey) }}" onsubmit="return showRunningMessage(event, this);">
     <input type="hidden" name="qkey" value="{{ qkey }}">
     {{ registry[qkey].render_fields(form or {}) | safe }}
     <div class="toolbar">
@@ -1170,12 +1170,22 @@ def home():
     return _render_home()
 
 
-@app.route("/query/<qkey>", methods=["GET"])
+@app.route("/query/<qkey>", methods=["GET", "POST"])
 def query_page(qkey):
     ensure_registry()
     if qkey not in REGISTRY:
         return redirect(url_for("home"))
-    return _render_query(qkey, form=request.args.to_dict(flat=True), headers=None, rows=None, error=None)
+    if request.method == "POST":
+        form = request.form.to_dict(flat=True)
+        form["qkey"] = qkey
+        return _run_query(qkey, form)
+    return _render_query(
+        qkey,
+        form=request.args.to_dict(flat=True),
+        headers=None,
+        rows=None,
+        error=None,
+    )
 
 
 @app.route("/stats", methods=["GET"])
@@ -1297,6 +1307,10 @@ def run():
     if qkey not in REGISTRY:
         return redirect(url_for("home"))
     form = request.form.to_dict(flat=True)
+    return _run_query(qkey, form)
+
+
+def _run_query(qkey, form):
     error = None
     headers, rows = None, None
     try:

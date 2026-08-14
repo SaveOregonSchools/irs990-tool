@@ -1068,7 +1068,7 @@ def _render_search_results(report: Dict) -> str:
               <td>{_h(item.get("tax_year"))}</td>
               <td>{_h(item.get("return_type"))}</td>
               <td>
-                <form method="post" action="/run" style="margin:0;">
+                <form method="post" action="/query/nonprofit_deep_dive" style="margin:0;">
                   <input type="hidden" name="qkey" value="nonprofit_deep_dive">
                   <input type="hidden" name="org_search" value="{_h(query)}">
                   <input type="hidden" name="ein" value="{ein}">
