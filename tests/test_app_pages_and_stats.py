@@ -1,3 +1,4 @@
+import csv
 import os
 import sqlite3
 import tempfile
@@ -340,6 +341,35 @@ class AppPagesAndStatsTests(unittest.TestCase):
             self.assertIn("enhanced_match", body)
             self.assertIn("human_review", body)
             self.assertIn("pending_ai_adjudication", body)
+
+    def test_stats_refresh_reuses_one_collection_for_csv_and_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "fixture.db"
+            csv_path = Path(tmp) / "grant_match_stats.csv"
+            build_stats_fixture(db_path)
+
+            with patch.object(
+                refresh_data_stats.grant_stats,
+                "collect_stats",
+                wraps=refresh_data_stats.grant_stats.collect_stats,
+            ) as collect_stats:
+                refresh_data_stats.refresh_stats(
+                    str(db_path),
+                    include_final_view=False,
+                    grant_stats_csv_path=str(csv_path),
+                )
+
+            self.assertEqual(collect_stats.call_count, 1)
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertTrue(
+                any(
+                    row["section"] == "raw_grants"
+                    and row["metric"] == "total_grants"
+                    and row["count"] == "3"
+                    for row in rows
+                )
+            )
 
 
 if __name__ == "__main__":
