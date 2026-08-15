@@ -195,7 +195,10 @@ staging filename. The loader builds beside that filename, fails on the first
 XML extraction/header error, verifies exact return/filing/object/source coverage
 and `PRAGMA quick_check`, checkpoints the WAL, and only then atomically installs
 the requested staging file. A failed run removes its temporary build and never
-publishes a partial destination. Rescan the archive and re-import
+publishes a partial destination. Multi-worker extraction submits at most twice
+the worker count in ordered batches, avoiding the unbounded task queue created
+by older `ProcessPoolExecutor.map` implementations while retaining deterministic
+input/result order. Rescan the archive and re-import
 `loaded_filings` into the manifest whenever the relative XML tree or production
 source population changes.
 

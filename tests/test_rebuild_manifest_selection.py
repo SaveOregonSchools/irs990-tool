@@ -471,3 +471,41 @@ def test_manifest_coverage_validation_is_a_hard_failure():
             rebuild.validate_manifest_load(conn, selection, processed=2)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_manifest_temp_cleanup_handles_base_exceptions(
+    tmp_path: Path, monkeypatch, exception_type
+):
+    root = tmp_path / "xml"
+    root.mkdir()
+    source = _write_xml(root, "1300_public.xml")
+    manifest = tmp_path / "manifest.db"
+    _create_manifest(
+        manifest,
+        [_source_row(root, "1300_public.xml", "1300")],
+        [_loaded_row("1300_public", "1300", str(source))],
+    )
+    destination = tmp_path / "staging.db"
+
+    def interrupt_build(temp_path, _xml_dirs, _args, _selection):
+        temp_path.write_bytes(b"partial")
+        Path(str(temp_path) + "-wal").write_bytes(b"wal")
+        Path(str(temp_path) + "-shm").write_bytes(b"shm")
+        raise exception_type()
+
+    monkeypatch.setattr(rebuild, "build_database", interrupt_build)
+
+    with pytest.raises(exception_type):
+        rebuild.main(
+            [
+                "--db", str(destination),
+                "--xml-dir", str(root),
+                "--manifest-db", str(manifest),
+                "--manifest-clean-rebuild",
+                "--expected-selection-count", "1",
+            ]
+        )
+
+    assert not destination.exists()
+    assert list(tmp_path.glob("staging.db.building-*.db*")) == []

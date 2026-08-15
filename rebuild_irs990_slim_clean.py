@@ -16,17 +16,18 @@ Patched version:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass
 import hashlib
-from itertools import groupby
+from itertools import groupby, islice
 import os
 import sqlite3
 import stat
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Executor, ProcessPoolExecutor
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 import xml.etree.ElementTree as ET
 
 from common import DB_PATH, configured_xml_root
@@ -41,6 +42,7 @@ MANIFEST_DUPLICATE_STATUSES = {
     'object_id_conflict',
 }
 HASH_CHUNK_SIZE = 1024 * 1024
+PROCESS_BATCH_PREFETCH_MULTIPLIER = 2
 
 
 class ManifestSelectionError(RuntimeError):
@@ -2265,6 +2267,62 @@ def rebuild_canonical(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _apply_ordered_batch(function: Callable[[Any], Any], values: Sequence[Any]) -> List[Any]:
+    """Worker entry point kept at module scope so Windows spawn can pickle it."""
+    return [function(value) for value in values]
+
+
+def bounded_ordered_executor_map(
+    executor: Executor,
+    function: Callable[[Any], Any],
+    values: Iterable[Any],
+    *,
+    chunksize: int,
+    max_pending_batches: int,
+) -> Iterator[Any]:
+    """Map lazily with a fixed batch window while preserving input order.
+
+    ``Executor.map`` eagerly collects its input on Python versions without the
+    newer ``buffersize`` argument.  A multi-million-file rebuild must work on
+    those versions too, so this feeder submits only a bounded deque of explicit
+    batches.  Pending work is cancelled if a worker/result or the consumer
+    raises.  Already-running process work cannot be cancelled, but is bounded by
+    the configured window.
+    """
+    batch_size = int(chunksize)
+    pending_limit = int(max_pending_batches)
+    if batch_size < 1:
+        raise ValueError('chunksize must be at least 1')
+    if pending_limit < 1:
+        raise ValueError('max_pending_batches must be at least 1')
+
+    iterator = iter(values)
+    pending: Deque[Any] = deque()
+
+    def submit_next() -> bool:
+        batch = list(islice(iterator, batch_size))
+        if not batch:
+            return False
+        pending.append(executor.submit(_apply_ordered_batch, function, batch))
+        return True
+
+    try:
+        while len(pending) < pending_limit and submit_next():
+            pass
+        while pending:
+            future = pending.popleft()
+            batch_results = future.result()
+            for result in batch_results:
+                yield result
+            submit_next()
+    finally:
+        while pending:
+            pending.popleft().cancel()
+        close_iterator = getattr(iterator, 'close', None)
+        if callable(close_iterator):
+            close_iterator()
+
+
 def load_data(
     conn: sqlite3.Connection,
     xml_dirs: Sequence[Path],
@@ -2409,8 +2467,20 @@ def load_data(
             handle(extract_file(fp))
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for row in ex.map(extract_file, files_iter, chunksize=chunksize):
-                handle(row)
+            mapped = bounded_ordered_executor_map(
+                ex,
+                extract_file,
+                files_iter,
+                chunksize=chunksize,
+                max_pending_batches=max(
+                    1, int(workers) * PROCESS_BATCH_PREFETCH_MULTIPLIER
+                ),
+            )
+            try:
+                for row in mapped:
+                    handle(row)
+            finally:
+                mapped.close()
 
     conn.commit()
     print(f'[load] done: {processed:,} files')
@@ -3171,12 +3241,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             os.replace(temp_path, manifest_destination)
         except Exception as exc:
-            _remove_staging_files(temp_path)
             print(f'ERROR: manifest clean rebuild failed atomically: {exc}', file=sys.stderr)
             return 1
         finally:
-            if temp_path.exists():
-                _remove_staging_files(temp_path)
+            # BaseException subclasses (KeyboardInterrupt/SystemExit) bypass
+            # the ordinary error handler but must never leave a partial DB/WAL.
+            _remove_staging_files(temp_path)
         print(f'[publish] installed validated staging database: {manifest_destination}')
     else:
         build_database(db_path, xml_dirs, args)
