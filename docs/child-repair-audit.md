@@ -17,9 +17,12 @@ active production database:
 
 ```powershell
 $stamp = Get-Date -Format yyyyMMdd-HHmmss
+$xmlRoot = (Resolve-Path $env:IRS_XML_ROOT).Path
 .\.venv\Scripts\python.exe audit_child_repair.py `
   --source-db db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db `
   --repaired-db db\irs990-repaired-YYYYMMDD-HHMMSS.db `
+  --source-manifest-db db\irs990_sources.db `
+  --manifest-xml-root $xmlRoot `
   --summary-csv "exports\child-repair-summary-$stamp.csv" `
   --detail-csv "exports\child-repair-detail-$stamp.csv" `
   --detail-json "exports\child-repair-detail-$stamp.json" `
@@ -32,8 +35,8 @@ Omit it only when newly extracted child rows have been separately reviewed and
 are intentionally allowed.
 
 The default audit treats extractor-driven payload changes as failures. For the
-current clean-rebuild repair only, the following explicit opt-in enables three
-narrow verifiers:
+current clean-rebuild repair only, the following explicit opt-in enables four
+narrow policies across three extractor families:
 
 ```powershell
 --allow-verified-extractor-enrichments `
@@ -54,9 +57,9 @@ The command writes reports atomically and returns:
 - `3` for an operational error such as a missing database or unsafe report
   path.
 
-The tool refuses to use either database path—or its `-wal`, `-shm`, or
-`-journal` companion path—as a report path. All three report paths must also be
-distinct.
+The tool refuses to use the source, repaired, or source-manifest database
+path—or any database's `-wal`, `-shm`, or `-journal` companion path—as a report
+path. All three report paths must also be distinct.
 
 ## Exact returns and provenance population
 
@@ -72,6 +75,41 @@ malformed object coverage, duplicate return rows, missing filings, newly
 introduced filings, and changed source provenance are all hard cutover
 failures. New return rows fail even when `--fail-on-new` is omitted; that option
 controls only newly introduced child sets.
+
+Some historical loaded paths predate the current archive layout, so even the
+archive-directory suffix can legitimately differ. The paired
+`--source-manifest-db` and `--manifest-xml-root` options enable a narrower
+authoritative proof for an otherwise path-only `returns` mismatch. The auditor
+holds the manifest in one read-only snapshot and requires all of the following:
+
+- the manifest has completed-scan metadata, and every candidate source row and
+  the single loaded row belong to that completed scan;
+- the historical return path matches the full loaded-manifest path (an old root
+  prefix may differ when the manifest stored a relative path, but a basename or
+  partial directory tail is insufficient);
+- the rebuild's exact manifest selection policy chooses one source, including
+  loaded-path preservation for object-ID conflicts and the primary source for
+  byte-identical duplicates;
+- the repaired `source_file` is an absolute, root-confined path resolving to
+  that exact selected source—not merely another file with the same basename or
+  relative tail;
+- the selected file still matches its manifest size, mtime, and SHA-256 when
+  recorded, and its object/filing identity is exact; and
+- typed EIN, tax year, and return type agree across the source return, repaired
+  return, loaded-manifest row, and freshly parsed selected XML header. `NULL`
+  and numeric zero are different values.
+
+Any missing, stale, ambiguous, changed, out-of-root, non-selected, or
+metadata-inconsistent evidence remains a hard failure. The rule does not admit
+general return payload changes and is never a basename-only equivalence.
+
+For the August 2026 repair, this proof covers 311,335 historical layout changes:
+222,964 paths loaded from `Found/2022_TEOS_XML_02A/cycles_*` and now selected
+from `Found/2022_TEOS_XML_11A`, `11B`, or `11C`; and 88,371 paths loaded from
+`Found/2019` and now selected from the verified 2017–2018 archive directories.
+Every one has a unique authoritative manifest selection and exact typed
+filing metadata; the audit still independently verifies each selected file and
+XML header rather than trusting those aggregate counts.
 
 The `returns` summary also records the exact distinct filing, source-file, and
 normalized-object counts for both databases. Each side must have one return,
@@ -108,6 +146,7 @@ variant before the database comparison runs.
 |---|---|---|
 | `expected_exact_replay_cleanup` | The repaired payload multiset has the same payload signatures and lower multiplicities. Removed rows are exact copies. | Pass |
 | `verified_extractor_enrichment` | An explicitly enabled, allowlisted extractor enrichment passed its complete directional and XML checks. | Pass |
+| `verified_zero_only_placeholder_removal` | An explicitly enabled source-only grant row exactly matched a strict zero-only `RecipientTable` placeholder in the selected XML, while the complete current extraction exactly matched the repaired rows. | Pass |
 | `missing_in_rebuild` | A source child set became empty in the repaired database. | Fail |
 | `new_in_rebuild` | A child set exists only in the repaired database. | Report; fail with `--fail-on-new` |
 | `content_changed` | Payload signatures changed, or row additions/removals are not exact replay cleanup. | Fail |
@@ -131,6 +170,19 @@ difference. It recognizes only:
   only substantive value is the repaired cash zero are rejected. An explicit
   noncash zero or any other populated recipient/purpose/noncash field is not
   treated as blank.
+- `grants` zero-only placeholder removal: every source-only payload must have
+  numeric-zero `cash_grant_amt` and no recipient, purpose, address, IRC,
+  noncash, valuation, or other grant value. The complete source counter must
+  equal the repaired counter plus exactly those payloads; this forbids a
+  combined enrichment, replay reduction, addition, or unrelated removal. The
+  selected XML must contain the identical typed payload counter, including
+  filer EIN and name, as strict `RecipientTable` groups whose sole nonblank XML
+  value is numeric-zero `CashGrantAmt`. A zero-only
+  `GrantOrContributionPdDurYrGrp`, any populated field (including explicit
+  noncash zero), or different placeholder multiplicity fails. Finally, the
+  complete repaired grant multiset must exactly equal a fresh current
+  extraction of that selected XML. Passing cases use the separate
+  `verified_zero_only_placeholder_removal` classification.
 - `irs990_pf_officer_dir_trst_key_empl_info_grp`: source NULL values may be
   populated only in `employee_benefits_amt` and/or `expense_account_amt`, with
   all other fields unchanged and replay reduction proven directionally. The
@@ -156,8 +208,10 @@ the general `new_in_rebuild` behavior described above.
 
 The summary CSV has a `returns` population/provenance row, one row per repeated
 child table, and `__TOTAL__`. It records indexed row/filing counts,
-source-file/object coverage, mismatch classifications, extra rows, whole-set
-replay candidates, grant inflation counts, and gate failures.
+source-file/object coverage, authoritative `manifest_provenance_matches`,
+mismatch classifications, extra rows, whole-set replay candidates, grant
+inflation counts, and gate failures. The JSON metadata records the read-only
+manifest database identity, completed scan ID/time, and explicit XML root.
 
 The detail CSV contains bounded evidence sampled in filing-index order. By
 default it writes at most 1,000 mismatched filing/table rows per audit scope and

@@ -229,6 +229,8 @@ Use this order; do not build the global network from the known-dirty children:
    .\.venv\Scripts\python.exe audit_child_repair.py `
      --source-db db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db `
      --repaired-db db\irs990-repaired-YYYYMMDD-HHMMSS.db `
+     --source-manifest-db db\irs990_sources.db `
+     --manifest-xml-root $xmlRoot `
      --summary-csv "exports\child-repair-summary-$auditStamp.csv" `
      --detail-csv "exports\child-repair-detail-$auditStamp.csv" `
      --detail-json "exports\child-repair-detail-$auditStamp.json" `
@@ -243,7 +245,13 @@ Use this order; do not build the global network from the known-dirty children:
    PF benefit/expense, and selected-XML Schedule C changes; omitting it preserves
    hard-fail behavior. Grant, PF, and Schedule C candidates are re-extracted
    from their root-confined selected XML one filing at a time, so budget
-   additional audit runtime. See
+   additional audit runtime. The separate manifest flags also verify historical
+   `returns.source_file` layout migrations against the completed scan, exact
+   rebuild selection, unchanged selected file, and typed XML header; a basename,
+   partial directory tail, non-selected duplicate, or out-of-root path never
+   passes. The August 2026 repair contains 311,335 such verified path-only
+   candidates (222,964 from the former 2022 cycle layout and 88,371 from the
+   former `Found/2019` layout). See
    [Child-row repair audit](child-repair-audit.md) for classifications,
    report fields, limitations, and acceptance gates.
 4. **Rebuild grant resolution and reapply decisions.** Use the sequence below,

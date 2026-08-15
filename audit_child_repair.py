@@ -34,7 +34,13 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from rebuild_irs990_slim_clean import (
+    ManifestSelectionError,
     MULTIROW_CHILD_TABLES,
+    _choose_manifest_source,
+    _loaded_path_matches,
+    _manifest_relative_path,
+    _require_manifest_schema,
+    _resolve_manifest_source,
     descendants_first_by_col,
     extract_file,
     extract_schedule_c_supplemental,
@@ -46,7 +52,7 @@ from rebuild_irs990_slim_clean import (
 )
 
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 5
 HARD_FAILURE_CLASSES = {"missing_in_rebuild", "content_changed", "unexplained"}
 SQLITE_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
 MULTISET_MASK = (1 << 256) - 1
@@ -158,9 +164,11 @@ SUMMARY_FIELDS = [
     "repaired_source_file_covered_rows",
     "source_object_covered_filings",
     "repaired_object_covered_filings",
+    "manifest_provenance_matches",
     "mismatched_filings",
     "expected_exact_replay_cleanup",
     "verified_extractor_enrichment",
+    "verified_zero_only_placeholder_removal",
     "missing_in_rebuild",
     "new_in_rebuild",
     "content_changed",
@@ -461,6 +469,7 @@ class TransformVerification:
     kind: str = ""
     source_extra_rows: int = 0
     new_payload_rows: int = 0
+    classification: str = "verified_extractor_enrichment"
 
 
 TransformCompatibility = Callable[
@@ -775,6 +784,63 @@ def is_zero_only_blank_grant(values: Mapping[str, PayloadToken]) -> bool:
     )
 
 
+def strict_zero_only_recipient_placeholder_counter(
+    root: ET.Element,
+    header: Mapping[str, Any],
+) -> Counter[str]:
+    """Map only structurally blank Schedule I zero-cash placeholders.
+
+    The allowlist is deliberately narrower than general grant extraction: the
+    group must be ``RecipientTable`` and its sole nonblank XML value must be a
+    numeric-zero ``CashGrantAmt``.  Attributes or mixed-content tails make the
+    group ineligible.  The resulting signature includes every audited grant
+    field, including filer metadata from the selected XML header, so it can be
+    compared exactly with the source-only payload counter.
+    """
+
+    placeholders: Counter[str] = Counter()
+    for group in find_groups(root, ["RecipientTable"]):
+        nodes = list(group.iter())
+        if any(
+            str(value or "").strip()
+            for node in nodes
+            for value in node.attrib.values()
+        ):
+            continue
+        if any(
+            str(node.tail or "").strip()
+            for node in nodes
+            if node is not group
+        ):
+            continue
+        populated = [
+            (local(node.tag).casefold(), str(node.text or "").strip())
+            for node in nodes
+            if str(node.text or "").strip()
+        ]
+        if len(populated) != 1:
+            continue
+        tag, value = populated[0]
+        if tag != "cashgrantamt" or decimal_value(value) != Decimal(0):
+            continue
+        row: Dict[str, Any] = {column: None for column in GRANT_PAYLOAD_COLUMNS}
+        row.update(
+            {
+                "filer_ein": header.get("ein"),
+                "filer_name": header.get("org_name"),
+                "cash_grant_amt": value,
+            }
+        )
+        placeholders[
+            mapping_payload_key(
+                row,
+                GRANT_PAYLOAD_COLUMNS,
+                numeric_columns=GRANT_NUMERIC_COLUMNS,
+            )
+        ] += 1
+    return placeholders
+
+
 def verify_grant_extractor_enrichment(
     filing_id: Any,
     source_counter: Counter[str],
@@ -788,13 +854,26 @@ def verify_grant_extractor_enrichment(
             return TransformVerification(False, "zero-only blank grant row is not allowed")
     if tuple(payload_columns) != GRANT_PAYLOAD_COLUMNS:
         return TransformVerification(False, "grant payload schema differs from current extractor")
-    result = verify_directional_payload_transform(
-        source_counter,
-        repaired_counter,
-        grant_null_to_zero_compatibility,
+
+    source_only = source_counter - repaired_counter
+    repaired_only = repaired_counter - source_counter
+    placeholder_removal = bool(source_only) and not repaired_only and all(
+        is_zero_only_blank_grant(decode_payload_key(payload))
+        for payload in source_only
     )
-    if not result.verified:
-        return result
+    placeholder_removal = bool(
+        placeholder_removal
+        and source_counter == repaired_counter + source_only
+    )
+    directional_result: Optional[TransformVerification] = None
+    if not placeholder_removal:
+        directional_result = verify_directional_payload_transform(
+            source_counter,
+            repaired_counter,
+            grant_null_to_zero_compatibility,
+        )
+        if not directional_result.verified:
+            return directional_result
     if not repaired_meta:
         return TransformVerification(False, "repaired return metadata is unavailable")
     candidate, path_error = resolve_selected_xml_path(
@@ -836,10 +915,37 @@ def verify_grant_extractor_enrichment(
             False,
             "full repaired grant multiset differs from current selected-XML extraction",
         )
+    if placeholder_removal:
+        try:
+            root = ET.parse(candidate).getroot()
+        except (OSError, ET.ParseError) as exc:
+            return TransformVerification(
+                False,
+                "selected XML could not be parsed for strict grant placeholders: "
+                f"{type(exc).__name__}",
+            )
+        xml_placeholders = strict_zero_only_recipient_placeholder_counter(root, header)
+        if xml_placeholders != source_only:
+            return TransformVerification(
+                False,
+                "source-only grant payloads do not exactly match strict zero-only "
+                "RecipientTable placeholders in selected XML",
+            )
+        return TransformVerification(
+            verified=True,
+            reason=(
+                "strict selected-XML zero-only RecipientTable removal and current "
+                "extractor exactly verified"
+            ),
+            kind="grants_zero_only_recipient_placeholder_removal",
+            source_extra_rows=sum(source_only.values()),
+            classification="verified_zero_only_placeholder_removal",
+        )
+    assert directional_result is not None
     return TransformVerification(
         True,
         "directional transform and selected XML/current extractor exactly verified",
-        result.enriched_rows,
+        directional_result.enriched_rows,
         "grants_cash_null_to_zero",
         sum(source_counter.values()) - sum(repaired_counter.values()),
         0,
@@ -1117,6 +1223,186 @@ def source_files_equivalent(source_file: Any, repaired_source_file: Any) -> bool
             break
         common_suffix_parts += 1
     return common_suffix_parts >= MIN_RELOCATED_SOURCE_SUFFIX_PARTS
+
+
+@dataclass(frozen=True)
+class ManifestProvenanceResult:
+    verified: bool
+    reason: str
+    selection_strategy: str = ""
+    selected_relative_path: str = ""
+
+
+class ManifestProvenanceVerifier:
+    """Verify historical-to-current source relocation against one completed scan."""
+
+    def __init__(self, manifest_db: Path, xml_root: Path) -> None:
+        self.manifest_db = manifest_db.expanduser().resolve()
+        self.xml_root = xml_root.expanduser().resolve()
+        if not self.xml_root.is_dir():
+            raise ValueError(f"manifest XML root is not a directory: {self.xml_root}")
+        self.conn = connect_readonly(self.manifest_db)
+        try:
+            self.conn.execute("PRAGMA trusted_schema=OFF")
+            self.scan_id, self.scanned_at = _require_manifest_schema(
+                self.conn,
+                self.manifest_db,
+            )
+            loaded_columns = set(table_columns(self.conn, "loaded_filings"))
+            missing_metadata = {
+                "ein",
+                "tax_year",
+                "return_type",
+            }.difference(loaded_columns)
+            if missing_metadata:
+                raise AuditInvariantError(
+                    "manifest loaded_filings lacks provenance metadata column(s): "
+                    + ", ".join(sorted(missing_metadata))
+                )
+        except Exception:
+            self.conn.close()
+            raise
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def verify(
+        self,
+        filing_id: Any,
+        historical_source_file: Any,
+        repaired_source_file: Any,
+        source_meta: Optional[Mapping[str, Any]],
+        repaired_meta: Optional[Mapping[str, Any]],
+    ) -> ManifestProvenanceResult:
+        try:
+            filing_text = str(filing_id or "").strip()
+            object_id = object_id_from_filing_id(filing_text)
+            if not filing_text or not object_id:
+                raise ManifestSelectionError("blank filing/object ID")
+            if not source_meta or not repaired_meta:
+                raise ManifestSelectionError("returns metadata is unavailable")
+            if (
+                str(source_meta.get("filing_id") or "") != filing_text
+                or str(repaired_meta.get("filing_id") or "") != filing_text
+            ):
+                raise ManifestSelectionError("returns metadata filing_id differs")
+
+            loaded_rows = self.conn.execute(
+                "SELECT * FROM loaded_filings WHERE object_id=?",
+                (object_id,),
+            ).fetchall()
+            source_rows = self.conn.execute(
+                "SELECT * FROM source_files WHERE object_id=? ORDER BY relative_path",
+                (object_id,),
+            ).fetchall()
+            if len(loaded_rows) != 1:
+                raise ManifestSelectionError(
+                    f"manifest has {len(loaded_rows)} loaded rows for object; expected one"
+                )
+            if not source_rows:
+                raise ManifestSelectionError("manifest has no source row for object")
+            loaded_row = loaded_rows[0]
+            if str(loaded_row["imported_at"] or "") != self.scanned_at:
+                raise ManifestSelectionError(
+                    "loaded row is not from the completed manifest scan"
+                )
+            if any(str(row["scan_id"] or "") != self.scan_id for row in source_rows):
+                raise ManifestSelectionError(
+                    "source row is not from the completed manifest scan"
+                )
+            for row in source_rows:
+                if _manifest_relative_path(row["source_file"]) != _manifest_relative_path(
+                    row["relative_path"]
+                ):
+                    raise ManifestSelectionError(
+                        "manifest source_file and relative_path differ"
+                    )
+
+            selected, strategy = _choose_manifest_source(
+                object_id,
+                source_rows,
+                loaded_row,
+            )
+            if (
+                str(loaded_row["filing_id"] or "") != filing_text
+                or str(selected["filing_id"] or "") != filing_text
+                or str(loaded_row["object_id"] or "") != object_id
+                or str(selected["object_id"] or "") != object_id
+            ):
+                raise ManifestSelectionError(
+                    "manifest filing/object identity differs from returns"
+                )
+
+            loaded_parts = normalized_source_path_parts(loaded_row["source_file"])
+            if len(loaded_parts) < MIN_RELOCATED_SOURCE_SUFFIX_PARTS:
+                raise ManifestSelectionError(
+                    "manifest loaded source lacks an archive directory"
+                )
+            if not normalized_source_path_parts(historical_source_file):
+                raise ManifestSelectionError(
+                    "historical returns source path is invalid"
+                )
+            if not _loaded_path_matches(
+                historical_source_file,
+                loaded_row["source_file"],
+            ):
+                raise ManifestSelectionError(
+                    "historical returns source does not match manifest loaded source"
+                )
+
+            for column in ("ein", "tax_year", "return_type"):
+                source_token = scalar_token(source_meta.get(column))
+                if (
+                    source_token != scalar_token(repaired_meta.get(column))
+                    or source_token != scalar_token(loaded_row[column])
+                ):
+                    raise ManifestSelectionError(
+                        f"typed {column} differs across source/repaired/manifest"
+                    )
+
+            authoritative = _resolve_manifest_source(
+                self.xml_root,
+                object_id,
+                selected,
+            )
+            repaired_raw = str(repaired_source_file or "").strip()
+            repaired_recorded = Path(repaired_raw)
+            if not repaired_raw or not repaired_recorded.is_absolute():
+                raise ManifestSelectionError(
+                    "repaired source path must be an absolute selected-XML path"
+                )
+            try:
+                repaired_resolved = repaired_recorded.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ManifestSelectionError(
+                    f"repaired source path cannot be resolved: {type(exc).__name__}"
+                ) from exc
+            if self.xml_root != repaired_resolved and self.xml_root not in repaired_resolved.parents:
+                raise ManifestSelectionError(
+                    "repaired source path resolves outside the manifest XML root"
+                )
+            if os.path.normcase(str(repaired_resolved)) != os.path.normcase(
+                str(authoritative)
+            ):
+                raise ManifestSelectionError(
+                    "repaired source path is not the exact manifest-selected file"
+                )
+
+            xml_document, header_error = parse_selected_xml_for_verification(
+                authoritative,
+                filing_text,
+                repaired_meta,
+            )
+            if xml_document is None:
+                raise ManifestSelectionError(header_error)
+            return ManifestProvenanceResult(
+                True,
+                "completed-scan loaded path and exact selected XML verified",
+                strategy,
+                _manifest_relative_path(selected["relative_path"]),
+            )
+        except (AuditInvariantError, ManifestSelectionError, OSError, sqlite3.Error, ValueError) as exc:
+            return ManifestProvenanceResult(False, str(exc))
 
 
 @dataclass
@@ -1555,14 +1841,14 @@ def build_detail(
         )
         if verification is not None:
             if verification.verified:
-                classification = "verified_extractor_enrichment"
+                classification = verification.classification
                 exact_extra = verification.source_extra_rows
                 new_rows = verification.new_payload_rows
                 replay_factor = None
                 notes.append(
-                    "verified_extractor_enrichment:"
+                    f"{classification}:"
                     f"{verification.kind};enriched_rows={verification.enriched_rows};"
-                    f"source_replay_rows_removed={verification.source_extra_rows};"
+                    f"source_rows_removed={verification.source_extra_rows};"
                     f"new_rows={verification.new_payload_rows}"
                 )
             else:
@@ -1829,8 +2115,14 @@ def validate_output_paths(
     summary_csv: Path,
     detail_csv: Path,
     detail_json: Path,
+    additional_databases: Sequence[Path] = (),
 ) -> None:
-    databases = {source_db.resolve(), repaired_db.resolve()}
+    resolved_databases = [
+        source_db.resolve(),
+        repaired_db.resolve(),
+        *(Path(path).resolve() for path in additional_databases),
+    ]
+    databases = set(resolved_databases)
     protected_paths = set(databases)
     for database in databases:
         protected_paths.update(
@@ -1838,8 +2130,8 @@ def validate_output_paths(
             for suffix in SQLITE_COMPANION_SUFFIXES
         )
     outputs = [summary_csv.resolve(), detail_csv.resolve(), detail_json.resolve()]
-    if source_db.resolve() == repaired_db.resolve():
-        raise ValueError("source and repaired database paths must differ")
+    if len(databases) != len(resolved_databases):
+        raise ValueError("source, repaired, and manifest database paths must differ")
     if len(set(outputs)) != len(outputs):
         raise ValueError("summary/detail report paths must be distinct")
     overlap = protected_paths.intersection(outputs)
@@ -1855,6 +2147,7 @@ def build_returns_detail(
     repaired_group: Optional[ReturnPopulationGroup],
     source_conn: sqlite3.Connection,
     repaired_conn: sqlite3.Connection,
+    manifest_provenance_failure: str = "",
 ) -> Dict[str, Any]:
     filing_id = (
         source_group.filing_id if source_group is not None else repaired_group.filing_id
@@ -1881,6 +2174,8 @@ def build_returns_detail(
         notes.extend(f"source:{note}" for note in source_group.problems)
     if repaired_group is not None and source_group is None:
         notes.extend(f"repaired:{note}" for note in repaired_group.problems)
+    if manifest_provenance_failure:
+        notes.append(f"manifest_provenance:{manifest_provenance_failure}")
     if notes:
         classification = "unexplained"
 
@@ -1926,6 +2221,7 @@ def audit_returns_population(
     source_conn: sqlite3.Connection,
     repaired_conn: sqlite3.Connection,
     report: DetailReportWriter,
+    manifest_verifier: Optional[ManifestProvenanceVerifier] = None,
 ) -> Dict[str, Any]:
     """Compare exact filing, source-file, and normalized object coverage."""
 
@@ -2015,11 +2311,41 @@ def audit_returns_population(
             )
             if matches:
                 continue
+            manifest_failure = ""
+            manifest_candidate = bool(
+                manifest_verifier is not None
+                and current_source is not None
+                and current_repaired is not None
+                and not current_source.problems
+                and not current_repaired.problems
+                and current_source.row_count == current_repaired.row_count == 1
+            )
+            if manifest_candidate:
+                source_meta = filing_metadata(
+                    source_conn,
+                    current_source.filing_id,
+                )
+                repaired_meta = filing_metadata(
+                    repaired_conn,
+                    current_repaired.filing_id,
+                )
+                verification = manifest_verifier.verify(
+                    current_source.filing_id,
+                    current_source.source_file,
+                    current_repaired.source_file,
+                    source_meta,
+                    repaired_meta,
+                )
+                if verification.verified:
+                    summary["manifest_provenance_matches"] += 1
+                    continue
+                manifest_failure = verification.reason
             detail = build_returns_detail(
                 current_source,
                 current_repaired,
                 source_conn,
                 repaired_conn,
+                manifest_failure,
             )
             report.write(detail)
             summary["mismatched_filings"] += 1
@@ -2218,12 +2544,21 @@ def run_audit(
     detail_limit_total: int = DEFAULT_DETAIL_LIMIT_TOTAL,
     allow_verified_extractor_enrichments: bool = False,
     extractor_enrichment_xml_root: Optional[Path] = None,
+    source_manifest_db: Optional[Path] = None,
+    manifest_xml_root: Optional[Path] = None,
 ) -> int:
     source_db = source_db.expanduser().resolve()
     repaired_db = repaired_db.expanduser().resolve()
     summary_csv = summary_csv.expanduser().resolve()
     detail_csv = detail_csv.expanduser().resolve()
     detail_json = detail_json.expanduser().resolve()
+    if (source_manifest_db is None) != (manifest_xml_root is None):
+        raise ValueError(
+            "--source-manifest-db and --manifest-xml-root must be supplied together"
+        )
+    if source_manifest_db is not None and manifest_xml_root is not None:
+        source_manifest_db = Path(source_manifest_db).expanduser().resolve()
+        manifest_xml_root = Path(manifest_xml_root).expanduser().resolve()
     if allow_verified_extractor_enrichments:
         if extractor_enrichment_xml_root is None:
             raise ValueError(
@@ -2244,13 +2579,26 @@ def run_audit(
             "--allow-verified-extractor-enrichments"
         )
     validate_output_paths(
-        source_db, repaired_db, summary_csv, detail_csv, detail_json
+        source_db,
+        repaired_db,
+        summary_csv,
+        detail_csv,
+        detail_json,
+        additional_databases=(
+            (source_manifest_db,) if source_manifest_db is not None else ()
+        ),
     )
 
     source_conn = connect_readonly(source_db)
     repaired_conn = None
+    manifest_verifier = None
     try:
         repaired_conn = connect_readonly(repaired_db)
+        if source_manifest_db is not None and manifest_xml_root is not None:
+            manifest_verifier = ManifestProvenanceVerifier(
+                source_manifest_db,
+                manifest_xml_root,
+            )
         metadata = {
             "started_at": utc_now(),
             "source": database_identity(source_conn, source_db),
@@ -2267,8 +2615,37 @@ def run_audit(
             ),
             "source_file_strategy": (
                 "exact normalized path or same XML object with at least one "
-                "matching trailing archive directory"
+                "matching trailing archive directory; otherwise optional completed-scan "
+                "manifest loaded-source and exact selected-XML verification"
             ),
+            "manifest_provenance": {
+                "enabled": manifest_verifier is not None,
+                "manifest": (
+                    database_identity(manifest_verifier.conn, source_manifest_db)
+                    if manifest_verifier is not None and source_manifest_db is not None
+                    else None
+                ),
+                "scan_id": (
+                    manifest_verifier.scan_id
+                    if manifest_verifier is not None
+                    else None
+                ),
+                "scanned_at": (
+                    manifest_verifier.scanned_at
+                    if manifest_verifier is not None
+                    else None
+                ),
+                "xml_root": (
+                    str(manifest_verifier.xml_root)
+                    if manifest_verifier is not None
+                    else None
+                ),
+                "rule": (
+                    "historical source equals manifest loaded source; repaired source is "
+                    "the exact root-confined selected current file; typed return metadata "
+                    "and current XML header agree"
+                ),
+            },
             "detail_reporting": {
                 "limit_per_table": int(detail_limit_per_table),
                 "limit_total": int(detail_limit_total),
@@ -2283,6 +2660,7 @@ def run_audit(
                 ),
                 "policies": [
                     "grants_cash_null_to_zero_with_directional_and_selected_xml_proof",
+                    "grants_strict_zero_only_recipient_placeholder_removal_with_exact_source_delta_and_selected_xml_proof",
                     "pf_officer_alternate_tag_benefit_expense_with_directional_and_selected_xml_proof",
                     "schedule_c_full_selected_xml_current_extractor_counter_equality",
                 ],
@@ -2299,7 +2677,12 @@ def run_audit(
         ) as report:
             print("[audit] comparing returns population/provenance...", flush=True)
             summaries.append(
-                audit_returns_population(source_conn, repaired_conn, report)
+                audit_returns_population(
+                    source_conn,
+                    repaired_conn,
+                    report,
+                    manifest_verifier,
+                )
             )
             for table in MULTIROW_CHILD_TABLES:
                 print(f"[audit] comparing {table}...", flush=True)
@@ -2328,6 +2711,7 @@ def run_audit(
                 "verified_extractor_enrichments_enabled": bool(
                     allow_verified_extractor_enrichments
                 ),
+                "manifest_provenance_enabled": manifest_verifier is not None,
                 "detail_rows_written": int(detail_reporting["rows_written"]),
                 "detail_rows_suppressed": int(detail_reporting["rows_suppressed"]),
                 "completed_at": utc_now(),
@@ -2335,6 +2719,8 @@ def run_audit(
             report.finish(all_summaries, gates)
         write_summary_csv(summary_csv, all_summaries)
     finally:
+        if manifest_verifier is not None:
+            manifest_verifier.close()
         if repaired_conn is not None:
             repaired_conn.close()
         source_conn.close()
@@ -2405,15 +2791,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-verified-extractor-enrichments",
         action="store_true",
         help=(
-            "Opt in to narrowly verified extractor-only enrichments for grants, "
-            "PF officers, and Schedule C. All other payload changes still fail."
+            "Opt in to narrowly verified extractor enrichments and strict zero-only "
+            "grant placeholder cleanup. All other payload changes still fail."
         ),
     )
     parser.add_argument(
         "--extractor-enrichment-xml-root",
         help=(
-            "Explicit XML archive root used to root-confine and re-extract Schedule C "
-            "evidence; required with --allow-verified-extractor-enrichments."
+            "Explicit XML archive root used to root-confine and re-extract grant, PF, "
+            "and Schedule C evidence; required with "
+            "--allow-verified-extractor-enrichments."
+        ),
+    )
+    parser.add_argument(
+        "--source-manifest-db",
+        help=(
+            "Read-only completed XML source manifest used to verify authoritative "
+            "historical-to-current returns provenance; requires --manifest-xml-root."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-xml-root",
+        help=(
+            "Explicit current XML root for exact manifest-selected file, stat/hash, "
+            "object, and header verification; requires --source-manifest-db."
         ),
     )
     return parser
@@ -2437,6 +2838,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             extractor_enrichment_xml_root=(
                 Path(args.extractor_enrichment_xml_root)
                 if args.extractor_enrichment_xml_root
+                else None
+            ),
+            source_manifest_db=(
+                Path(args.source_manifest_db)
+                if args.source_manifest_db
+                else None
+            ),
+            manifest_xml_root=(
+                Path(args.manifest_xml_root)
+                if args.manifest_xml_root
                 else None
             ),
         )
