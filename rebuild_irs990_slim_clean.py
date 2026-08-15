@@ -27,7 +27,7 @@ import sys
 import tempfile
 from concurrent.futures import Executor, ProcessPoolExecutor
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 import xml.etree.ElementTree as ET
 
 from common import DB_PATH, configured_xml_root
@@ -1429,6 +1429,30 @@ def generic_group_rows(root: ET.Element, tag_key: str, cols: Sequence[str]) -> L
     return rows
 
 
+def should_keep_grant_row(group: ET.Element, row: Mapping[str, Any]) -> bool:
+    """Reject an IRS Schedule I placeholder that contains only a zero cash amount.
+
+    Some filings emit an otherwise-empty ``RecipientTable`` with
+    ``CashGrantAmt=0``.  It is not a recipient record.  An explicit zero remains
+    meaningful when the row also has recipient, purpose, address, noncash, or
+    other grant data, and a populated row with no amount must retain ``None``.
+    """
+    ignored = {'filing_id', 'filer_ein', 'filer_name'}
+    populated = {
+        key: value
+        for key, value in row.items()
+        if key not in ignored and value not in (None, '')
+    }
+    if not populated:
+        return False
+    if local(group.tag).lower() != 'recipienttable':
+        return True
+    return not (
+        set(populated) == {'cash_grant_amt'}
+        and norm_num(populated['cash_grant_amt']) == 0
+    )
+
+
 def header_extract(root: ET.Element, p: Path) -> Optional[Dict[str, Any]]:
     rtype = first_text_paths(root, HEADER_PATHS["return_type"])
     tax_year = norm_int(first_text_paths(root, HEADER_PATHS["tax_year"]))
@@ -1610,7 +1634,7 @@ def extract_file(file_path: str) -> Dict[str, Any]:
             'valuation_method_used_desc': descendants_text_first(g, ['ValuationMethodUsedDesc']),
             'purpose_of_grant_txt': descendants_text_first(g, ['PurposeOfGrantTxt', 'GrantOrContributionPurposeTxt']),
         }
-        if any(v not in (None, '') for k, v in row.items() if k not in {'filing_id', 'filer_ein', 'filer_name'}):
+        if should_keep_grant_row(g, row):
             grants.append(row)
 
     contractors = []

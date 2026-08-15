@@ -225,17 +225,25 @@ Use this order; do not build the global network from the known-dirty children:
 
    ```powershell
    $auditStamp = Get-Date -Format yyyyMMdd-HHmmss
+   $xmlRoot = (Resolve-Path $env:IRS_XML_ROOT).Path
    .\.venv\Scripts\python.exe audit_child_repair.py `
      --source-db db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db `
      --repaired-db db\irs990-repaired-YYYYMMDD-HHMMSS.db `
      --summary-csv "exports\child-repair-summary-$auditStamp.csv" `
      --detail-csv "exports\child-repair-detail-$auditStamp.csv" `
      --detail-json "exports\child-repair-detail-$auditStamp.json" `
+     --allow-verified-extractor-enrichments `
+     --extractor-enrichment-xml-root $xmlRoot `
      --fail-on-new
    ```
 
    Do not proceed on a nonzero exit. Review every remaining clean grant
-   reconciliation warning even when the structural audit passes. See
+   reconciliation warning even when the structural audit passes. The explicit
+   enrichment flag is limited to the diagnosed grant NULL-to-zero, alternate-tag
+   PF benefit/expense, and selected-XML Schedule C changes; omitting it preserves
+   hard-fail behavior. Grant, PF, and Schedule C candidates are re-extracted
+   from their root-confined selected XML one filing at a time, so budget
+   additional audit runtime. See
    [Child-row repair audit](child-repair-audit.md) for classifications,
    report fields, limitations, and acceptance gates.
 4. **Rebuild grant resolution and reapply decisions.** Use the sequence below,

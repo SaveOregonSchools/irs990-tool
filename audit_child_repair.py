@@ -24,21 +24,87 @@ import os
 import sqlite3
 import sys
 import tempfile
-from collections import Counter
+import xml.etree.ElementTree as ET
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from rebuild_irs990_slim_clean import MULTIROW_CHILD_TABLES, object_id_from_filing_id
+from rebuild_irs990_slim_clean import (
+    MULTIROW_CHILD_TABLES,
+    descendants_first_by_col,
+    extract_file,
+    extract_schedule_c_supplemental,
+    find_groups,
+    form_nodes,
+    header_extract,
+    local,
+    object_id_from_filing_id,
+)
 
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 HARD_FAILURE_CLASSES = {"missing_in_rebuild", "content_changed", "unexplained"}
 SQLITE_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
 MULTISET_MASK = (1 << 256) - 1
+DEFAULT_DETAIL_LIMIT_PER_TABLE = 1_000
+DEFAULT_DETAIL_LIMIT_TOTAL = 25_000
+MIN_RELOCATED_SOURCE_SUFFIX_PARTS = 2
+GRANT_PAYLOAD_COLUMNS = (
+    "filer_ein",
+    "filer_name",
+    "recipient_ein",
+    "business_name_line1_txt",
+    "business_name_line2_txt",
+    "us_address_line1_txt",
+    "us_address_line2_txt",
+    "us_city_nm",
+    "us_state_abbreviation_cd",
+    "us_zip_cd",
+    "foreign_address_line1_txt",
+    "foreign_city_nm",
+    "foreign_province_or_state_nm",
+    "foreign_postal_cd",
+    "foreign_country_cd",
+    "ircsection_desc",
+    "cash_grant_amt",
+    "non_cash_assistance_amt",
+    "non_cash_assistance_desc",
+    "valuation_method_used_desc",
+    "purpose_of_grant_txt",
+)
+GRANT_NUMERIC_COLUMNS = {"cash_grant_amt", "non_cash_assistance_amt"}
+SCHEDULE_C_SUPPLEMENTAL_PAYLOAD_COLUMNS = (
+    "form_and_line_reference_desc",
+    "explanation_txt",
+)
+PF_OFFICER_PAYLOAD_COLUMNS = (
+    "person_nm",
+    "title_txt",
+    "average_hrs_per_wk_devoted_to_pos_rt",
+    "compensation_amt",
+    "employee_benefits_amt",
+    "expense_account_amt",
+)
+PF_OFFICER_NUMERIC_COLUMNS = {
+    "compensation_amt",
+    "employee_benefits_amt",
+    "expense_account_amt",
+}
+PF_EMPLOYEE_ORIGIN_COLUMN = "__employee_benefits_xml_origin"
+PF_EXPENSE_ORIGIN_COLUMN = "__expense_account_xml_origin"
+PF_ALLOWED_ALTERNATE_ORIGINS = {
+    "employee_benefits_amt": "employeebenefitprogramamt",
+    "expense_account_amt": "expenseaccountotherallwncamt",
+}
+VERIFIED_EXTRACTOR_ENRICHMENT_TABLES = {
+    "grants",
+    "irs990_pf_officer_dir_trst_key_empl_info_grp",
+    "irs990_schedule_c_supplemental_info",
+}
 
 DETAIL_FIELDS = [
     "table_name",
@@ -94,6 +160,7 @@ SUMMARY_FIELDS = [
     "repaired_object_covered_filings",
     "mismatched_filings",
     "expected_exact_replay_cleanup",
+    "verified_extractor_enrichment",
     "missing_in_rebuild",
     "new_in_rebuild",
     "content_changed",
@@ -104,6 +171,9 @@ SUMMARY_FIELDS = [
     "grant_source_inflated",
     "grant_repaired_inflated",
     "gate_failures",
+    "detail_evidence_rows",
+    "detail_rows_written",
+    "detail_rows_suppressed",
     "notes",
 ]
 
@@ -205,6 +275,289 @@ def scalar_token(value: Any) -> List[Any]:
 def payload_key(row: sqlite3.Row, payload_columns: Sequence[str]) -> str:
     values = [[column, scalar_token(row[column])] for column in payload_columns]
     return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def mapping_payload_key(
+    row: Mapping[str, Any],
+    payload_columns: Sequence[str],
+    *,
+    numeric_columns: Sequence[str] = (),
+) -> str:
+    numeric = set(numeric_columns)
+    values = [
+        [
+            column,
+            scalar_token(
+                sqlite_numeric_affinity_value(row.get(column))
+                if column in numeric
+                else row.get(column)
+            ),
+        ]
+        for column in payload_columns
+    ]
+    return json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+
+
+def sqlite_numeric_affinity_value(value: Any) -> Any:
+    """Model SQLite NUMERIC affinity for well-formed IRS numeric XML text."""
+
+    if value is None or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer() and -(1 << 63) <= value < (1 << 63):
+            return int(value)
+        return value
+    text = str(value).strip()
+    if not text:
+        return value
+    try:
+        number = Decimal(text)
+    except InvalidOperation:
+        return value
+    if not number.is_finite():
+        return value
+    integral = number.to_integral_value()
+    if number == integral and -(1 << 63) <= integral < (1 << 63):
+        return int(integral)
+    try:
+        return float(text)
+    except (ValueError, OverflowError):
+        return value
+
+
+PayloadToken = Tuple[str, Any]
+
+
+def decode_payload_key(value: str) -> Dict[str, PayloadToken]:
+    decoded = json.loads(value)
+    if not isinstance(decoded, list):
+        raise AuditInvariantError("payload signature is not a column list")
+    result: Dict[str, PayloadToken] = {}
+    for item in decoded:
+        if (
+            not isinstance(item, list)
+            or len(item) != 2
+            or not isinstance(item[0], str)
+            or not isinstance(item[1], list)
+            or len(item[1]) != 2
+            or not isinstance(item[1][0], str)
+        ):
+            raise AuditInvariantError("payload signature has an invalid token")
+        column = item[0]
+        if column in result:
+            raise AuditInvariantError(f"payload signature repeats column {column!r}")
+        result[column] = (item[1][0], item[1][1])
+    return result
+
+
+def token_is_null(token: Optional[PayloadToken]) -> bool:
+    return token == ("null", None)
+
+
+def token_numeric_value(token: Optional[PayloadToken]) -> Optional[Decimal]:
+    if token is None:
+        return None
+    kind, value = token
+    try:
+        if kind == "integer":
+            number = Decimal(str(value))
+        elif kind == "float" and value not in {"nan", "+inf", "-inf"}:
+            number = Decimal.from_float(float.fromhex(str(value)))
+        else:
+            return None
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+    return number if number.is_finite() else None
+
+
+def token_is_numeric_zero(token: Optional[PayloadToken]) -> bool:
+    number = token_numeric_value(token)
+    return number is not None and number == 0
+
+
+def token_has_meaningful_grant_value(token: Optional[PayloadToken]) -> bool:
+    if token is None or token_is_null(token):
+        return False
+    kind, value = token
+    if kind in {"integer", "float"}:
+        return token_numeric_value(token) is not None
+    if kind == "text":
+        return bool(str(value or "").strip())
+    if kind == "blob":
+        return bool(value)
+    return True
+
+
+@dataclass
+class _FlowEdge:
+    to: int
+    reverse_index: int
+    capacity: int
+    original_capacity: int
+
+    @property
+    def flow(self) -> int:
+        return self.original_capacity - self.capacity
+
+
+class _Dinic:
+    def __init__(self, node_count: int) -> None:
+        self.graph: List[List[_FlowEdge]] = [[] for _ in range(node_count)]
+
+    def add_edge(self, source: int, target: int, capacity: int) -> _FlowEdge:
+        capacity = int(capacity)
+        if capacity < 0:
+            raise ValueError("flow capacity cannot be negative")
+        forward = _FlowEdge(target, len(self.graph[target]), capacity, capacity)
+        reverse = _FlowEdge(source, len(self.graph[source]), 0, 0)
+        self.graph[source].append(forward)
+        self.graph[target].append(reverse)
+        return forward
+
+    def max_flow(self, source: int, sink: int) -> int:
+        total = 0
+        node_count = len(self.graph)
+        while True:
+            level = [-1] * node_count
+            level[source] = 0
+            queue = deque([source])
+            while queue:
+                node = queue.popleft()
+                for edge in self.graph[node]:
+                    if edge.capacity and level[edge.to] < 0:
+                        level[edge.to] = level[node] + 1
+                        queue.append(edge.to)
+            if level[sink] < 0:
+                return total
+            offsets = [0] * node_count
+
+            def send(node: int, available: int) -> int:
+                if node == sink:
+                    return available
+                while offsets[node] < len(self.graph[node]):
+                    edge = self.graph[node][offsets[node]]
+                    if edge.capacity and level[edge.to] == level[node] + 1:
+                        pushed = send(edge.to, min(available, edge.capacity))
+                        if pushed:
+                            edge.capacity -= pushed
+                            reverse = self.graph[edge.to][edge.reverse_index]
+                            reverse.capacity += pushed
+                            return pushed
+                    offsets[node] += 1
+                return 0
+
+            while True:
+                pushed = send(source, 1 << 60)
+                if not pushed:
+                    break
+                total += pushed
+
+
+@dataclass(frozen=True)
+class TransformVerification:
+    verified: bool
+    reason: str
+    enriched_rows: int = 0
+    kind: str = ""
+    source_extra_rows: int = 0
+    new_payload_rows: int = 0
+
+
+TransformCompatibility = Callable[
+    [Mapping[str, PayloadToken], Mapping[str, PayloadToken]], Tuple[bool, bool]
+]
+
+
+def verify_directional_payload_transform(
+    source_counter: Counter[str],
+    repaired_counter: Counter[str],
+    compatibility: TransformCompatibility,
+) -> TransformVerification:
+    """Prove repaired rows derive directionally from retained source signatures.
+
+    Every repaired row must be supplied by a compatible source row, and every
+    distinct source signature must supply at least one repaired row.  Remaining
+    source multiplicity is therefore demonstrably duplicate replay cleanup,
+    never deletion of an entire source payload signature.
+    """
+
+    if not source_counter or not repaired_counter:
+        return TransformVerification(False, "both source and repaired payloads are required")
+    source_items = [(key, int(count)) for key, count in source_counter.items() if count]
+    repaired_items = [(key, int(count)) for key, count in repaired_counter.items() if count]
+    source_total = sum(count for _key, count in source_items)
+    repaired_total = sum(count for _key, count in repaired_items)
+    if repaired_total > source_total:
+        return TransformVerification(False, "repaired multiplicity exceeds source")
+    if len(source_items) > repaired_total:
+        return TransformVerification(
+            False,
+            "repaired rows cannot retain every distinct source payload signature",
+        )
+
+    source_tokens = [decode_payload_key(key) for key, _count in source_items]
+    repaired_tokens = [decode_payload_key(key) for key, _count in repaired_items]
+    source_node = 0
+    source_offset = 1
+    repaired_offset = source_offset + len(source_items)
+    sink_node = repaired_offset + len(repaired_items)
+    super_source = sink_node + 1
+    super_sink = sink_node + 2
+    network = _Dinic(super_sink + 1)
+    demand = [0] * (super_sink + 1)
+    enrichment_edges: List[_FlowEdge] = []
+
+    def add_lower_edge(
+        start: int,
+        end: int,
+        lower: int,
+        upper: int,
+    ) -> _FlowEdge:
+        if lower < 0 or upper < lower:
+            raise ValueError("invalid lower/upper flow capacity")
+        demand[start] -= lower
+        demand[end] += lower
+        return network.add_edge(start, end, upper - lower)
+
+    for index, (_key, count) in enumerate(source_items):
+        add_lower_edge(source_node, source_offset + index, 1, count)
+    for source_index, source_values in enumerate(source_tokens):
+        compatible_count = 0
+        for repaired_index, repaired_values in enumerate(repaired_tokens):
+            compatible, enrichment = compatibility(source_values, repaired_values)
+            if not compatible:
+                continue
+            compatible_count += 1
+            edge = add_lower_edge(
+                source_offset + source_index,
+                repaired_offset + repaired_index,
+                0,
+                min(source_items[source_index][1], repaired_items[repaired_index][1]),
+            )
+            if enrichment:
+                enrichment_edges.append(edge)
+        if not compatible_count:
+            return TransformVerification(
+                False,
+                "a source payload signature has no allowed repaired counterpart",
+            )
+    for index, (_key, count) in enumerate(repaired_items):
+        add_lower_edge(repaired_offset + index, sink_node, count, count)
+    add_lower_edge(sink_node, source_node, 0, repaired_total)
+
+    required = 0
+    for node, balance in enumerate(demand[: sink_node + 1]):
+        if balance > 0:
+            network.add_edge(super_source, node, balance)
+            required += balance
+        elif balance < 0:
+            network.add_edge(node, super_sink, -balance)
+    if network.max_flow(super_source, super_sink) != required:
+        return TransformVerification(False, "directional payload multiset is infeasible")
+    enriched_rows = sum(max(0, edge.flow) for edge in enrichment_edges)
+    if not enriched_rows:
+        return TransformVerification(False, "no allowed extractor enrichment was required")
+    return TransformVerification(True, "directional payload multiset verified", enriched_rows)
 
 
 class StreamingMultisetDigest:
@@ -343,12 +696,427 @@ def fetch_payload(
     return PayloadResult(counter, row_count, grant_total, invalid_grant_numbers)
 
 
+def _unchanged_except(
+    source_values: Mapping[str, PayloadToken],
+    repaired_values: Mapping[str, PayloadToken],
+    allowed_columns: Sequence[str],
+) -> bool:
+    allowed = set(allowed_columns)
+    columns = set(source_values).union(repaired_values)
+    return all(
+        source_values.get(column) == repaired_values.get(column)
+        for column in columns
+        if column not in allowed
+    )
+
+
+def grant_null_to_zero_compatibility(
+    source_values: Mapping[str, PayloadToken],
+    repaired_values: Mapping[str, PayloadToken],
+) -> Tuple[bool, bool]:
+    if not _unchanged_except(source_values, repaired_values, ("cash_grant_amt",)):
+        return False, False
+    source_cash = source_values.get("cash_grant_amt")
+    repaired_cash = repaired_values.get("cash_grant_amt")
+    if source_cash == repaired_cash:
+        return True, False
+    enrichment = token_is_null(source_cash) and token_is_numeric_zero(repaired_cash)
+    return enrichment, enrichment
+
+
+def pf_officer_enrichment_compatibility(
+    source_values: Mapping[str, PayloadToken],
+    repaired_values: Mapping[str, PayloadToken],
+) -> Tuple[bool, bool]:
+    amount_columns = (
+        "employee_benefits_amt",
+        "expense_account_amt",
+    )
+    ignored_columns = (
+        *amount_columns,
+        PF_EMPLOYEE_ORIGIN_COLUMN,
+        PF_EXPENSE_ORIGIN_COLUMN,
+    )
+    if not _unchanged_except(source_values, repaired_values, ignored_columns):
+        return False, False
+    enriched = False
+    for column in amount_columns:
+        source_value = source_values.get(column)
+        repaired_value = repaired_values.get(column)
+        if source_value == repaired_value:
+            continue
+        if not token_is_null(source_value) or token_numeric_value(repaired_value) is None:
+            return False, False
+        origin_column = (
+            PF_EMPLOYEE_ORIGIN_COLUMN
+            if column == "employee_benefits_amt"
+            else PF_EXPENSE_ORIGIN_COLUMN
+        )
+        origin_token = repaired_values.get(origin_column)
+        expected_origin = PF_ALLOWED_ALTERNATE_ORIGINS[column]
+        if (
+            origin_token is None
+            or origin_token[0] != "text"
+            or str(origin_token[1] or "").casefold() != expected_origin
+        ):
+            return False, False
+        enriched = True
+    return True, enriched
+
+
+def is_zero_only_blank_grant(values: Mapping[str, PayloadToken]) -> bool:
+    if not token_is_numeric_zero(values.get("cash_grant_amt")):
+        return False
+    ignored = {"cash_grant_amt", "filer_ein", "filer_name"}
+    return not any(
+        token_has_meaningful_grant_value(token)
+        for column, token in values.items()
+        if column not in ignored
+    )
+
+
+def verify_grant_extractor_enrichment(
+    filing_id: Any,
+    source_counter: Counter[str],
+    repaired_counter: Counter[str],
+    payload_columns: Sequence[str],
+    repaired_meta: Optional[Mapping[str, Any]],
+    xml_root: Path,
+) -> TransformVerification:
+    for payload in repaired_counter:
+        if is_zero_only_blank_grant(decode_payload_key(payload)):
+            return TransformVerification(False, "zero-only blank grant row is not allowed")
+    if tuple(payload_columns) != GRANT_PAYLOAD_COLUMNS:
+        return TransformVerification(False, "grant payload schema differs from current extractor")
+    result = verify_directional_payload_transform(
+        source_counter,
+        repaired_counter,
+        grant_null_to_zero_compatibility,
+    )
+    if not result.verified:
+        return result
+    if not repaired_meta:
+        return TransformVerification(False, "repaired return metadata is unavailable")
+    candidate, path_error = resolve_selected_xml_path(
+        repaired_meta.get("source_file"),
+        filing_id,
+        xml_root,
+    )
+    if candidate is None:
+        return TransformVerification(False, path_error)
+    extracted = extract_file(str(candidate))
+    if extracted.get("error"):
+        return TransformVerification(
+            False,
+            "current extractor rejected selected XML: " + str(extracted["error"]),
+        )
+    header = extracted.get("header") or {}
+    if str(header.get("filing_id") or "") != str(filing_id or ""):
+        return TransformVerification(False, "current extractor filing_id differs from audit filing")
+    for column in ("ein", "tax_year", "return_type"):
+        if scalar_token(header.get(column)) != scalar_token(repaired_meta.get(column)):
+            return TransformVerification(
+                False,
+                f"selected XML header {column} differs from repaired return",
+            )
+    extracted_rows = extracted.get("grants")
+    if not isinstance(extracted_rows, list):
+        return TransformVerification(False, "current extractor returned no grant row list")
+    extracted_counter: Counter[str] = Counter(
+        mapping_payload_key(
+            row,
+            payload_columns,
+            numeric_columns=GRANT_NUMERIC_COLUMNS,
+        )
+        for row in extracted_rows
+        if isinstance(row, dict)
+    )
+    if extracted_counter != repaired_counter:
+        return TransformVerification(
+            False,
+            "full repaired grant multiset differs from current selected-XML extraction",
+        )
+    return TransformVerification(
+        True,
+        "directional transform and selected XML/current extractor exactly verified",
+        result.enriched_rows,
+        "grants_cash_null_to_zero",
+        sum(source_counter.values()) - sum(repaired_counter.values()),
+        0,
+    )
+
+
+def first_pf_amount_origin(group: ET.Element, column: str) -> str:
+    candidates = {
+        "employee_benefits_amt": {
+            "employeebenefitsamt",
+            "employeebenefitprogramamt",
+        },
+        "expense_account_amt": {
+            "expenseaccountamt",
+            "expenseaccountotherallwncamt",
+        },
+    }[column]
+    for node in group.iter():
+        tag = local(node.tag).casefold()
+        if tag in candidates and str(node.text or "").strip():
+            return tag
+    return ""
+
+
+def extract_pf_officer_rows_with_origins(
+    xml_document: ET.Element,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for group in find_groups(xml_document, ("OfficerDirTrstKeyEmplGrp",)):
+        row = {
+            column: descendants_first_by_col(group, column)
+            for column in PF_OFFICER_PAYLOAD_COLUMNS
+        }
+        if not any(value not in (None, "") for value in row.values()):
+            continue
+        row[PF_EMPLOYEE_ORIGIN_COLUMN] = first_pf_amount_origin(
+            group, "employee_benefits_amt"
+        )
+        row[PF_EXPENSE_ORIGIN_COLUMN] = first_pf_amount_origin(
+            group, "expense_account_amt"
+        )
+        rows.append(row)
+    return rows
+
+
+def verify_pf_officer_extractor_enrichment(
+    filing_id: Any,
+    source_counter: Counter[str],
+    repaired_counter: Counter[str],
+    payload_columns: Sequence[str],
+    repaired_meta: Optional[Mapping[str, Any]],
+    xml_root: Path,
+) -> TransformVerification:
+    if tuple(payload_columns) != PF_OFFICER_PAYLOAD_COLUMNS:
+        return TransformVerification(False, "PF officer payload schema differs from current extractor")
+    if not repaired_meta:
+        return TransformVerification(False, "repaired return metadata is unavailable")
+    candidate, path_error = resolve_selected_xml_path(
+        repaired_meta.get("source_file"),
+        filing_id,
+        xml_root,
+    )
+    if candidate is None:
+        return TransformVerification(False, path_error)
+    xml_document, extract_error = parse_selected_xml_for_verification(
+        candidate,
+        filing_id,
+        repaired_meta,
+    )
+    if xml_document is None:
+        return TransformVerification(False, extract_error)
+    extracted_rows = extract_pf_officer_rows_with_origins(xml_document)
+    extracted_counter: Counter[str] = Counter(
+        mapping_payload_key(
+            row,
+            payload_columns,
+            numeric_columns=PF_OFFICER_NUMERIC_COLUMNS,
+        )
+        for row in extracted_rows
+    )
+    if extracted_counter != repaired_counter:
+        return TransformVerification(
+            False,
+            "full repaired PF officer multiset differs from current selected-XML extraction",
+        )
+    origin_payload_columns = (
+        *payload_columns,
+        PF_EMPLOYEE_ORIGIN_COLUMN,
+        PF_EXPENSE_ORIGIN_COLUMN,
+    )
+    origin_counter: Counter[str] = Counter(
+        mapping_payload_key(
+            row,
+            origin_payload_columns,
+            numeric_columns=PF_OFFICER_NUMERIC_COLUMNS,
+        )
+        for row in extracted_rows
+    )
+    result = verify_directional_payload_transform(
+        source_counter,
+        origin_counter,
+        pf_officer_enrichment_compatibility,
+    )
+    if not result.verified:
+        return TransformVerification(
+            False,
+            "PF directional/origin proof failed: " + result.reason,
+        )
+    return TransformVerification(
+        True,
+        "directional transform and selected XML/current extractor exactly verified",
+        result.enriched_rows,
+        "pf_officer_benefit_expense_selected_xml_enrichment",
+        sum(source_counter.values()) - sum(repaired_counter.values()),
+        0,
+    )
+
+
+def resolve_selected_xml_path(
+    source_file: Any,
+    filing_id: Any,
+    xml_root: Path,
+) -> Tuple[Optional[Path], str]:
+    raw = str(source_file or "").strip()
+    if not raw:
+        return None, "repaired return has no source_file"
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = xml_root / candidate
+    try:
+        candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return None, f"selected XML cannot be resolved: {type(exc).__name__}"
+    if xml_root != candidate and xml_root not in candidate.parents:
+        return None, "selected XML resolves outside the verified XML root"
+    if not candidate.is_file() or candidate.suffix.casefold() != ".xml":
+        return None, "selected XML is not a readable XML file"
+    filing_object = object_id_from_filing_id(str(filing_id or "").strip())
+    candidate_object = object_id_from_filing_id(candidate.stem)
+    if not filing_object or candidate_object != filing_object:
+        return None, "selected XML object does not match filing_id"
+    return candidate, ""
+
+
+def parse_selected_xml_for_verification(
+    candidate: Path,
+    filing_id: Any,
+    repaired_meta: Mapping[str, Any],
+) -> Tuple[Optional[ET.Element], str]:
+    try:
+        xml_document = ET.parse(str(candidate)).getroot()
+    except (ET.ParseError, OSError) as exc:
+        return None, f"selected XML parse failed: {type(exc).__name__}"
+    header = header_extract(xml_document, candidate)
+    if header is None:
+        return None, "current extractor rejected selected XML header"
+    if str(header.get("filing_id") or "") != str(filing_id or ""):
+        return None, "current extractor filing_id differs from audit filing"
+    for column in ("ein", "tax_year", "return_type"):
+        if scalar_token(header.get(column)) != scalar_token(repaired_meta.get(column)):
+            return None, f"selected XML header {column} differs from repaired return"
+    return xml_document, ""
+
+
+def verify_schedule_c_extractor_enrichment(
+    filing_id: Any,
+    source_counter: Counter[str],
+    repaired_counter: Counter[str],
+    payload_columns: Sequence[str],
+    repaired_meta: Optional[Mapping[str, Any]],
+    xml_root: Path,
+) -> TransformVerification:
+    if tuple(payload_columns) != SCHEDULE_C_SUPPLEMENTAL_PAYLOAD_COLUMNS:
+        return TransformVerification(False, "Schedule C payload schema differs from current extractor")
+    if not repaired_meta:
+        return TransformVerification(False, "repaired return metadata is unavailable")
+    if source_counter - repaired_counter:
+        return TransformVerification(False, "a source Schedule C payload was removed or changed")
+    new_rows = sum((repaired_counter - source_counter).values())
+    if not new_rows:
+        return TransformVerification(False, "no new Schedule C payload is present")
+    candidate, path_error = resolve_selected_xml_path(
+        repaired_meta.get("source_file"),
+        filing_id,
+        xml_root,
+    )
+    if candidate is None:
+        return TransformVerification(False, path_error)
+    xml_document, extract_error = parse_selected_xml_for_verification(
+        candidate,
+        filing_id,
+        repaired_meta,
+    )
+    if xml_document is None:
+        return TransformVerification(False, extract_error)
+    extracted_rows = extract_schedule_c_supplemental(
+        form_nodes(xml_document)["SCHC"],
+        str(filing_id),
+    )
+    extracted_counter: Counter[str] = Counter(
+        mapping_payload_key(row, payload_columns)
+        for row in extracted_rows
+    )
+    if extracted_counter != repaired_counter:
+        return TransformVerification(
+            False,
+            "full repaired Schedule C multiset differs from current selected-XML extraction",
+        )
+    return TransformVerification(
+        True,
+        "selected XML/current extractor exactly verified repaired Schedule C multiset",
+        new_rows,
+        "schedule_c_selected_xml_enrichment",
+        0,
+        new_rows,
+    )
+
+
 def source_file_object_id(source_file: Any) -> str:
     value = str(source_file or "").strip().replace("\\", "/")
     filename = value.rsplit("/", 1)[-1]
     if filename.lower().endswith(".xml"):
         filename = filename[:-4]
     return object_id_from_filing_id(filename)
+
+
+def normalized_source_path_parts(source_file: Any) -> Tuple[str, ...]:
+    """Return comparison-only path parts without assuming either archive root.
+
+    IRS XML databases have historically been rebuilt after moving the archive
+    between Windows roots.  The full absolute path is therefore not portable,
+    but the archive directory suffix and XML object filename are.  Traversal
+    components are rejected so a malformed path can never compare equal merely
+    because its tail resembles a selected source.
+    """
+
+    value = str(source_file or "").strip().replace("\\", "/")
+    if not value:
+        return ()
+    raw_parts = tuple(part for part in value.split("/") if part not in ("", "."))
+    if not raw_parts or any(part == ".." for part in raw_parts):
+        return ()
+    # These inventories and databases are Windows-produced.  Case-folding
+    # preserves the filesystem's comparison semantics across drive/root moves.
+    return tuple(part.casefold() for part in raw_parts)
+
+
+def source_files_equivalent(source_file: Any, repaired_source_file: Any) -> bool:
+    """Compare source provenance while allowing only a relocated root prefix.
+
+    Exact normalized paths compare equal.  Otherwise both values must identify
+    the same XML object and share at least the final archive-directory component
+    plus the object filename.  A basename-only match is deliberately rejected:
+    different archive directories remain a hard provenance mismatch.
+    """
+
+    source_parts = normalized_source_path_parts(source_file)
+    repaired_parts = normalized_source_path_parts(repaired_source_file)
+    if not source_parts or not repaired_parts:
+        return False
+    if source_parts == repaired_parts:
+        return True
+    if not source_parts[-1].endswith(".xml") or not repaired_parts[-1].endswith(".xml"):
+        return False
+    source_object = source_file_object_id(source_file)
+    repaired_object = source_file_object_id(repaired_source_file)
+    if not source_object or source_object != repaired_object:
+        return False
+
+    common_suffix_parts = 0
+    for source_part, repaired_part in zip(
+        reversed(source_parts), reversed(repaired_parts)
+    ):
+        if source_part != repaired_part:
+            break
+        common_suffix_parts += 1
+    return common_suffix_parts >= MIN_RELOCATED_SOURCE_SUFFIX_PARTS
 
 
 @dataclass
@@ -675,8 +1443,47 @@ def metadata_problem(
         return "repaired_child_has_no_returns_row"
     if source_meta and repaired_meta:
         for key in ("ein", "tax_year", "return_type"):
-            if str(source_meta.get(key) or "") != str(repaired_meta.get(key) or ""):
+            if scalar_token(source_meta.get(key)) != scalar_token(repaired_meta.get(key)):
                 return f"filing_metadata_changed:{key}"
+    return None
+
+
+def verify_known_extractor_enrichment(
+    table: str,
+    filing_id: Any,
+    source_payload: PayloadResult,
+    repaired_payload: PayloadResult,
+    payload_columns: Sequence[str],
+    repaired_meta: Optional[Mapping[str, Any]],
+    xml_root: Path,
+) -> Optional[TransformVerification]:
+    if table == "grants":
+        return verify_grant_extractor_enrichment(
+            filing_id,
+            source_payload.counter,
+            repaired_payload.counter,
+            payload_columns,
+            repaired_meta,
+            xml_root,
+        )
+    if table == "irs990_pf_officer_dir_trst_key_empl_info_grp":
+        return verify_pf_officer_extractor_enrichment(
+            filing_id,
+            source_payload.counter,
+            repaired_payload.counter,
+            payload_columns,
+            repaired_meta,
+            xml_root,
+        )
+    if table == "irs990_schedule_c_supplemental_info":
+        return verify_schedule_c_extractor_enrichment(
+            filing_id,
+            source_payload.counter,
+            repaired_payload.counter,
+            payload_columns,
+            repaired_meta,
+            xml_root,
+        )
     return None
 
 
@@ -691,6 +1498,8 @@ def build_detail(
     repaired_index: str,
     payload_columns: Sequence[str],
     fail_on_new: bool,
+    allow_verified_extractor_enrichments: bool,
+    extractor_enrichment_xml_root: Optional[Path],
 ) -> Dict[str, Any]:
     source_payload = fetch_payload(
         source_conn, table, source_index, filing_id, payload_columns
@@ -728,6 +1537,43 @@ def build_detail(
     meta = repaired_meta or source_meta or {}
     source_file = (source_meta or {}).get("source_file")
     repaired_source_file = (repaired_meta or {}).get("source_file")
+
+    if (
+        allow_verified_extractor_enrichments
+        and extractor_enrichment_xml_root is not None
+        and not notes
+        and classification != "expected_exact_replay_cleanup"
+    ):
+        verification = verify_known_extractor_enrichment(
+            table,
+            filing_id,
+            source_payload,
+            repaired_payload,
+            payload_columns,
+            repaired_meta,
+            extractor_enrichment_xml_root,
+        )
+        if verification is not None:
+            if verification.verified:
+                classification = "verified_extractor_enrichment"
+                exact_extra = verification.source_extra_rows
+                new_rows = verification.new_payload_rows
+                replay_factor = None
+                notes.append(
+                    "verified_extractor_enrichment:"
+                    f"{verification.kind};enriched_rows={verification.enriched_rows};"
+                    f"source_replay_rows_removed={verification.source_extra_rows};"
+                    f"new_rows={verification.new_payload_rows}"
+                )
+            else:
+                notes.append(
+                    f"extractor_enrichment_not_verified:{verification.reason}"
+                )
+                # Opt-in never relaxes a supported-table mismatch unless the
+                # complete directional/XML proof succeeds.  In particular, a
+                # failed Schedule C proof must not inherit the normally
+                # non-gating new_in_rebuild classification.
+                classification = "unexplained"
 
     row: Dict[str, Any] = {field: None for field in DETAIL_FIELDS}
     row.update(
@@ -786,8 +1632,17 @@ def build_detail(
             row[f"{prefix}_grant_material_mismatch"] = reconciliation["material_mismatch"]
             row[f"{prefix}_grant_inflated"] = reconciliation["inflated"]
 
-    gate_failure = classification in HARD_FAILURE_CLASSES or (
-        fail_on_new and classification == "new_in_rebuild"
+    unverified_allowlisted_new = bool(
+        not allow_verified_extractor_enrichments
+        and table in VERIFIED_EXTRACTOR_ENRICHMENT_TABLES
+        and classification == "new_in_rebuild"
+    )
+    if unverified_allowlisted_new:
+        notes.append("allowlisted_new_rows_require_explicit_verified_enrichment_opt_in")
+    gate_failure = (
+        classification in HARD_FAILURE_CLASSES
+        or (fail_on_new and classification == "new_in_rebuild")
+        or unverified_allowlisted_new
     )
     row["classification"] = classification
     row["gate_failure"] = int(gate_failure)
@@ -801,10 +1656,23 @@ class DetailReportWriter:
         detail_csv: Path,
         detail_json: Path,
         metadata: Mapping[str, Any],
+        *,
+        detail_limit_per_table: int = DEFAULT_DETAIL_LIMIT_PER_TABLE,
+        detail_limit_total: int = DEFAULT_DETAIL_LIMIT_TOTAL,
     ) -> None:
+        if detail_limit_per_table < 1:
+            raise ValueError("detail_limit_per_table must be at least 1")
+        if detail_limit_total < 1:
+            raise ValueError("detail_limit_total must be at least 1")
         self.detail_csv = detail_csv.resolve()
         self.detail_json = detail_json.resolve()
         self.metadata = dict(metadata)
+        self.detail_limit_per_table = int(detail_limit_per_table)
+        self.detail_limit_total = int(detail_limit_total)
+        self._evidence_by_table: Counter[str] = Counter()
+        self._written_by_table: Counter[str] = Counter()
+        self._suppressed_by_table: Counter[str] = Counter()
+        self._written_total = 0
         self._csv_tmp: Optional[Path] = None
         self._json_tmp: Optional[Path] = None
         self._csv_fh = None
@@ -837,13 +1705,45 @@ class DetailReportWriter:
         self._json_fh.write(',"details":[')
         return self
 
-    def write(self, row: Mapping[str, Any]) -> None:
+    def write(self, row: Mapping[str, Any]) -> bool:
         assert self._csv_writer is not None and self._json_fh is not None
+        table = str(row.get("table_name") or "__UNKNOWN__")
+        self._evidence_by_table[table] += 1
+        if (
+            self._written_by_table[table] >= self.detail_limit_per_table
+            or self._written_total >= self.detail_limit_total
+        ):
+            self._suppressed_by_table[table] += 1
+            return False
         self._csv_writer.writerow(dict(row))
         if not self._first_json:
             self._json_fh.write(",")
         json.dump(dict(row), self._json_fh, ensure_ascii=False, sort_keys=True)
         self._first_json = False
+        self._written_by_table[table] += 1
+        self._written_total += 1
+        return True
+
+    def detail_counts(self, table: str) -> Dict[str, int]:
+        return {
+            "detail_evidence_rows": int(self._evidence_by_table[table]),
+            "detail_rows_written": int(self._written_by_table[table]),
+            "detail_rows_suppressed": int(self._suppressed_by_table[table]),
+        }
+
+    def detail_reporting(self) -> Dict[str, Any]:
+        tables = sorted(self._evidence_by_table)
+        return {
+            "limit_per_table": self.detail_limit_per_table,
+            "limit_total": self.detail_limit_total,
+            "evidence_rows": sum(self._evidence_by_table.values()),
+            "rows_written": self._written_total,
+            "rows_suppressed": sum(self._suppressed_by_table.values()),
+            "by_table": {
+                table: self.detail_counts(table)
+                for table in tables
+            },
+        }
 
     def finish(
         self,
@@ -855,6 +1755,8 @@ class DetailReportWriter:
         json.dump(list(summary), self._json_fh, ensure_ascii=False, sort_keys=True)
         self._json_fh.write(',"gates":')
         json.dump(dict(gates), self._json_fh, ensure_ascii=False, sort_keys=True)
+        self._json_fh.write(',"detail_reporting":')
+        json.dump(self.detail_reporting(), self._json_fh, ensure_ascii=False, sort_keys=True)
         self._json_fh.write("}\n")
         self._csv_fh.flush()
         self._json_fh.flush()
@@ -1105,7 +2007,11 @@ def audit_returns_population(
                 and current_repaired is not None
                 and not current_source.problems
                 and not current_repaired.problems
-                and current_source.mapping_counter == current_repaired.mapping_counter
+                and current_source.row_count == current_repaired.row_count == 1
+                and source_files_equivalent(
+                    current_source.source_file,
+                    current_repaired.source_file,
+                )
             )
             if matches:
                 continue
@@ -1162,7 +2068,7 @@ def audit_returns_population(
     if summary["gate_failures"]:
         summary["status"] = "failed"
     elif not summary["notes"]:
-        summary["notes"] = "exact filing/source_file/object coverage"
+        summary["notes"] = "exact filing/portable source provenance/object coverage"
     return summary
 
 
@@ -1186,6 +2092,8 @@ def audit_table(
     repaired_conn: sqlite3.Connection,
     report: DetailReportWriter,
     fail_on_new: bool,
+    allow_verified_extractor_enrichments: bool,
+    extractor_enrichment_xml_root: Optional[Path],
 ) -> Dict[str, Any]:
     summary = new_summary(table)
     try:
@@ -1267,6 +2175,8 @@ def audit_table(
                 repaired_index,
                 payload_columns,
                 fail_on_new,
+                allow_verified_extractor_enrichments,
+                extractor_enrichment_xml_root,
             )
             report.write(detail)
             summary["mismatched_filings"] += 1
@@ -1304,12 +2214,35 @@ def run_audit(
     detail_csv: Path,
     detail_json: Path,
     fail_on_new: bool = False,
+    detail_limit_per_table: int = DEFAULT_DETAIL_LIMIT_PER_TABLE,
+    detail_limit_total: int = DEFAULT_DETAIL_LIMIT_TOTAL,
+    allow_verified_extractor_enrichments: bool = False,
+    extractor_enrichment_xml_root: Optional[Path] = None,
 ) -> int:
     source_db = source_db.expanduser().resolve()
     repaired_db = repaired_db.expanduser().resolve()
     summary_csv = summary_csv.expanduser().resolve()
     detail_csv = detail_csv.expanduser().resolve()
     detail_json = detail_json.expanduser().resolve()
+    if allow_verified_extractor_enrichments:
+        if extractor_enrichment_xml_root is None:
+            raise ValueError(
+                "--allow-verified-extractor-enrichments requires "
+                "--extractor-enrichment-xml-root"
+            )
+        extractor_enrichment_xml_root = (
+            Path(extractor_enrichment_xml_root).expanduser().resolve()
+        )
+        if not extractor_enrichment_xml_root.is_dir():
+            raise ValueError(
+                "extractor enrichment XML root is not a directory: "
+                f"{extractor_enrichment_xml_root}"
+            )
+    elif extractor_enrichment_xml_root is not None:
+        raise ValueError(
+            "--extractor-enrichment-xml-root requires "
+            "--allow-verified-extractor-enrichments"
+        )
     validate_output_paths(
         source_db, repaired_db, summary_csv, detail_csv, detail_json
     )
@@ -1324,16 +2257,46 @@ def run_audit(
             "repaired": database_identity(repaired_conn, repaired_db),
             "tables": list(MULTIROW_CHILD_TABLES),
             "audit_scopes": ["returns", *MULTIROW_CHILD_TABLES],
-            "population_strategy": "exact indexed filing/source_file/object coverage",
+            "population_strategy": (
+                "exact indexed filing/portable source provenance/object coverage"
+            ),
             "count_strategy": "streamed through filing_id leading index",
             "payload_strategy": (
                 "order-independent constant-memory digest for every filing; "
                 "full payload multiset only for mismatches"
             ),
+            "source_file_strategy": (
+                "exact normalized path or same XML object with at least one "
+                "matching trailing archive directory"
+            ),
+            "detail_reporting": {
+                "limit_per_table": int(detail_limit_per_table),
+                "limit_total": int(detail_limit_total),
+                "summary_counts_remain_exact_when_details_are_suppressed": True,
+            },
+            "verified_extractor_enrichments": {
+                "enabled": bool(allow_verified_extractor_enrichments),
+                "xml_root": (
+                    str(extractor_enrichment_xml_root)
+                    if extractor_enrichment_xml_root is not None
+                    else None
+                ),
+                "policies": [
+                    "grants_cash_null_to_zero_with_directional_and_selected_xml_proof",
+                    "pf_officer_alternate_tag_benefit_expense_with_directional_and_selected_xml_proof",
+                    "schedule_c_full_selected_xml_current_extractor_counter_equality",
+                ],
+            },
             "fail_on_new": bool(fail_on_new),
         }
         summaries: List[Dict[str, Any]] = []
-        with DetailReportWriter(detail_csv, detail_json, metadata) as report:
+        with DetailReportWriter(
+            detail_csv,
+            detail_json,
+            metadata,
+            detail_limit_per_table=detail_limit_per_table,
+            detail_limit_total=detail_limit_total,
+        ) as report:
             print("[audit] comparing returns population/provenance...", flush=True)
             summaries.append(
                 audit_returns_population(source_conn, repaired_conn, report)
@@ -1347,16 +2310,26 @@ def run_audit(
                         repaired_conn,
                         report,
                         fail_on_new,
+                        allow_verified_extractor_enrichments,
+                        extractor_enrichment_xml_root,
                     )
                 )
+            for summary in summaries:
+                summary.update(report.detail_counts(str(summary["table_name"])))
             total = aggregate_summary(summaries)
             all_summaries = [*summaries, total]
+            detail_reporting = report.detail_reporting()
             gates = {
                 "passed": not bool(total["gate_failures"]),
                 "gate_failures": int(total["gate_failures"]),
                 "hard_failure_classes": sorted(HARD_FAILURE_CLASSES),
                 "exact_returns_population_required": True,
                 "new_rows_fail_when_requested": bool(fail_on_new),
+                "verified_extractor_enrichments_enabled": bool(
+                    allow_verified_extractor_enrichments
+                ),
+                "detail_rows_written": int(detail_reporting["rows_written"]),
+                "detail_rows_suppressed": int(detail_reporting["rows_suppressed"]),
                 "completed_at": utc_now(),
             }
             report.finish(all_summaries, gates)
@@ -1410,6 +2383,39 @@ def build_parser() -> argparse.ArgumentParser:
             "Recommended when the extractor and source inventory are expected to be identical."
         ),
     )
+    parser.add_argument(
+        "--detail-limit-per-table",
+        type=int,
+        default=DEFAULT_DETAIL_LIMIT_PER_TABLE,
+        help=(
+            "Maximum mismatch evidence rows written for each audit scope "
+            f"(default: {DEFAULT_DETAIL_LIMIT_PER_TABLE:,}); exact summary counts are retained."
+        ),
+    )
+    parser.add_argument(
+        "--detail-limit-total",
+        type=int,
+        default=DEFAULT_DETAIL_LIMIT_TOTAL,
+        help=(
+            "Maximum mismatch evidence rows written across all scopes "
+            f"(default: {DEFAULT_DETAIL_LIMIT_TOTAL:,}); exact summary counts are retained."
+        ),
+    )
+    parser.add_argument(
+        "--allow-verified-extractor-enrichments",
+        action="store_true",
+        help=(
+            "Opt in to narrowly verified extractor-only enrichments for grants, "
+            "PF officers, and Schedule C. All other payload changes still fail."
+        ),
+    )
+    parser.add_argument(
+        "--extractor-enrichment-xml-root",
+        help=(
+            "Explicit XML archive root used to root-confine and re-extract Schedule C "
+            "evidence; required with --allow-verified-extractor-enrichments."
+        ),
+    )
     return parser
 
 
@@ -1423,6 +2429,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             Path(args.detail_csv),
             Path(args.detail_json),
             fail_on_new=bool(args.fail_on_new),
+            detail_limit_per_table=int(args.detail_limit_per_table),
+            detail_limit_total=int(args.detail_limit_total),
+            allow_verified_extractor_enrichments=bool(
+                args.allow_verified_extractor_enrichments
+            ),
+            extractor_enrichment_xml_root=(
+                Path(args.extractor_enrichment_xml_root)
+                if args.extractor_enrichment_xml_root
+                else None
+            ),
         )
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
