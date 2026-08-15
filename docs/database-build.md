@@ -151,6 +151,54 @@ It hashes duplicate object-ID candidates by default and classifies them as:
 - `object_id_conflict`: same normalized object ID, but different or unknown file
   content. Review these manually.
 
+### Manifest-verified clean rebuild
+
+For a clean rebuild that must reproduce the source choice behind the current
+database, explicitly enable manifest selection. First run the read-only
+selection proof; `IRS_XML_ROOT` supplies the archive root unless `--xml-dir`
+overrides it:
+
+```powershell
+.\.venv\Scripts\python.exe rebuild_irs990_slim_clean.py `
+  --manifest-selection-only `
+  --manifest-db db\irs990_sources.db `
+  --expected-selection-count 5904356
+```
+
+This opens the manifest read-only and does not open, create, or remove a
+destination database. It requires exactly one `loaded_filings` row and one
+selected XML per normalized object ID. Unique sources are retained, exact byte
+duplicates use their single manifest primary, and every `object_id_conflict`
+must resolve uniquely to the historical source path recorded in
+`loaded_filings`. Absolute/traversal paths, ambiguous or unresolved groups,
+selected quarantine rows, missing files, size/mtime changes, SHA-256 changes
+where the manifest has a digest, stale scan rows, and object/filing count
+mismatches reject the entire selection. Long selections report progress every
+100,000 validated objects/files.
+
+Only after selection succeeds, build into a new staging filename:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+$repairDb = "db\irs990-repaired-$stamp.db"
+.\.venv\Scripts\python.exe rebuild_irs990_slim_clean.py `
+  --db $repairDb `
+  --manifest-clean-rebuild `
+  --manifest-db db\irs990_sources.db `
+  --expected-selection-count 5904356
+```
+
+The complete manifest and filesystem validation occurs before the loader can
+write anything. Manifest mode refuses `IRS_DB_PATH`, any destination that
+already exists, and any destination within the XML root; always provide a new
+staging filename. The loader builds beside that filename, fails on the first
+XML extraction/header error, verifies exact return/filing/object/source coverage
+and `PRAGMA quick_check`, checkpoints the WAL, and only then atomically installs
+the requested staging file. A failed run removes its temporary build and never
+publishes a partial destination. Rescan the archive and re-import
+`loaded_filings` into the manifest whenever the relative XML tree or production
+source population changes.
+
 ### Rescanning after a move
 
 Changing only the absolute archive location does not invalidate a portable
@@ -287,6 +335,13 @@ Full clean rebuild:
 
 ```powershell
 python rebuild_irs990_slim_clean.py --db db/irs990.db --xml-dir C:/path/to/xml
+```
+
+Manifest selection-only proof and manifest-verified staging rebuild:
+
+```powershell
+python rebuild_irs990_slim_clean.py --manifest-selection-only --manifest-db db/irs990_sources.db --xml-dir C:/path/to/xml --expected-selection-count 5904356
+python rebuild_irs990_slim_clean.py --db db/irs990-repaired.db --manifest-clean-rebuild --manifest-db db/irs990_sources.db --xml-dir C:/path/to/xml --expected-selection-count 5904356
 ```
 
 Full rebuild with fewer workers:

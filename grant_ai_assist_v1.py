@@ -336,6 +336,10 @@ def attach_grant_work_db(conn: sqlite3.Connection, db_path: str, readonly: bool 
     if readonly and not Path(work_db_path).exists():
         conn.execute(f"ATTACH DATABASE ':memory:' AS {GRANT_WORK_SCHEMA}")
         return
+    if readonly:
+        work_uri = Path(work_db_path).expanduser().resolve().as_uri() + "?mode=ro"
+        conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (work_uri,))
+        return
     if not readonly:
         Path(work_db_path).parent.mkdir(parents=True, exist_ok=True)
     conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (work_db_path,))
@@ -3853,6 +3857,957 @@ def cmd_import_adjudication_decisions(args: argparse.Namespace) -> None:
     print(f"External decision import complete: processed={processed:,}; {mode}={inserted:,}; skipped_existing={skipped_existing:,}; missing/invalid_input={invalid_missing:,}", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Reviewed-decision migration after a clean database rebuild
+# ---------------------------------------------------------------------------
+
+
+DECISION_COLUMNS = [
+    "signature_hash", "decision", "selected_candidate_id", "selected_ein", "selected_name", "confidence",
+    "confidence_label", "reason_codes_json", "explanation", "needs_human_review", "auto_accept",
+    "validation_status", "validation_error", "model", "model_options_json", "prompt_hash", "candidate_set_hash",
+    "input_json", "output_json", "created_at",
+]
+
+MIGRATION_AUDIT_COLUMNS = [
+    "signature_hash", "status", "target_action", "reasons", "decision", "model",
+    "source_validation_status", "source_auto_accept", "retained_auto_accept",
+    "selected_candidate_id", "selected_ein", "current_reported_ein",
+    "source_candidate_set_hash", "derived_source_candidate_set_hash", "current_candidate_set_hash",
+    "candidate_identity_equal", "target_existing_model",
+]
+
+SQLITE_DB_COMPANION_SUFFIXES = ("-wal", "-shm", "-journal")
+ROLLBACK_JOURNAL_MODES = {"delete", "truncate", "persist"}
+
+
+def _normalized_file_path(path: str) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve()))
+
+
+def _same_file_path(left: str, right: str) -> bool:
+    if _normalized_file_path(left) == _normalized_file_path(right):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def _database_and_companion_paths(db_path: str) -> List[str]:
+    """Return a DB path plus SQLite's adjacent journal/WAL companion names."""
+    resolved = str(Path(db_path).expanduser().resolve())
+    return [resolved, *(resolved + suffix for suffix in SQLITE_DB_COMPANION_SUFFIXES)]
+
+
+def _reject_database_output_path(output_path: Path, database_paths: Sequence[str]) -> None:
+    for database_path in database_paths:
+        for protected_path in _database_and_companion_paths(database_path):
+            if _same_file_path(str(output_path), protected_path):
+                raise RuntimeError(
+                    "Refusing to use a database or SQLite companion path as migration output: "
+                    f"{output_path}"
+                )
+
+
+def _connect_main_readonly(db_path: str) -> sqlite3.Connection:
+    """Open one SQLite database read-only, without attaching the configured work DB."""
+    path = Path(db_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
+    if int(conn.execute("PRAGMA query_only").fetchone()[0]) != 1:
+        conn.close()
+        raise RuntimeError(f"Could not enforce read-only mode for source database: {path}")
+    return conn
+
+
+def _connect_migration_target(main_path: str, work_path: str, readonly: bool) -> sqlite3.Connection:
+    """Open exactly the regenerated main/work pair used by decision migration."""
+    main = Path(main_path).expanduser().resolve()
+    work = Path(work_path).expanduser().resolve()
+    if readonly:
+        conn = sqlite3.connect(main.as_uri() + "?mode=ro", uri=True)
+    else:
+        conn = sqlite3.connect(str(main))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-300000")
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA mmap_size=2147483648")
+        if readonly:
+            work_uri = work.as_uri() + "?mode=ro"
+            conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (work_uri,))
+            conn.execute("PRAGMA query_only=ON")
+            if int(conn.execute("PRAGMA query_only").fetchone()[0]) != 1:
+                raise RuntimeError("Could not enforce query-only mode for the dry-run target connection.")
+        else:
+            conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (str(work),))
+            conn.execute("PRAGMA main.locking_mode=EXCLUSIVE")
+            conn.execute(f"PRAGMA {GRANT_WORK_SCHEMA}.locking_mode=EXCLUSIVE")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _migration_database_paths(conn: sqlite3.Connection) -> Dict[str, Path]:
+    paths = {
+        clean_text(row[1]): Path(clean_text(row[2])).expanduser().resolve()
+        for row in conn.execute("PRAGMA database_list")
+        if clean_text(row[1]) in {"main", GRANT_WORK_SCHEMA}
+    }
+    if set(paths) != {"main", GRANT_WORK_SCHEMA}:
+        raise RuntimeError("Migration requires one file-backed main DB and one attached grant work DB.")
+    if not all(path.is_file() for path in paths.values()):
+        raise RuntimeError("Migration requires existing file-backed main and grant work databases.")
+    if os.stat(paths["main"]).st_dev != os.stat(paths[GRANT_WORK_SCHEMA]).st_dev:
+        raise RuntimeError(
+            "Target main and grant work databases must be on the same filesystem for crash-atomic attached writes."
+        )
+    return paths
+
+
+def _journal_mode(conn: sqlite3.Connection, schema: str) -> str:
+    return clean_text(conn.execute(f"PRAGMA {schema}.journal_mode").fetchone()[0]).lower()
+
+
+def _set_journal_mode(conn: sqlite3.Connection, schema: str, mode: str) -> str:
+    return clean_text(conn.execute(f"PRAGMA {schema}.journal_mode={mode}").fetchone()[0]).lower()
+
+
+def _prepare_migration_journal_modes(conn: sqlite3.Connection) -> Dict[str, str]:
+    """Force rollback journals so SQLite can use a super-journal for the pair."""
+    _migration_database_paths(conn)
+    original = {schema: _journal_mode(conn, schema) for schema in ("main", GRANT_WORK_SCHEMA)}
+    changed: List[str] = []
+    try:
+        for schema in ("main", GRANT_WORK_SCHEMA):
+            if original[schema] == "wal":
+                checkpoint = conn.execute(f"PRAGMA {schema}.wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and int(checkpoint[0]) != 0:
+                    raise RuntimeError(
+                        f"Could not checkpoint {schema} WAL; stop all users of the repaired pair before migration."
+                    )
+            actual = _set_journal_mode(conn, schema, "DELETE")
+            changed.append(schema)
+            if actual not in ROLLBACK_JOURNAL_MODES:
+                raise RuntimeError(
+                    f"Could not force a rollback journal for {schema}; SQLite reported journal_mode={actual!r}."
+                )
+            conn.execute(f"PRAGMA {schema}.synchronous=FULL")
+            if int(conn.execute(f"PRAGMA {schema}.synchronous").fetchone()[0]) < 2:
+                raise RuntimeError(f"Could not enforce synchronous=FULL for {schema} during migration.")
+        return original
+    except Exception as exc:
+        restore_failures: List[str] = []
+        for schema in reversed(changed):
+            try:
+                actual = _set_journal_mode(conn, schema, original[schema])
+                if actual != original[schema]:
+                    restore_failures.append(
+                        f"{schema}: expected {original[schema]}, got {actual}"
+                    )
+            except sqlite3.Error as restore_exc:
+                restore_failures.append(f"{schema}: {type(restore_exc).__name__}: {restore_exc}")
+        if restore_failures:
+            raise RuntimeError(
+                f"Migration journal preparation failed ({type(exc).__name__}: {exc}) and changed modes "
+                "could not be restored: " + "; ".join(restore_failures)
+            ) from exc
+        raise
+
+
+def _restore_migration_journal_modes(conn: sqlite3.Connection, original: Dict[str, str]) -> None:
+    failures: List[str] = []
+    for schema in (GRANT_WORK_SCHEMA, "main"):
+        expected = original.get(schema, "delete")
+        try:
+            actual = _set_journal_mode(conn, schema, expected)
+        except sqlite3.Error as exc:
+            failures.append(f"{schema}: {type(exc).__name__}: {exc}")
+            continue
+        if actual != expected:
+            failures.append(f"{schema}: expected {expected}, got {actual}")
+    if failures:
+        raise RuntimeError("Could not restore pre-migration SQLite journal modes: " + "; ".join(failures))
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    schema, table = _split_qualified_name(table_name)
+    schema = schema or "main"
+    return {clean_text(row[1]) for row in conn.execute(f"PRAGMA {schema}.table_info({table})")}
+
+
+def _require_columns(conn: sqlite3.Connection, table_name: str, required: Sequence[str]) -> None:
+    columns = _table_columns(conn, table_name)
+    missing = sorted(set(required) - columns)
+    if missing:
+        raise RuntimeError(f"{table_name} is missing required columns: {', '.join(missing)}")
+
+
+def _require_signature_grant_coverage(conn: sqlite3.Connection) -> None:
+    """Require a complete signature -> mapping -> rebuilt grant relationship."""
+    unmapped_signature = conn.execute(
+        f"SELECT s.signature_hash FROM {SIG_TABLE} s "
+        f"LEFT JOIN {SIG_GRANT_TABLE} sg ON sg.signature_hash=s.signature_hash "
+        "WHERE sg.signature_hash IS NULL LIMIT 1"
+    ).fetchone()
+    if unmapped_signature is not None:
+        raise RuntimeError(
+            "Signature/grant mapping is incomplete; signature "
+            f"{clean_text(unmapped_signature['signature_hash'])!r} has no mapped rebuilt grant."
+        )
+
+    orphan_signature_mapping = conn.execute(
+        f"SELECT sg.signature_hash, sg.grant_id FROM {SIG_GRANT_TABLE} sg "
+        f"LEFT JOIN {SIG_TABLE} s ON s.signature_hash=sg.signature_hash "
+        "WHERE s.signature_hash IS NULL LIMIT 1"
+    ).fetchone()
+    if orphan_signature_mapping is not None:
+        raise RuntimeError(
+            "Signature/grant mapping is referentially invalid; mapping for signature "
+            f"{clean_text(orphan_signature_mapping['signature_hash'])!r} has no signature row."
+        )
+
+    orphan_grant_mapping = conn.execute(
+        f"SELECT sg.signature_hash, sg.grant_id FROM {SIG_GRANT_TABLE} sg "
+        f"LEFT JOIN {RESOLVED_TABLE} r ON r.grant_id=sg.grant_id "
+        "WHERE r.grant_id IS NULL LIMIT 1"
+    ).fetchone()
+    if orphan_grant_mapping is not None:
+        raise RuntimeError(
+            "Signature/grant mapping is referentially invalid; grant_id "
+            f"{orphan_grant_mapping['grant_id']!r} for signature "
+            f"{clean_text(orphan_grant_mapping['signature_hash'])!r} is absent from rebuilt resolution."
+        )
+
+
+def _record_value(record: Any, key: str, default: Any = None) -> Any:
+    if isinstance(record, dict):
+        return record.get(key, default)
+    try:
+        return record[key] if key in record.keys() else default
+    except (AttributeError, KeyError, TypeError):
+        return default
+
+
+def _record_dict(record: Any) -> Dict[str, Any]:
+    if isinstance(record, dict):
+        return dict(record)
+    try:
+        return {key: record[key] for key in record.keys()}
+    except (AttributeError, KeyError, TypeError):
+        return {}
+
+
+def candidate_set_payload(candidates: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Return the exact compact candidate representation used by stored decision hashes."""
+    payload: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        score = _record_value(candidate, "candidate_score", None)
+        if score is None:
+            score = _record_value(candidate, "score", None)
+        payload.append({
+            "id": clean_text(_record_value(candidate, "candidate_id", _record_value(candidate, "id", ""))),
+            "ein": clean_text(_record_value(candidate, "ein", "")),
+            "score": score,
+        })
+    return payload
+
+
+def candidate_set_fingerprint(candidates: Sequence[Any]) -> str:
+    payload_json = json.dumps(candidate_set_payload(candidates), sort_keys=True)
+    return stable_hash([payload_json], "CANDS_")
+
+
+def candidate_set_identity(candidates: Sequence[Any]) -> List[Tuple[str, str]]:
+    return [
+        (
+            clean_text(_record_value(candidate, "candidate_id", _record_value(candidate, "id", ""))),
+            clean_text(_record_value(candidate, "ein", "")),
+        )
+        for candidate in candidates
+    ]
+
+
+def _json_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        return value
+    text = clean_text(value)
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _source_output_for_revalidation(row: sqlite3.Row) -> Tuple[Optional[Dict[str, Any]], str]:
+    raw_output = clean_text(row["output_json"])
+    output = _json_dict(raw_output)
+    if raw_output and output is None:
+        return None, "invalid_source_output_json"
+    if output is None:
+        # Legacy hand-entered review rows may not have output_json. Reconstruct
+        # only the validator fields while preserving the original blank value.
+        output = {
+            "decision": clean_text(row["decision"]),
+            "candidate_id": clean_text(row["selected_candidate_id"]),
+            "confidence": row["confidence"],
+            "confidence_label": clean_text(row["confidence_label"]),
+            "reason_codes": _reason_codes_from_any(row["reason_codes_json"]),
+            "explanation": clean_text(row["explanation"]),
+            "needs_human_review": _bool_from_any(row["needs_human_review"], default=True),
+        }
+        return output, "output_synthesized_from_columns"
+    output = dict(output)
+    output["reason_codes"] = _reason_codes_from_any(output.get("reason_codes"))
+    output["needs_human_review"] = _bool_from_any(output.get("needs_human_review"), default=True)
+    if "candidate_id" not in output and "selected_candidate_id" in output:
+        output["candidate_id"] = clean_text(output.get("selected_candidate_id"))
+    return output, ""
+
+
+def _source_candidates_from_input(row: sqlite3.Row) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    raw_input = clean_text(row["input_json"])
+    if not raw_input:
+        return None, ""
+    input_obj = _json_dict(raw_input)
+    if input_obj is None:
+        return None, "invalid_source_input_json"
+    candidates = input_obj.get("candidates")
+    if candidates is None:
+        return None, ""
+    if not isinstance(candidates, list) or any(not isinstance(candidate, dict) for candidate in candidates):
+        return None, "invalid_source_candidate_list"
+    return list(candidates), ""
+
+
+def _source_signature_hash_from_input(row: sqlite3.Row) -> str:
+    input_obj = _json_dict(row["input_json"])
+    if not input_obj:
+        return ""
+    signature = input_obj.get("grant_recipient_signature")
+    if not isinstance(signature, dict):
+        return ""
+    return clean_text(signature.get("signature_hash"))
+
+
+def _fetch_migration_batch_context(
+    conn: sqlite3.Connection,
+    signature_hashes: Sequence[str],
+    max_candidates: int,
+    decision_table_exists: bool,
+) -> Tuple[Dict[str, sqlite3.Row], Dict[str, List[sqlite3.Row]], Dict[str, sqlite3.Row]]:
+    placeholders = ",".join("?" for _ in signature_hashes)
+    signatures = {
+        row["signature_hash"]: row
+        for row in conn.execute(
+            f"SELECT * FROM {SIG_TABLE} WHERE signature_hash IN ({placeholders})",
+            list(signature_hashes),
+        )
+    }
+    candidate_rows = conn.execute(
+        f"SELECT * FROM ("
+        f"  SELECT c.*, ROW_NUMBER() OVER (PARTITION BY signature_hash ORDER BY candidate_rank) AS migration_rank "
+        f"  FROM {CAND_TABLE} c WHERE signature_hash IN ({placeholders})"
+        f") WHERE migration_rank <= ? ORDER BY signature_hash, candidate_rank",
+        [*signature_hashes, max_candidates],
+    )
+    candidates: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for row in candidate_rows:
+        candidates[row["signature_hash"]].append(row)
+    existing: Dict[str, sqlite3.Row] = {}
+    if decision_table_exists:
+        existing = {
+            row["signature_hash"]: row
+            for row in conn.execute(
+                f"SELECT * FROM {DECISION_TABLE} WHERE signature_hash IN ({placeholders})",
+                list(signature_hashes),
+            )
+        }
+    return signatures, candidates, existing
+
+
+def _ensure_decision_schema_in_transaction(conn: sqlite3.Connection) -> None:
+    conn.execute(f"""
+    CREATE TABLE IF NOT EXISTS {DECISION_TABLE} (
+      signature_hash TEXT PRIMARY KEY,
+      decision TEXT,
+      selected_candidate_id TEXT,
+      selected_ein TEXT,
+      selected_name TEXT,
+      confidence NUMERIC,
+      confidence_label TEXT,
+      reason_codes_json TEXT,
+      explanation TEXT,
+      needs_human_review INTEGER,
+      auto_accept INTEGER,
+      validation_status TEXT,
+      validation_error TEXT,
+      model TEXT,
+      model_options_json TEXT,
+      prompt_hash TEXT,
+      candidate_set_hash TEXT,
+      input_json TEXT,
+      output_json TEXT,
+      created_at TEXT
+    )
+    """)
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ai_decision_auto ON {DECISION_TABLE}(auto_accept, confidence)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_ai_decision_selected_ein ON {DECISION_TABLE}(selected_ein)")
+    _require_columns(conn, DECISION_TABLE, DECISION_COLUMNS)
+
+
+def _upsert_migrated_decision(conn: sqlite3.Connection, row: Sequence[Any]) -> None:
+    placeholders = ",".join("?" for _ in DECISION_COLUMNS)
+    updates = ",".join(f"{column}=excluded.{column}" for column in DECISION_COLUMNS if column != "signature_hash")
+    conn.execute(
+        f"INSERT INTO {DECISION_TABLE} ({','.join(DECISION_COLUMNS)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(signature_hash) DO UPDATE SET {updates}",
+        tuple(row),
+    )
+    _mark_migrated_signature_adjudicated(conn, clean_text(row[0]))
+
+
+def _mark_migrated_signature_adjudicated(conn: sqlite3.Connection, signature_hash: str) -> None:
+    conn.execute(
+        f"UPDATE {SIG_TABLE} SET ai_queue_status='adjudicated', updated_at=? WHERE signature_hash=?",
+        (now_stamp(), signature_hash),
+    )
+
+
+def _canonical_json_for_comparison(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    try:
+        return json.dumps(json.loads(text), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, json.JSONDecodeError):
+        return text
+
+
+def _normalized_migration_decision(record: Any) -> Tuple[Any, ...]:
+    json_fields = {"reason_codes_json", "model_options_json", "input_json", "output_json"}
+    bool_fields = {"needs_human_review", "auto_accept"}
+    normalized: List[Any] = []
+    for column in DECISION_COLUMNS:
+        value = _record_value(record, column)
+        if column in json_fields:
+            value = _canonical_json_for_comparison(value)
+        elif column in bool_fields:
+            value = 1 if _bool_from_any(value, default=False) else 0
+        elif column == "confidence":
+            try:
+                value = round(float(value), 12)
+            except (TypeError, ValueError):
+                value = None
+        else:
+            value = clean_text(value)
+        normalized.append(value)
+    return tuple(normalized)
+
+
+def _decision_rows_same_normalized(expected_row: Sequence[Any], target: sqlite3.Row) -> bool:
+    expected = dict(zip(DECISION_COLUMNS, expected_row))
+    return _normalized_migration_decision(expected) == _normalized_migration_decision(target)
+
+
+def _migration_row(
+    source: sqlite3.Row,
+    validation: Dict[str, Any],
+    current_candidate_hash: str,
+    retained_auto_accept: int,
+) -> Tuple[Any, ...]:
+    decision = clean_text(source["decision"])
+    selected_name = clean_text(source["selected_name"])
+    if decision in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"} and validation.get("selected_name"):
+        selected_name = clean_text(validation["selected_name"])
+    return (
+        clean_text(source["signature_hash"]),
+        decision,
+        clean_text(source["selected_candidate_id"]),
+        clean_text(source["selected_ein"]),
+        selected_name,
+        source["confidence"],
+        clean_text(source["confidence_label"]),
+        source["reason_codes_json"],
+        source["explanation"],
+        1 if _bool_from_any(source["needs_human_review"], default=True) else 0,
+        retained_auto_accept,
+        "ok",
+        "",
+        source["model"],
+        source["model_options_json"],
+        source["prompt_hash"],
+        current_candidate_hash,
+        source["input_json"],
+        source["output_json"],
+        source["created_at"],
+    )
+
+
+def _atomic_output_paths(paths: Sequence[Path], overwrite: bool) -> Dict[Path, Path]:
+    normalized = [_normalized_file_path(str(path)) for path in paths]
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("Audit and quarantine output paths must be different files.")
+    temp_paths: Dict[Path, Path] = {}
+    nonce = f"{os.getpid()}-{time.time_ns()}"
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and not overwrite:
+            raise FileExistsError(f"Output already exists: {path}. Use --overwrite-audit to replace it.")
+        temp_path = path.with_name(f".{path.name}.{nonce}.tmp")
+        if temp_path.exists():
+            raise FileExistsError(temp_path)
+        temp_paths[path] = temp_path
+    return temp_paths
+
+
+def _flush_and_sync_output(handle: Any) -> None:
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _commit_migration_transaction(conn: sqlite3.Connection) -> None:
+    conn.commit()
+
+
+def _publish_staged_migration_outputs(temp_paths: Dict[Path, Path]) -> None:
+    for final_path, temp_path in temp_paths.items():
+        os.replace(temp_path, final_path)
+
+
+def _staged_recovery_message(temp_paths: Dict[Path, Path]) -> str:
+    recoverable = [
+        f"{temp_path} -> {final_path}"
+        for final_path, temp_path in temp_paths.items()
+        if temp_path.exists()
+    ]
+    published = [str(final_path) for final_path, temp_path in temp_paths.items() if not temp_path.exists()]
+    parts: List[str] = []
+    if recoverable:
+        parts.append("staged recovery artifacts: " + "; ".join(recoverable))
+    if published:
+        parts.append("already-published outputs: " + "; ".join(published))
+    return "; ".join(parts) or "no staged recovery artifact remains"
+
+
+def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
+    """Revalidate retained non-rule decisions against a regenerated target pair."""
+    source_path = str(Path(args.source_db).expanduser().resolve())
+    target_path = str(Path(args.db).expanduser().resolve())
+    work_arg = clean_text(getattr(args, "work_db", ""))
+    work_path = str(
+        Path(work_arg or GRANT_WORK_DB_PATH or default_grant_work_db_path(args.db)).expanduser().resolve()
+    )
+    if _same_file_path(source_path, target_path):
+        raise RuntimeError("Refusing decision migration because --source-db and --db are the same file.")
+    if _same_file_path(source_path, work_path):
+        raise RuntimeError("Refusing decision migration because --source-db and --work-db are the same file.")
+    if _same_file_path(target_path, work_path):
+        raise RuntimeError("Refusing decision migration because --db and --work-db are the same file.")
+    if not Path(target_path).is_file():
+        raise FileNotFoundError(target_path)
+    if not Path(work_path).is_file():
+        raise FileNotFoundError(
+            f"Regenerated grant work database not found: {work_path}. "
+            "Build signatures and candidates before migrating reviewed decisions."
+        )
+    if args.batch_size < 1 or args.batch_size > 900:
+        raise ValueError("--batch-size must be between 1 and 900 for portable SQLite parameter limits.")
+    if args.max_candidates < 1 or args.max_candidates > 100:
+        raise ValueError("--max-candidates must be between 1 and 100.")
+
+    audit_path = Path(args.audit_csv).expanduser().resolve()
+    quarantine_path = Path(args.quarantine_jsonl).expanduser().resolve()
+    for output_path in (audit_path, quarantine_path):
+        _reject_database_output_path(output_path, (source_path, target_path, work_path))
+    temp_paths = _atomic_output_paths([audit_path, quarantine_path], args.overwrite_audit)
+
+    source_conn: Optional[sqlite3.Connection] = None
+    target_conn: Optional[sqlite3.Connection] = None
+    audit_fh = None
+    quarantine_fh = None
+    transaction_started = False
+    database_committed = False
+    outputs_published = False
+    original_journal_modes: Optional[Dict[str, str]] = None
+    journal_modes_restored = False
+    counts: Counter = Counter()
+    started = time.time()
+    try:
+        source_conn = _connect_main_readonly(source_path)
+        if not table_exists(source_conn, DECISION_TABLE):
+            raise RuntimeError(f"Source database is missing {DECISION_TABLE}: {source_path}")
+        _require_columns(source_conn, DECISION_TABLE, DECISION_COLUMNS)
+
+        target_conn = _connect_migration_target(target_path, work_path, readonly=not args.apply)
+        if not table_exists(target_conn, RESOLVED_TABLE):
+            raise RuntimeError(
+                f"Target is missing {RESOLVED_TABLE}. Run deterministic grant resolution before migrating reviewed decisions."
+            )
+        if (
+            not table_exists(target_conn, SIG_TABLE)
+            or not table_exists(target_conn, SIG_GRANT_TABLE)
+            or not table_exists(target_conn, CAND_TABLE)
+        ):
+            raise RuntimeError(
+                f"Target is missing {SIG_TABLE}, {SIG_GRANT_TABLE}, or {CAND_TABLE}. "
+                "Build signatures, grant mappings, and candidates before migrating reviewed decisions."
+            )
+        _require_columns(
+            target_conn,
+            SIG_TABLE,
+            ["signature_hash", "reported_ein", "recipient_name", "sample_grantor_ein", "ai_queue_status", "updated_at"],
+        )
+        _require_columns(
+            target_conn,
+            CAND_TABLE,
+            ["signature_hash", "candidate_id", "candidate_rank", "ein", "candidate_name", "candidate_score"],
+        )
+        _require_columns(target_conn, SIG_GRANT_TABLE, ["signature_hash", "grant_id"])
+        _require_columns(target_conn, RESOLVED_TABLE, ["grant_id"])
+        _require_signature_grant_coverage(target_conn)
+        pending_signature = target_conn.execute(
+            f"SELECT signature_hash, ai_queue_status FROM {SIG_TABLE} "
+            "WHERE COALESCE(ai_queue_status,'') NOT IN ('candidates_ready','no_candidates','adjudicated') LIMIT 1"
+        ).fetchone()
+        if pending_signature is not None:
+            raise RuntimeError(
+                "Target candidate generation is incomplete; signature "
+                f"{pending_signature['signature_hash']} has queue status "
+                f"{pending_signature['ai_queue_status']!r}."
+            )
+        decision_table_exists = table_exists(target_conn, DECISION_TABLE)
+        if decision_table_exists:
+            _require_columns(target_conn, DECISION_TABLE, DECISION_COLUMNS)
+        if args.apply:
+            original_journal_modes = _prepare_migration_journal_modes(target_conn)
+            target_conn.execute("BEGIN EXCLUSIVE")
+            transaction_started = True
+            _ensure_decision_schema_in_transaction(target_conn)
+            decision_table_exists = True
+
+        audit_fh = temp_paths[audit_path].open("x", newline="", encoding="utf-8-sig")
+        quarantine_fh = temp_paths[quarantine_path].open("x", encoding="utf-8")
+        audit_writer = csv.DictWriter(audit_fh, fieldnames=MIGRATION_AUDIT_COLUMNS)
+        audit_writer.writeheader()
+
+        source_sql = (
+            f"SELECT * FROM {DECISION_TABLE} "
+            "WHERE LOWER(TRIM(COALESCE(model,''))) NOT LIKE 'rule:%' "
+            "ORDER BY signature_hash"
+        )
+        source_cursor = source_conn.execute(source_sql)
+        while True:
+            source_rows = source_cursor.fetchmany(args.batch_size)
+            if not source_rows:
+                break
+            signature_hashes = [clean_text(row["signature_hash"]) for row in source_rows]
+            signatures, candidates_by_signature, existing_by_signature = _fetch_migration_batch_context(
+                target_conn,
+                signature_hashes,
+                args.max_candidates,
+                decision_table_exists,
+            )
+            for source in source_rows:
+                counts["examined"] += 1
+                signature_hash = clean_text(source["signature_hash"])
+                decision = clean_text(source["decision"])
+                model = clean_text(source["model"])
+                reasons: List[str] = []
+                notes: List[str] = []
+                signature = signatures.get(signature_hash)
+                current_candidates = candidates_by_signature.get(signature_hash, [])
+                current_candidate_hash = candidate_set_fingerprint(current_candidates)
+                source_candidate_hash = clean_text(source["candidate_set_hash"])
+                derived_source_hash = ""
+                candidate_identity_equal = "unknown"
+                current_reported_ein = usable_reported_ein(signature["reported_ein"]) if signature is not None else ""
+
+                if not signature_hash:
+                    reasons.append("missing_signature_hash")
+                if not model:
+                    reasons.append("missing_source_model_provenance")
+                if signature is None:
+                    reasons.append("orphan_signature_not_found")
+                source_input_signature = _source_signature_hash_from_input(source)
+                if source_input_signature and source_input_signature != signature_hash:
+                    reasons.append("source_input_signature_mismatch")
+                if clean_text(source["validation_status"]) != "ok":
+                    reasons.append("source_validation_not_ok")
+                if decision not in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN", "NO_MATCH", "AMBIGUOUS", "HUMAN_REVIEW"}:
+                    reasons.append("invalid_source_decision")
+
+                source_candidates, input_error = _source_candidates_from_input(source)
+                if input_error:
+                    reasons.append(input_error)
+                if source_candidates is not None:
+                    derived_source_hash = candidate_set_fingerprint(source_candidates)
+                    candidate_identity_equal = "yes" if candidate_set_identity(source_candidates) == candidate_set_identity(current_candidates) else "no"
+                    if candidate_identity_equal == "no":
+                        reasons.append("candidate_identity_changed")
+                if not source_candidate_hash:
+                    reasons.append("missing_source_candidate_set_hash")
+                elif derived_source_hash and derived_source_hash != source_candidate_hash:
+                    reasons.append("source_candidate_set_hash_inconsistent")
+                if source_candidate_hash and source_candidate_hash != current_candidate_hash:
+                    reasons.append("candidate_set_changed")
+
+                output, output_note = _source_output_for_revalidation(source)
+                if output_note == "invalid_source_output_json":
+                    reasons.append(output_note)
+                elif output_note:
+                    notes.append(output_note)
+                validation: Dict[str, Any] = {
+                    "selected_candidate_id": "",
+                    "selected_ein": "",
+                    "selected_name": "",
+                    "confidence": 0.0,
+                    "auto_accept": 0,
+                    "validation_status": "invalid",
+                    "validation_error": "not_validated",
+                }
+                if signature is not None and output is not None:
+                    if clean_text(output.get("decision")) != decision:
+                        reasons.append("source_output_decision_mismatch")
+                    validation = validate_ai_output(output, current_candidates, signature, 0.0)
+                    if validation["validation_status"] != "ok":
+                        reasons.append("current_validation_failed:" + clean_text(validation["validation_error"]))
+
+                    source_candidate_id = clean_text(source["selected_candidate_id"])
+                    source_selected_ein = clean_text(source["selected_ein"])
+                    if decision == "SELECT_CANDIDATE":
+                        if not source_candidate_id or not source_selected_ein:
+                            reasons.append("select_candidate_missing_stored_identity")
+                        if validation["selected_candidate_id"] != source_candidate_id:
+                            reasons.append("select_candidate_id_changed")
+                        if validation["selected_ein"] != source_selected_ein:
+                            reasons.append("select_candidate_ein_changed")
+                        exact_candidate = any(
+                            clean_text(candidate["candidate_id"]) == source_candidate_id
+                            and clean_text(candidate["ein"]) == source_selected_ein
+                            for candidate in current_candidates
+                        )
+                        if not exact_candidate:
+                            reasons.append("select_candidate_not_in_current_set")
+                    elif decision == "KEEP_REPORTED_EIN":
+                        if not current_reported_ein:
+                            reasons.append("keep_reported_ein_current_value_invalid")
+                        if source_selected_ein != current_reported_ein:
+                            reasons.append("keep_reported_ein_value_changed")
+                        if validation["selected_candidate_id"] != source_candidate_id:
+                            reasons.append("keep_reported_ein_candidate_id_changed")
+                        if validation["selected_ein"] and validation["selected_ein"] != current_reported_ein:
+                            reasons.append("keep_reported_ein_candidate_changed")
+                    else:
+                        if source_candidate_id or source_selected_ein or clean_text(source["selected_name"]):
+                            reasons.append("nonselect_decision_has_selected_identity")
+                        if validation["auto_accept"]:
+                            reasons.append("nonselect_decision_became_auto_accept")
+
+                    try:
+                        source_confidence = float(source["confidence"] or 0)
+                    except (TypeError, ValueError):
+                        source_confidence = -1.0
+                    if abs(source_confidence - float(validation["confidence"] or 0)) > 0.00005:
+                        reasons.append("source_confidence_inconsistent")
+
+                retained_auto_accept = 1 if _bool_from_any(source["auto_accept"], default=False) else 0
+                if retained_auto_accept and validation.get("auto_accept") != 1:
+                    reasons.append("auto_accept_no_longer_valid")
+
+                migration_row = _migration_row(
+                    source,
+                    validation,
+                    current_candidate_hash,
+                    retained_auto_accept,
+                )
+
+                target_existing = existing_by_signature.get(signature_hash)
+                target_action = "insert"
+                if target_existing is not None:
+                    target_model = clean_text(target_existing["model"])
+                    if _decision_rows_same_normalized(migration_row, target_existing):
+                        target_action = (
+                            "already_current"
+                            if signature is not None and clean_text(signature["ai_queue_status"]) == "adjudicated"
+                            else "refresh_work_status"
+                        )
+                    elif target_model.lower().startswith("rule:"):
+                        target_action = "replace_rule"
+                    elif args.replace_existing_reviewed:
+                        target_action = "replace_reviewed"
+                    else:
+                        reasons.append("target_reviewed_decision_conflict")
+                        target_action = "quarantine_conflict"
+                else:
+                    target_model = ""
+
+                reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+                notes = list(dict.fromkeys(note for note in notes if note))
+                if reasons:
+                    status = "quarantined"
+                    counts["quarantined"] += 1
+                    for reason in reasons:
+                        counts["reason:" + reason] += 1
+                    quarantine_record = {
+                        "format": "grant_reviewed_decision_quarantine_v1",
+                        "signature_hash": signature_hash,
+                        "reasons": reasons,
+                        "notes": notes,
+                        "candidate_comparison": {
+                            "source_hash": source_candidate_hash,
+                            "derived_source_hash": derived_source_hash,
+                            "current_hash": current_candidate_hash,
+                            "identity_equal": candidate_identity_equal,
+                        },
+                        "source_decision": _record_dict(source),
+                        "preexisting_target_decision": (
+                            _record_dict(target_existing)
+                            if target_existing is not None
+                            else None
+                        ),
+                    }
+                    quarantine_fh.write(json.dumps(quarantine_record, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+                else:
+                    status = "eligible" if target_action != "already_current" else "already_current"
+                    counts[status] += 1
+                    if args.apply:
+                        if target_action in {"replace_rule", "replace_reviewed"}:
+                            replacement_record = {
+                                "format": "grant_reviewed_decision_replacement_audit_v1",
+                                "event_type": "preexisting_target_replacement",
+                                "signature_hash": signature_hash,
+                                "target_action": target_action,
+                                "incoming_source_model": model,
+                                "preexisting_target_decision": _record_dict(target_existing),
+                            }
+                            quarantine_fh.write(
+                                json.dumps(replacement_record, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+                            )
+                            counts["replacement_audits"] += 1
+                        if target_action in {"insert", "replace_rule", "replace_reviewed"}:
+                            _upsert_migrated_decision(target_conn, migration_row)
+                            counts["written"] += 1
+                        elif target_action == "refresh_work_status":
+                            _mark_migrated_signature_adjudicated(target_conn, signature_hash)
+                            counts["work_status_refreshed"] += 1
+
+                audit_writer.writerow({
+                    "signature_hash": signature_hash,
+                    "status": status,
+                    "target_action": target_action,
+                    "reasons": ";".join(reasons or notes),
+                    "decision": decision,
+                    "model": model,
+                    "source_validation_status": clean_text(source["validation_status"]),
+                    "source_auto_accept": source["auto_accept"],
+                    "retained_auto_accept": retained_auto_accept,
+                    "selected_candidate_id": clean_text(source["selected_candidate_id"]),
+                    "selected_ein": clean_text(source["selected_ein"]),
+                    "current_reported_ein": current_reported_ein,
+                    "source_candidate_set_hash": source_candidate_hash,
+                    "derived_source_candidate_set_hash": derived_source_hash,
+                    "current_candidate_set_hash": current_candidate_hash,
+                    "candidate_identity_equal": candidate_identity_equal,
+                    "target_existing_model": target_model,
+                })
+                if args.progress_every and counts["examined"] % args.progress_every == 0:
+                    elapsed = max(1.0, time.time() - started)
+                    print(
+                        f"Reviewed-decision migration examined {counts['examined']:,}; "
+                        f"eligible={counts['eligible']:,}; quarantined={counts['quarantined']:,}; "
+                        f"{counts['examined']/elapsed:,.0f}/sec",
+                        flush=True,
+                    )
+                    audit_fh.flush()
+                    quarantine_fh.flush()
+
+        _flush_and_sync_output(audit_fh)
+        _flush_and_sync_output(quarantine_fh)
+        audit_fh.close()
+        quarantine_fh.close()
+        audit_fh = quarantine_fh = None
+        if args.apply:
+            _commit_migration_transaction(target_conn)
+            transaction_started = False
+            database_committed = True
+            try:
+                _restore_migration_journal_modes(target_conn, original_journal_modes or {})
+                journal_modes_restored = True
+            except Exception as exc:
+                raise RuntimeError(
+                    "DATABASE COMMITTED, but SQLite journal-mode restoration failed; reports remain staged; "
+                    + _staged_recovery_message(temp_paths)
+                ) from exc
+        try:
+            _publish_staged_migration_outputs(temp_paths)
+            outputs_published = True
+        except Exception as exc:
+            if database_committed:
+                raise RuntimeError(
+                    "DATABASE COMMITTED, but migration report publication failed; do not rerun writes until "
+                    "you recover/review the staged reports; "
+                    + _staged_recovery_message(temp_paths)
+                ) from exc
+            raise
+    except Exception as exc:
+        if target_conn is not None and transaction_started:
+            try:
+                target_conn.rollback()
+            finally:
+                transaction_started = False
+        if (
+            target_conn is not None
+            and original_journal_modes is not None
+            and not journal_modes_restored
+            and not database_committed
+        ):
+            try:
+                _restore_migration_journal_modes(target_conn, original_journal_modes)
+                journal_modes_restored = True
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    f"Migration failed ({type(exc).__name__}: {exc}) and pre-migration journal modes "
+                    f"could not be restored ({type(restore_exc).__name__}: {restore_exc})."
+                ) from exc
+        raise
+    finally:
+        if audit_fh is not None:
+            audit_fh.close()
+        if quarantine_fh is not None:
+            quarantine_fh.close()
+        if not outputs_published and not database_committed:
+            for temp_path in temp_paths.values():
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
+        if source_conn is not None:
+            source_conn.close()
+        if target_conn is not None:
+            target_conn.close()
+
+    mode = "APPLIED" if args.apply else "DRY RUN"
+    print(
+        f"Reviewed-decision migration {mode}: examined={counts['examined']:,}; "
+        f"eligible={counts['eligible']:,}; already_current={counts['already_current']:,}; "
+        f"quarantined={counts['quarantined']:,}; written={counts['written']:,}",
+        flush=True,
+    )
+    print(f"Audit CSV: {audit_path}", flush=True)
+    print(f"Quarantine JSONL: {quarantine_path}", flush=True)
+    print("Rule-generated decisions were intentionally excluded; regenerate them against the repaired data.", flush=True)
+
+
 
 # ---------------------------------------------------------------------------
 # Ollama test / diagnostics
@@ -6032,6 +6987,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_import_adjudication_decision_dir)
+
+    p = sub.add_parser(
+        "migrate-reviewed-decisions",
+        help=(
+            "Dry-run or apply a revalidated migration of retained non-rule AI/manual/review decisions "
+            "from a read-only backup DB into regenerated signatures and candidates"
+        ),
+    )
+    add_common_db(p)
+    p.add_argument("--source-db", required=True, help="Read-only source/backup main SQLite DB containing reviewed decisions")
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Write eligible decisions in one offline, exclusive target-pair transaction. "
+            "Without this flag the command is a read-only dry run."
+        ),
+    )
+    p.add_argument("--audit-csv", default="exports/reviewed_decision_migration_audit.csv")
+    p.add_argument("--quarantine-jsonl", default="exports/reviewed_decision_migration_quarantine.jsonl")
+    p.add_argument("--overwrite-audit", action="store_true", help="Atomically replace existing audit/quarantine output files")
+    p.add_argument(
+        "--replace-existing-reviewed",
+        action="store_true",
+        help="Replace a different non-rule target decision. Without this flag such conflicts are quarantined.",
+    )
+    p.add_argument("--batch-size", type=int, default=500, help="Bounded source rows per lookup batch (1-900)")
+    p.add_argument("--max-candidates", type=int, default=20)
+    p.add_argument("--progress-every", type=int, default=10000)
+    p.set_defaults(func=cmd_migrate_reviewed_decisions)
 
     p = sub.add_parser("nonadjudicable-recipient-triage", help="Create no-AI NO_MATCH/HUMAN_REVIEW decisions for See Attachment / Various / placeholder recipient signatures")
     add_common_db(p)

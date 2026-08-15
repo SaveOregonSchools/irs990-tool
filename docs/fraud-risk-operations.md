@@ -181,49 +181,129 @@ Use this order; do not build the global network from the known-dirty children:
    XML, affected child tables, pre/post counts, and reconciliation results.
    Compare source XML with all repeated child families, not just grants and
    people. `--append` and `--keep-db` deliberately skip existing filings, and
-   there is currently no supported targeted-replacement CLI; do not improvise
-   production `DELETE` statements. The safest supported repair is a clean build
-   into a new, versioned staging database from the authoritative XML archive:
+   there is no supported targeted-replacement CLI; do not improvise production
+   `DELETE` statements. First prove that the portable source manifest selects
+   exactly the production population without opening a destination database:
+
+   ```powershell
+   .\.venv\Scripts\python.exe rebuild_irs990_slim_clean.py `
+     --manifest-selection-only `
+     --manifest-db db\irs990_sources.db `
+     --expected-selection-count 5904356
+   ```
+
+   The selector preserves the loaded source path for every object-ID conflict
+   and rejects unresolved, ambiguous, quarantined, missing, changed-size/mtime,
+   hash-mismatched, or out-of-root sources. The safest supported repair is then
+   a manifest-verified clean build into a new, versioned staging database:
 
    ```powershell
    $stamp = Get-Date -Format yyyyMMdd-HHmmss
    $repairDb = "db\irs990-repaired-$stamp.db"
    .\.venv\Scripts\python.exe rebuild_irs990_slim_clean.py `
      --db $repairDb `
-     --xml-dir D:\path\to\authoritative-irs-xml-archive
+     --manifest-clean-rebuild `
+     --manifest-db db\irs990_sources.db `
+     --expected-selection-count 5904356
    ```
 
-   Do not point this command at the active DB: without append flags the builder
-   deletes its destination first. Validate filing/child counts, canonical rows,
-   duplicate signatures, `PRAGMA integrity_check`, and representative dashboard
-   years in staging. Preserve and reconcile reviewed decision records before
-   cutover; keep the backup for rollback.
-4. **Rebuild grant resolution and reapply decisions.** Against the repaired DB,
-   run the documented full workflow, which rebuilds deterministic resolution,
-   identity/signature/candidate layers, rule decisions, and the applied view:
+   `IRS_XML_ROOT` supplies the archive path; use one explicit `--xml-dir` to
+   override it. Selection and all path/count checks finish before staging writes
+   begin. Manifest mode refuses the active DB and every existing staging path,
+   builds to a temporary file, fails hard on any extraction/header or coverage
+   error, and publishes the new staging filename only after validation and WAL
+   checkpoint. Validate filing/child counts, canonical rows, duplicate
+   signatures, `PRAGMA integrity_check`, and representative dashboard years in staging.
+   Preserve and reconcile reviewed decision records before cutover; keep the
+   backup for rollback.
+
+   Produce the retained old-versus-clean child audit before rebuilding grant
+   resolution. Both databases are opened read-only. The audit compares exact
+   returns/source-file/object coverage and streams an order-independent payload
+   multiset digest for every filing in all 19 child tables; full payload sets
+   are materialized only for digest or count mismatches:
 
    ```powershell
-   .\batch_enhanced_grant_matches.ps1 `
-     -DbPath C:\full\path\to\db\irs990-repaired-YYYYMMDD-HHMMSS.db `
-     -WorkDbPath C:\full\path\to\db\grant_matching_work.db `
-     -ProjectDir C:\Projects\irs990-tool `
-     -Yes
+   $auditStamp = Get-Date -Format yyyyMMdd-HHmmss
+   .\.venv\Scripts\python.exe audit_child_repair.py `
+     --source-db db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db `
+     --repaired-db db\irs990-repaired-YYYYMMDD-HHMMSS.db `
+     --summary-csv "exports\child-repair-summary-$auditStamp.csv" `
+     --detail-csv "exports\child-repair-detail-$auditStamp.csv" `
+     --detail-json "exports\child-repair-detail-$auditStamp.json" `
+     --fail-on-new
    ```
 
-   A clean staging DB does not automatically inherit old human/AI decisions.
-   After signatures and candidates are regenerated, dry-run and re-import the
-   retained decision JSONL files (or perform a separately reviewed, keyed table
-   migration), and accept only decisions that still map to the same signature
-   and a valid candidate. See [grant-matching.md](grant-matching.md) for the
-   decision import commands. Rerun `apply-decisions` after that import. If only
-   the applied layer is missing after all grant inputs and decisions are
-   validated, restore it with:
+   Do not proceed on a nonzero exit. Review every remaining clean grant
+   reconciliation warning even when the structural audit passes. See
+   [Child-row repair audit](child-repair-audit.md) for classifications,
+   report fields, limitations, and acceptance gates.
+4. **Rebuild grant resolution and reapply decisions.** Use the sequence below,
+   not the all-in-one batch script: reviewed rows must be migrated after current
+   signatures/candidates exist but before regenerated rules fill undecided
+   signatures.
 
    ```powershell
-   .\.venv\Scripts\python.exe grant_ai_assist_v1.py apply-decisions `
-     --db C:\full\path\to\db\irs990-repaired-YYYYMMDD-HHMMSS.db `
-     --work-db db\grant_matching_work.db `
-     --full-refresh
+   $python = ".\.venv\Scripts\python.exe"
+   $project = "C:\Projects\irs990-tool"
+   $source = "db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db"
+   $main = "db\irs990-repaired-YYYYMMDD-HHMMSS.db"
+   $work = "db\grant_matching_work-repaired-YYYYMMDD-HHMMSS.db"
+
+   & $python resolve_grant_recipients.py --db $main --full-refresh --batch-size 100000
+   & $python grant_ai_assist_v1.py verify-bmf --project-dir $project
+   & $python grant_ai_assist_v1.py build-identity --db $main --work-db $work --project-dir $project --full-refresh
+   & $python grant_ai_assist_v1.py build-signatures --db $main --work-db $work --full-refresh
+   & $python grant_ai_assist_v1.py generate-candidates --db $main --work-db $work --full-refresh --candidate-mode fast
+   & $python grant_ai_assist_v1.py generate-candidates --db $main --work-db $work --candidate-mode balanced --queue-status no_candidates
+   ```
+
+   A clean staging DB does not inherit old human/AI decisions. Dry-run the
+   dedicated migration against the read-only pre-repair backup. Review both
+   reports and resolve every quarantine before applying:
+
+   ```powershell
+   $stamp = Get-Date -Format yyyyMMdd-HHmmss
+   & $python grant_ai_assist_v1.py migrate-reviewed-decisions `
+     --source-db $source `
+     --db $main `
+     --work-db $work `
+     --audit-csv "exports\reviewed-decision-migration-dry-$stamp.csv" `
+     --quarantine-jsonl "exports\reviewed-decision-quarantine-dry-$stamp.jsonl"
+
+   $stamp = Get-Date -Format yyyyMMdd-HHmmss
+   & $python grant_ai_assist_v1.py migrate-reviewed-decisions `
+     --source-db $source `
+     --db $main `
+     --work-db $work `
+     --audit-csv "exports\reviewed-decision-migration-apply-$stamp.csv" `
+     --quarantine-jsonl "exports\reviewed-decision-quarantine-apply-$stamp.jsonl" `
+     --apply
+   ```
+
+   Run `--apply` offline with all Flask, SQLite, and builder connections stopped.
+   It uses one potentially long exclusive transaction across same-filesystem
+   main/work DBs. Reports publish only after commit; if an error says
+   `DATABASE COMMITTED`, preserve the named temporary reports and reconcile
+   before rerunning. The migration retains specific source evidence fields but
+   refreshes candidate/validation fields; it is not a byte-for-byte copy or
+   proof of human review. See
+   [Migrate reviewed decisions after a clean rebuild](grant-matching.md#migrate-reviewed-decisions-after-a-clean-rebuild)
+   for readiness, quarantine, replacement-audit, and recovery details.
+
+   Regenerate deterministic decisions without `--regenerate`, so the migrated
+   rows keep precedence, then rebuild the applied layer:
+
+   ```powershell
+   & $python grant_ai_assist_v1.py reported-ein-triage --db $main --work-db $work --placeholder-action human_review
+   & $python grant_ai_assist_v1.py nonadjudicable-recipient-triage --db $main --work-db $work --action human_review --include-blank-recipient-name
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_zip,exact_name_city_state,exact_address_zip_good_name
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules single_candidate_high_score
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_state_only
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules large_safe_remaining
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules address_name_remaining --addr-name-min-name-score 0.70 --high-address-geo-min-name-score 0.70
+   & $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_no_geo_distinctive
+   & $python grant_ai_assist_v1.py apply-decisions --db $main --work-db $work --full-refresh
    ```
 
 5. **Cut over the validated main DB, then build the risk network.** Update

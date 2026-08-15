@@ -583,3 +583,133 @@ py grant_ai_assist_v1.py generate-candidates --full-refresh --candidate-mode fas
 ```
 
 `apply-decisions --full-refresh` is safe and comparatively lightweight. It rebuilds the applied/final layer from existing decisions.
+
+### Migrate reviewed decisions after a clean rebuild
+
+A clean, versioned main database does not contain reviewed AI/manual decisions
+from the prior database. Do not copy `grant_recipient_ai_decision` directly and
+do not trust its old `auto_accept` flag against newly generated candidates.
+
+Use this exact order for a repaired pair. Do not run
+`batch_enhanced_grant_matches.ps1` for this repair path: that script creates
+rules before there is an opportunity to migrate reviewed decisions. Keep the
+new main and work DB on the same filesystem.
+
+```powershell
+$python = ".\.venv\Scripts\python.exe"
+$project = "C:\Projects\irs990-tool"
+$source = "db\backup\irs990-before-child-repair-YYYYMMDD-HHMMSS.db"
+$main = "db\irs990-repaired-YYYYMMDD-HHMMSS.db"
+$work = "db\grant_matching_work-repaired-YYYYMMDD-HHMMSS.db"
+
+& $python resolve_grant_recipients.py --db $main --full-refresh --batch-size 100000
+& $python grant_ai_assist_v1.py verify-bmf --project-dir $project
+& $python grant_ai_assist_v1.py build-identity --db $main --work-db $work --project-dir $project --full-refresh
+& $python grant_ai_assist_v1.py build-signatures --db $main --work-db $work --full-refresh
+& $python grant_ai_assist_v1.py generate-candidates --db $main --work-db $work --full-refresh --candidate-mode fast
+& $python grant_ai_assist_v1.py generate-candidates --db $main --work-db $work --candidate-mode balanced --queue-status no_candidates
+```
+
+The migration readiness check requires every signature to have a
+`signature_grant` mapping, every mapping to reference an existing signature and
+rebuilt resolved grant, every signature to have completed candidate generation,
+and all required columns to exist. Run the migration first in its default
+read-only mode:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+& $python grant_ai_assist_v1.py migrate-reviewed-decisions `
+  --source-db $source `
+  --db $main `
+  --work-db $work `
+  --audit-csv "exports\reviewed-decision-migration-dry-$stamp.csv" `
+  --quarantine-jsonl "exports\reviewed-decision-quarantine-dry-$stamp.jsonl"
+```
+
+The command opens the source main DB with SQLite `mode=ro` plus
+`query_only=ON`. Without `--apply`, the target main/work connection is also
+query-only. Source, target, and work paths must all be different. Audit paths
+also cannot be any of those DB files or their `-wal`, `-shm`, or `-journal`
+companions.
+
+Only source decisions whose model does **not** start with `rule:` are examined;
+this is a mechanical filter, not proof that a row received human review. Confirm
+that the source's non-rule model labels are the intended AI, external-review, or
+manual cohort before applying. Rows with a blank model are quarantined as
+having insufficient provenance. Reported-EIN triage, nonadjudicable-recipient
+decisions, and candidate rules must be regenerated from the repaired data. For
+every retained decision, the migration requires the current signature, verifies
+the stored candidate-set hash (and candidate identity when preserved in
+`input_json`), re-runs the current validator, and specifically verifies:
+
+- `SELECT_CANDIDATE`: the same candidate ID and EIN still exist together;
+- `KEEP_REPORTED_EIN`: the selected EIN is still the signature's usable
+  filing-reported EIN; and
+- non-select decisions: no selected identity or auto-accept state is present.
+
+The CSV contains one row for every source decision examined. Every orphan,
+changed candidate set, invalid decision, or target conflict is also written to
+the JSONL with the complete source row and any complete preexisting target row.
+Before an allowed target replacement, the JSONL receives a separate
+`preexisting_target_replacement` audit record containing the full old row. A
+historical non-auto-accepted decision is never promoted merely because current
+policy could auto-accept it.
+
+"Retained provenance" is deliberately narrow. Eligible rows retain the source
+model label, model-options JSON, prompt hash, input/output JSON, and original
+`created_at`. The current candidate set is independently recomputed; selected
+name, candidate-set hash, and validation fields are refreshed. Therefore the
+result is a revalidated migration, not a byte-for-byte copy and not an assertion
+that the source model label proves human review.
+
+After reviewing and retaining both dry-run artifacts, apply with new output
+paths:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+& $python grant_ai_assist_v1.py migrate-reviewed-decisions `
+  --source-db $source `
+  --db $main `
+  --work-db $work `
+  --audit-csv "exports\reviewed-decision-migration-apply-$stamp.csv" `
+  --quarantine-jsonl "exports\reviewed-decision-quarantine-apply-$stamp.jsonl" `
+  --apply
+```
+
+Stop Flask, SQLite shells, builders, and every other user of the repaired pair
+before `--apply`. The command checkpoints WAL, forces both target DBs to rollback
+journals with `synchronous=FULL`, and holds one exclusive transaction for the
+entire streamed source scan. That transaction can be long even though memory is
+bounded. SQLite then crash-atomically writes the decision to the target main DB
+and marks the work signature `adjudicated`; the prior journal modes are restored
+after commit. The source database remains read-only.
+
+Reports are written to named temporary files and published only after a
+successful DB commit. A commit failure leaves no final reports. If publication
+fails after commit, the error begins with `DATABASE COMMITTED` and lists the
+temporary recovery artifacts; preserve those files and reconcile the committed
+rows before rerunning. A regenerated `rule:` target decision is replaced by the
+retained reviewed decision. A different existing non-rule target decision is
+quarantined unless `--replace-existing-reviewed` is supplied after separate
+review. A rerun recognizes a normalized current row and does not rewrite either
+the decision or the work `updated_at` timestamp.
+
+Finally, run the deterministic triage/rule commands without `--regenerate` so
+they fill only signatures that still lack decisions, and rebuild the applied
+layer:
+
+```powershell
+& $python grant_ai_assist_v1.py reported-ein-triage --db $main --work-db $work --placeholder-action human_review
+& $python grant_ai_assist_v1.py nonadjudicable-recipient-triage --db $main --work-db $work --action human_review --include-blank-recipient-name
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_zip,exact_name_city_state,exact_address_zip_good_name
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules single_candidate_high_score
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_state_only
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules large_safe_remaining
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules address_name_remaining --addr-name-min-name-score 0.70 --high-address-geo-min-name-score 0.70
+& $python grant_ai_assist_v1.py candidate-rule-decisions --db $main --work-db $work --rules exact_name_no_geo_distinctive
+& $python grant_ai_assist_v1.py apply-decisions --db $main --work-db $work --full-refresh
+```
+
+Only after those commands pass should you run `stats`, refresh the web data
+statistics cache, checkpoint both DBs, validate representative grant rows, and
+cut over the repaired main/work pair together.
