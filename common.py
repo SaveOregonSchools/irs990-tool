@@ -28,6 +28,9 @@ DEFAULT_OLMS_DB = APP_ROOT / "db" / "olms.db"
 #   $env:IRS_DB_PATH="C:\some\other\path\irs990.db"
 DB_PATH = Path(os.getenv("IRS_DB_PATH", DEFAULT_DB)).expanduser().resolve()
 OLMS_DB_PATH = Path(os.getenv("OLMS_DB_PATH", DEFAULT_OLMS_DB)).expanduser().resolve()
+GRANT_WORK_DB_PATH = Path(
+    os.getenv("IRS_GRANT_WORK_DB_PATH") or DB_PATH.parent / "grant_matching_work.db"
+).expanduser().resolve()
 
 
 def configured_xml_root() -> Optional[Path]:
@@ -47,6 +50,10 @@ def current_db_path():
 
 def current_olms_db_path():
     return str(OLMS_DB_PATH)
+
+
+def current_grant_work_db_path():
+    return str(GRANT_WORK_DB_PATH)
 
 def connect_ro():
     if not DB_PATH.exists():
@@ -86,6 +93,38 @@ def _configure_read_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
     except Exception:
         pass
     return conn
+
+
+def attach_grant_work_ro(conn: sqlite3.Connection, schema: str = "grant_work") -> bool:
+    """Attach the configured grant-work sidecar read-only when safe and available.
+
+    The main database identity check deliberately skips fixture/in-memory
+    connections.  This prevents a unit test that patches ``connect_ro`` from
+    accidentally reaching the workstation's multi-gigabyte sidecar.
+    """
+    if schema != "grant_work":
+        raise ValueError("Only the fixed grant_work schema name is supported")
+
+    databases = {row[1]: row[2] for row in conn.execute("PRAGMA database_list")}
+    if schema in databases:
+        return True
+
+    main_path = databases.get("main") or ""
+    if not main_path:
+        return False
+    try:
+        if Path(main_path).resolve() != DB_PATH:
+            return False
+    except (OSError, ValueError):
+        return False
+
+    if not GRANT_WORK_DB_PATH.exists():
+        return False
+    conn.execute(
+        f"ATTACH DATABASE ? AS {schema}",
+        (_readonly_uri(GRANT_WORK_DB_PATH),),
+    )
+    return True
 
 
 def connect_olms_ro():

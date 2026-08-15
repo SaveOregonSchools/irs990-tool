@@ -108,6 +108,16 @@ Place an existing database at `db/irs990.db`, or use any other location through
 | `IRS_XML_INVENTORY_PATH` | XML source inventory sidecar. | `db/irs990_sources.db` |
 | `IRS_PROJECT_DIR` | Project/EO-BMF root used by grant-matching tools. | Project-specific |
 | `IRS_GRANT_WORK_DB_PATH` | Bulky grant-matching work sidecar. | Beside the main DB |
+| `FAC_API_KEY` | Data.gov key for live Federal Audit Clearinghouse audits, awards, and findings in the risk dashboard. | None |
+| `SAM_API_KEY` | SAM.gov key for UEI registration and exclusion checks reached through FAC. | None |
+| `SAM_MAX_UEIS` | Maximum verified primary-EIN FAC UEIs checked per dashboard request (hard cap 3). | `1` |
+| `SAM_REQUEST_BUDGET` | Maximum SAM HTTP calls per uncached dashboard request (hard cap 10). | `3` |
+| `FEC_API_KEY` | OpenFEC key for campaign-committee candidate matches. | None |
+| `LDA_API_KEY` | Optional LDA.gov token for higher-rate federal lobbying lookups. | Anonymous access |
+| `FAC_DB_PATH` | Optional indexed FAC current/historical audit sidecar. | `db/fac_audits.db` |
+| `IRS_SCREENING_DB_PATH` | Optional IRS Pub. 78/revocation, OFAC, and HHS-OIG sidecar. | `db/screening_data.db` |
+| `IRS_SCREENING_CACHE_DIR` | Ignored download cache for public screening snapshots. | `downloads/screening` |
+| `IRS_RISK_NETWORK_DB_PATH` | Optional precomputed relationship-edge sidecar. | `db/risk_network.db` |
 | `OLMS_DB_PATH` | OLMS application sidecar. | `db/olms.db` |
 | `OLMS_DATA_ROOT` | Unpacked OLMS annual folders. | None |
 | `TOOLBOX_HOME_URL` | Optional parent launcher URL shown as an **All tools** header link. | Hidden |
@@ -118,6 +128,29 @@ Place an existing database at `db/irs990.db`, or use any other location through
 
 `common.py` loads `.env` before resolving application paths. Process-level
 environment variables take precedence over values in `.env`.
+
+### Fraud/risk API credentials
+
+The local FAC, IRS, OFAC, and HHS sidecars do not require API keys. For fresh
+live lookups:
+
+1. Request a free Data.gov key at
+   [api.data.gov/signup](https://api.data.gov/signup/). Put the same personal
+   key in `FAC_API_KEY` and `FEC_API_KEY`; this replaces the rate-limited
+   `DEMO_KEY` used for development.
+2. Sign in to SAM.gov, open
+   [Account Details](https://sam.gov/workspace/profile/account-details), and
+   reveal/request the **Public API Key** using the emailed one-time password.
+   Put it in `SAM_API_KEY`. A non-federal personal account with no role may be
+   limited to 10 calls/day, so keep the conservative SAM defaults above unless
+   the account has a higher quota.
+3. LDA.gov works anonymously. For higher-rate access, register at
+   [lda.gov/api/register](https://lda.gov/api/register/) and put the token in
+   `LDA_API_KEY`.
+
+Keep `.env` local and restart Flask after changing it. The dashboard reports
+each source's status, partial/truncated SAM coverage, and whether live or cached
+data was used.
 
 ## Run the web app
 
@@ -259,7 +292,7 @@ database.
 | Find EINs by Organization Name | Deterministic normalized-name matching with optional fuzzy fallback. |
 | Grants Paid / Received / Paid-Received | Research grantor and recipient relationships and export results. |
 | Nonprofit Deep Dive | Single-EIN trends, yearly summaries, top grantors, compensation, PDF output, and original filing downloads. |
-| Fraud & Risk Indicators | Explainable financial, governance, lobbying, grant, contractor, and related-organization indicators. |
+| Fraud & Risk Indicators | Explainable financial, governance, IRS BMF, Schedule C/L, grant-identity, relationship-network, and optional federal public-record indicators. |
 | Contractors | Contractor/vendor compensation reported by filers. |
 | Find Filings by Person Name | Search officers, employees, contractors, grant recipients, preparers, signers, and supported schedules. |
 | Lobbying & Political Activity | Schedule C, political campaign, 527, dues/proxy-tax, and 990-PF indicators. |
@@ -276,6 +309,24 @@ database.
 
 Query modules are discovered from `queries/` and reloaded when their files
 change. See [Query Module Guide](queries/README.md) for the plugin contract.
+
+The **Fraud & Risk Indicators** page can run in local-only or live-source mode.
+Live mode checks the Federal Audit Clearinghouse (FAC), exact-UEI USAspending
+and SAM.gov records reached through FAC, OpenFEC committee candidates, and the
+federal Lobbying Disclosure Act database. FAC results distinguish federal
+awards *expended* from Form 990 government-grant revenue and apply the
+$750,000 threshold to fiscal years beginning before October 1, 2024 and the
+$1,000,000 threshold thereafter. Candidate-only name matches are displayed as
+unscored review leads.
+
+No-key local integrations are documented in
+[Public screening data](docs/screening-data.md),
+[FAC offline data](docs/fac-offline.md), and the
+[precomputed relationship network](docs/risk-network.md). The dashboard opens
+these sidecars read-only and continues source-by-source when one is absent.
+Credential setup, refresh commands, production-data repair ordering, and the
+first full network-build checklist are consolidated in the
+[fraud/risk operations runbook](docs/fraud-risk-operations.md).
 
 ## Ask Database and Ollama
 

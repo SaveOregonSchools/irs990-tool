@@ -906,6 +906,33 @@ CREATE TABLE IF NOT EXISTS irs990_schedule_r_unrelated_org_txbl_partnership_grp 
 ]
 
 
+# Every table in this inventory represents a repeated XML child group.  Keep it
+# centralized so replacing one filing cannot leave stale or duplicate children.
+# Singleton tables use filing_id as their primary key and are already handled by
+# INSERT OR REPLACE.
+MULTIROW_CHILD_TABLES: Tuple[str, ...] = (
+    'irs990_schedule_c_supplemental_info',
+    'grants',
+    'irs990_contractor_compensation_grp',
+    'officers',
+    'highest_comp_employees',
+    'former_key_people',
+    'irs990_ez_officer_director_trustee_empl_grp',
+    'irs990_schedule_j_rltd_org_officer_trst_key_empl_grp',
+    'irs990_pf_officer_dir_trst_key_empl_info_grp',
+    'irs990_schedule_l_bus_tr_involve_interested_prsn_grp',
+    'irs990_schedule_l_disqualified_person_ex_bnft_tr_grp',
+    'irs990_schedule_l_grnt_asst_bnft_interested_prsn_grp',
+    'irs990_schedule_l_loans_btwn_org_interested_prsn_grp',
+    'irs990_schedule_r_id_related_tax_exempt_org_grp',
+    'irs990_schedule_r_id_related_org_txbl_corp_tr_grp',
+    'irs990_schedule_r_id_related_org_txbl_partnership_grp',
+    'irs990_schedule_r_id_disregarded_entities_grp',
+    'irs990_schedule_r_transactions_related_org_grp',
+    'irs990_schedule_r_unrelated_org_txbl_partnership_grp',
+)
+
+
 VIEWS = [
 """
 CREATE VIEW grants_compat_v1 AS
@@ -1766,6 +1793,18 @@ def ensure_schema_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _filing_exists(conn: sqlite3.Connection, filing_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM returns WHERE filing_id = ? LIMIT 1",
+        (filing_id,),
+    ).fetchone() is not None
+
+
+def _delete_multirow_children(conn: sqlite3.Connection, filing_id: str) -> None:
+    for table in MULTIROW_CHILD_TABLES:
+        conn.execute(f'DELETE FROM "{table}" WHERE filing_id = ?', (filing_id,))
+
+
 def existing_filing_keys(conn: sqlite3.Connection) -> Tuple[set, set]:
     filing_ids = set()
     object_ids = set()
@@ -1851,13 +1890,7 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
         print('[load] no new XML files to load')
         return
 
-    def handle(row):
-        nonlocal processed
-        if 'error' in row:
-            with open(err_log, 'a', encoding='utf-8') as ef:
-                ef.write(row['error'] + '\n')
-            return
-
+    def persist(row):
         h = row['header']
         ins("""INSERT OR REPLACE INTO returns (
             filing_id, source_file, ein, return_type, tax_year, period_end, schema_version, return_ts, amended_return_ind,
@@ -1885,7 +1918,6 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
         ins_singleton('irs990_ez_root', IRS990EZ_COLS)
         ins_singleton('irs990_pf_root', IRS990PF_COLS)
         ins_singleton('irs990_schedule_c_root', SCHEDC_COLS)
-        conn.execute("DELETE FROM irs990_schedule_c_supplemental_info WHERE filing_id = ?", [h['filing_id']])
         for r in row['irs990_schedule_c_supplemental_info']:
             ins("""INSERT INTO irs990_schedule_c_supplemental_info (
                 filing_id,form_and_line_reference_desc,explanation_txt
@@ -1929,6 +1961,29 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
             for r in row[t]:
                 placeholders = ','.join('?' for _ in cols)
                 conn.execute(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({placeholders})", [r.get(k) for k in cols])
+
+    def handle(row):
+        nonlocal processed
+        if 'error' in row:
+            with open(err_log, 'a', encoding='utf-8') as ef:
+                ef.write(row['error'] + '\n')
+            return
+
+        filing_id = row['header']['filing_id']
+        if _filing_exists(conn, filing_id):
+            savepoint = 'replace_existing_filing'
+            conn.execute(f'SAVEPOINT {savepoint}')
+            try:
+                _delete_multirow_children(conn, filing_id)
+                persist(row)
+            except BaseException:
+                conn.execute(f'ROLLBACK TO {savepoint}')
+                conn.execute(f'RELEASE {savepoint}')
+                raise
+            else:
+                conn.execute(f'RELEASE {savepoint}')
+        else:
+            persist(row)
 
         processed += 1
         if processed % commit_every == 0:

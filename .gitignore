@@ -14,6 +14,7 @@ venv/
 db/*.db
 db/*.db-shm
 db/*.db-wal
+*.db-journal
 db/backup/
 
 # Database schema dumps
