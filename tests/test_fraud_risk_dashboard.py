@@ -355,10 +355,21 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("Schedule L excess-benefit transaction", html)
         self.assertIn("IRS EO BMF Status Snapshot", html)
         self.assertIn("Unconditional exemption", html)
+        self.assertIn("Open the IRS NTEE code list", html)
+        self.assertIn("https://www.irs.gov/instructions/i1023ez", html)
         self.assertIn("Relationship Network", html)
         self.assertIn("Reciprocal grant relationship", html)
-        self.assertIn("Shared officer", html)
+        self.assertIn("Shared person name", html)
+        self.assertIn("Name-only candidate", html)
         self.assertIn("Shared address", html)
+        self.assertIn("<span>Medium</span>", html)
+        self.assertIn("<span>Low</span>", html)
+        self.assertNotIn("Medium / Low", html)
+        self.assertIn('aria-label="About the Review Priority Score"', html)
+        self.assertIn("Range 0–100", html)
+        self.assertIn("0–34 baseline", html)
+        self.assertIn("35–69 moderate", html)
+        self.assertIn("70–100 high", html)
         self.assertIn("Screening result, not a fraud probability or determination", html)
         self.assertIn("Data Coverage &amp; Remaining Work", html)
         self.assertIn("Build public screening snapshots", html)
@@ -382,6 +393,124 @@ class FraudRiskDashboardTests(unittest.TestCase):
             mod._indicator("High", "Disclosure Context", "Lawful disclosure", 2024, "e", "w", "n")
         ]
         self.assertEqual(mod._risk_score(with_disclosures), score)
+
+    def test_score_is_bounded_zero_to_one_hundred(self):
+        self.assertEqual(mod._risk_score([]), 0)
+        many_high_signals = [
+            mod._indicator("High", f"Category {index}", f"Issue {index}", 2024, "e", "w", "n")
+            for index in range(10)
+        ]
+        self.assertEqual(mod._risk_score(many_high_signals), 100)
+        self.assertEqual(mod._score_band(34), "Baseline Review Priority")
+        self.assertEqual(mod._score_band(35), "Moderate Review Priority")
+        self.assertEqual(mod._score_band(69), "Moderate Review Priority")
+        self.assertEqual(mod._score_band(70), "High Review Priority")
+        self.assertEqual(
+            mod._connection_scored_relationships({"relationships": {"A", "B"}}),
+            {"A", "B"},
+        )
+
+    def test_person_name_links_are_candidate_only_and_common_cross_table_hubs_are_hidden(self):
+        years = mod._core_years("111111111")
+        network = mod._build_network(self.conn, "111111111", years)
+        other = next(item for item in network["connections"] if item.get("ein") == "222222222")
+        self.assertIn("Shared person name", other["relationships"])
+        self.assertNotIn("Shared person name", other["scored_relationships"])
+        self.assertTrue(any("Name-only candidate" in value for value in other["evidence"]))
+
+        self.conn.execute(
+            "CREATE TABLE highest_comp_employees (filing_id TEXT, person_name TEXT)"
+        )
+        self.conn.executemany(
+            "INSERT INTO officers VALUES (?,?,?,?,?,?,?)",
+            [("F1", "Common Person", "Officer", 1, 0, 0, 0)],
+        )
+        self.conn.execute(
+            "INSERT INTO highest_comp_employees VALUES (?,?)", ("F1", "Common Person")
+        )
+        for index in range(12):
+            filing_id = f"H{index}"
+            other_ein = f"8{index:08d}"
+            self.conn.execute(
+                "INSERT INTO canonical_by_ein_year VALUES (?,?,?,?)",
+                (other_ein, 2024, filing_id, "990"),
+            )
+            self.conn.execute(
+                "INSERT INTO returns VALUES (?,?,?,?,?)",
+                (filing_id, other_ein, f"Hub Org {index}", "City", "OR"),
+            )
+            if index < 6:
+                self.conn.execute(
+                    "INSERT INTO officers VALUES (?,?,?,?,?,?,?)",
+                    (filing_id, "Common Person", "Officer", 1, 0, 0, 0),
+                )
+            else:
+                self.conn.execute(
+                    "INSERT INTO highest_comp_employees VALUES (?,?)",
+                    (filing_id, "Common Person"),
+                )
+        self.conn.commit()
+        connections = {}
+        metrics = mod._shared_people_network(self.conn, "111111111", connections)
+        self.assertEqual(metrics["shared_people_hubs_suppressed"], 1)
+        self.assertFalse(any("Common Person" in " ".join(item["evidence"]) for item in connections.values()))
+        self.assertNotEqual(
+            mod._person_key("THOMAS MURRAY"), mod._person_key("THOMAS C MURRAY")
+        )
+
+        candidate_overlap = {}
+        mod._add_connection(
+            candidate_overlap,
+            subject_ein="111111111",
+            ein="333333333",
+            name="Candidate Org",
+            relationship="Contractor",
+            evidence="Payment",
+            amount=100000,
+        )
+        mod._add_connection(
+            candidate_overlap,
+            subject_ein="111111111",
+            ein="333333333",
+            name="Candidate Org",
+            relationship="Shared person name",
+            evidence="Name-only candidate",
+            scored_relationship=False,
+        )
+        candidate = next(iter(candidate_overlap.values()))
+        overlap_titles = {
+            item["title"]
+            for item in mod._network_indicators(
+                {"connections": [candidate], "paths": []}, 2024
+            )
+        }
+        self.assertNotIn("Financial flow overlaps an identity or control link", overlap_titles)
+        self.assertEqual(
+            mod._relationship_color(
+                candidate["relationships"], candidate["scored_relationships"]
+            ),
+            "#647084",
+        )
+
+    def test_network_map_wraps_long_labels_and_keeps_full_hover_text(self):
+        full_name = "A Very Long Organization Name That Needs More Than One Line"
+        lines = mod._network_label_lines(full_name, width=15, max_lines=2)
+        self.assertLessEqual(len(lines), 2)
+        self.assertTrue(lines[-1].endswith("…"))
+        html = mod._network_svg(
+            "An Equally Long Filer Organization Name",
+            [{
+                "name": full_name,
+                "ein": "222222222",
+                "relationships": {"Shared person name"},
+                "scored_relationships": set(),
+            }],
+        )
+        self.assertIn('viewBox="0 0 960 520"', html)
+        self.assertIn('r="46"', html)
+        self.assertGreaterEqual(html.count("<tspan"), 3)
+        self.assertIn(full_name, html)
+        self.assertIn("Shared person name", html)
 
     def test_private_foundation_grantmaking_and_zero_staff_are_not_risk_signals(self):
         row = {
@@ -1219,6 +1348,9 @@ class FraudRiskDashboardTests(unittest.TestCase):
         pdf = mod.render_pdf_export({"ein": "111111111", "external_mode": "local"})
         self.assertIn('class="network-paths" open', pdf)
         self.assertIn("min-width:0 !important", pdf)
+        self.assertIn(".risk-summary-grid { grid-template-columns: repeat(5, 1fr); }", pdf)
+        self.assertIn(".metric-help { display:none !important; }", pdf)
+        self.assertIn("The score ranges from 0–100", pdf)
 
     def test_name_search_returns_selectable_matches(self):
         headers, rows = mod.run({"org_search": "Risky"})

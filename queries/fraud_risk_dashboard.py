@@ -3,6 +3,7 @@ import json
 import math
 import re
 import sqlite3
+import textwrap
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import date
@@ -1943,21 +1944,20 @@ def _shared_people_network(conn, ein: str, connections: Dict[str, Dict]) -> Dict
     if not canonical or not returns:
         return {"shared_people": 0}
     source_specs = [
-        ("officers", "person_name", "Shared officer", "officer/director/trustee"),
-        ("highest_comp_employees", "person_name", "Shared employee/key person", "highly compensated employee"),
-        ("former_key_people", "person_name", "Shared employee/key person", "former/key employee"),
-        ("irs990_ez_officer_director_trustee_empl_grp", "person_nm", "Shared officer", "EZ officer/director/trustee/employee"),
-        ("irs990_schedule_j_rltd_org_officer_trst_key_empl_grp", "person_nm", "Shared officer", "Schedule J officer/trustee/key employee"),
-        ("irs990_pf_officer_dir_trst_key_empl_info_grp", "person_nm", "Shared officer", "990-PF officer/director/trustee/key employee"),
+        ("officers", "person_name", "officer/director/trustee"),
+        ("highest_comp_employees", "person_name", "highly compensated employee"),
+        ("former_key_people", "person_name", "former/key employee"),
+        ("irs990_ez_officer_director_trustee_empl_grp", "person_nm", "EZ officer/director/trustee/employee"),
+        ("irs990_schedule_j_rltd_org_officer_trst_key_empl_grp", "person_nm", "Schedule J officer/trustee/key employee"),
+        ("irs990_pf_officer_dir_trst_key_empl_info_grp", "person_nm", "990-PF officer/director/trustee/key employee"),
     ]
-    shared_keys: Set[str] = set()
-    suppressed_hubs = 0
-    sources_used = 0
-    for table_name, name_col, relationship, role_label in source_specs:
+    sources = []
+    candidates: Dict[str, Dict] = {}
+    for table_name, name_col, role_label in source_specs:
         people = _object_ref(conn, table_name)
         if not people or name_col not in _object_columns(conn, people):
             continue
-        sources_used += 1
+        sources.append((people, name_col, role_label))
         subject_sql = f"""
         SELECT UPPER(p.{name_col}) AS person_key, MAX(p.{name_col}), COUNT(*)
         FROM {people} p
@@ -1967,46 +1967,77 @@ def _shared_people_network(conn, ein: str, connections: Dict[str, Dict]) -> Dict
         ORDER BY COUNT(*) DESC
         LIMIT 18
         """
-        for raw_key, display_name, subject_rows in conn.execute(subject_sql, [ein]):
+        for raw_key, display_name, _subject_rows in conn.execute(subject_sql, [ein]):
             person_key = _person_key(raw_key)
             if not person_key:
                 continue
+            candidate = candidates.setdefault(person_key, {
+                "display_name": _text(display_name).strip(),
+                "query_keys": set(),
+                "subject_roles": set(),
+            })
+            candidate["query_keys"].add(_text(raw_key))
+            candidate["subject_roles"].add(role_label)
+
+    shared_keys: Set[str] = set()
+    suppressed_hubs = 0
+    for person_key, candidate in candidates.items():
+        query_keys = sorted(candidate["query_keys"])
+        placeholders = ",".join("?" for _ in query_keys)
+        other_eins: Set[str] = set()
+        for people, name_col, _role_label in sources:
             degree_sql = f"""
             SELECT c.ein
             FROM {people} p
             JOIN {canonical} c ON c.filing_id = p.filing_id
-            WHERE UPPER(p.{name_col}) = ? AND c.ein <> ?
+            WHERE UPPER(p.{name_col}) IN ({placeholders}) AND c.ein <> ?
             GROUP BY c.ein
             LIMIT 11
             """
-            if len(conn.execute(degree_sql, [raw_key, ein]).fetchall()) > 10:
-                suppressed_hubs += 1
-                continue
+            other_eins.update(
+                _text(row[0]) for row in conn.execute(degree_sql, [*query_keys, ein])
+            )
+            if len(other_eins) > 10:
+                break
+        if len(other_eins) > 10:
+            suppressed_hubs += 1
+            continue
+
+        subject_roles = ", ".join(sorted(candidate["subject_roles"]))
+        for people, name_col, role_label in sources:
             other_sql = f"""
-            SELECT c.ein, MAX(r.org_name), COUNT(DISTINCT c.tax_year), MAX(c.tax_year)
+            SELECT c.ein, MAX(r.org_name), COUNT(DISTINCT c.tax_year), MAX(c.tax_year), MAX(p.{name_col})
             FROM {people} p
             JOIN {canonical} c ON c.filing_id = p.filing_id
             JOIN {returns} r ON r.filing_id = c.filing_id
-            WHERE UPPER(p.{name_col}) = ? AND c.ein <> ?
+            WHERE UPPER(p.{name_col}) IN ({placeholders}) AND c.ein <> ?
             GROUP BY c.ein
             ORDER BY MAX(c.tax_year) DESC
             LIMIT 12
             """
-            for other_ein, other_name, year_count, max_year in conn.execute(other_sql, [raw_key, ein]):
+            for other_ein, other_name, year_count, max_year, matched_name in conn.execute(
+                other_sql, [*query_keys, ein]
+            ):
                 _add_connection(
                     connections,
                     subject_ein=ein,
                     ein=other_ein,
                     name=other_name,
-                    relationship=relationship,
-                    evidence=f"{_text(display_name)} appears for both organizations as a {role_label} ({year_count} other filing year(s))",
+                    relationship="Shared person name",
+                    evidence=(
+                        "Name-only candidate; Form 990 does not provide a unique person identifier. "
+                        f"{_text(matched_name) or candidate['display_name']} appears for this filer as "
+                        f"{subject_roles} and for the other organization as {role_label} "
+                        f"({year_count} other filing year(s))."
+                    ),
                     year=max_year,
                     occurrences=year_count,
+                    scored_relationship=False,
                 )
                 shared_keys.add(person_key)
     return {
         "shared_people": len(shared_keys),
-        "shared_people_sources": sources_used,
+        "shared_people_sources": len(sources),
         "shared_people_hubs_suppressed": suppressed_hubs,
     }
 
@@ -2258,6 +2289,7 @@ def _connection_rank(item: Dict) -> Tuple:
         "Schedule R": 7,
         "Shared officer": 6,
         "Shared employee/key person": 5,
+        "Shared person name": 1,
         "Shared address": 5,
         "Grant paid": 4,
         "Grant received": 4,
@@ -2268,6 +2300,12 @@ def _connection_rank(item: Dict) -> Tuple:
     relationship_score = sum(weights.get(rel, 1) for rel in item.get("relationships", set()))
     total_amount = sum(item.get("amount_by_type", {}).values())
     return relationship_score, len(item.get("relationships", set())), math.log10(max(total_amount, 1)), item.get("occurrences", 0)
+
+
+def _connection_scored_relationships(item: Dict) -> Set[str]:
+    if "scored_relationships" in item:
+        return item.get("scored_relationships") or set()
+    return item.get("relationships") or set()
 
 
 def _build_network(conn, ein: str, years: List[Dict]) -> Dict:
@@ -2285,7 +2323,9 @@ def _build_network(conn, ein: str, years: List[Dict]) -> Dict:
     paths = _grant_paths(conn, ein, connections)
     ranked = sorted(connections.values(), key=_connection_rank, reverse=True)
     metrics["connected_entities"] = len(ranked)
-    metrics["multi_signal_entities"] = sum(1 for item in ranked if len(item["relationships"]) >= 2)
+    metrics["multi_signal_entities"] = sum(
+        1 for item in ranked if len(_connection_scored_relationships(item)) >= 2
+    )
     return {
         "connections": ranked[:50],
         "paths": paths,
@@ -2349,7 +2389,10 @@ def _network_indicators(network: Dict, latest_year) -> List[Dict]:
 
     overlaps = []
     financial = {"Grant paid", "Grant received", "Contractor"}
-    identity = {"Schedule R", "Shared officer", "Shared employee/key person", "Shared address"}
+    identity = {
+        "Schedule R", "Shared officer", "Shared employee/key person",
+        "Shared person name", "Shared address",
+    }
     for item in connections:
         strong_relationships = item.get("scored_relationships", item.get("relationships", set()))
         if item["relationships"] & financial and strong_relationships & identity:
@@ -3091,10 +3134,18 @@ def _bmf_panel(bmf: Dict) -> str:
             ("Affiliation / filing requirement", f"Affiliation {extra.get('affiliation') or '—'}; filing requirement {extra.get('filing_req_cd') or '—'}"),
             ("Source", bmf.get("source_detail")),
         ]
-        rows = "".join(
-            f"<tr><th>{_h(label)}</th><td>{_h(value) if value not in (None, '') else '<span class=\"muted\">Not reported</span>'}</td></tr>"
-            for label, value in fields
-        )
+        rows = []
+        for label, value in fields:
+            label_html = _h(label)
+            if label == "NTEE":
+                label_html += (
+                    ' <a class="info-link" href="https://www.irs.gov/instructions/i1023ez" '
+                    'target="_blank" rel="noopener" aria-label="Open the IRS NTEE code list" '
+                    'title="NTEE is a descriptive mission and purpose classification. It can be imprecise and is not itself a risk finding.">i</a>'
+                )
+            value_html = _h(value) if value not in (None, "") else '<span class="muted">Not reported</span>'
+            rows.append(f"<tr><th>{label_html}</th><td>{value_html}</td></tr>")
+        rows = "".join(rows)
         content = f'<table class="risk-table risk-kv"><tbody>{rows}</tbody></table>'
     return f"""
     <section class="risk-panel">
@@ -3103,7 +3154,7 @@ def _bmf_panel(bmf: Dict) -> str:
         <a href="https://www.irs.gov/charities-non-profits/exempt-organizations-business-master-file-extract-eo-bmf" target="_blank" rel="noopener">IRS source guide</a>
       </div>
       {content}
-      <p class="panel-footnote">The BMF is a current monthly snapshot. Pub. 78 eligibility and automatic-revocation history are separate IRS datasets and are not inferred here.</p>
+      <p class="panel-footnote">The BMF is a current monthly snapshot. NTEE is a descriptive mission/purpose classification and is not itself a risk finding. Pub. 78 eligibility and automatic-revocation history are separate IRS datasets and are not inferred here.</p>
     </section>
     """
 
@@ -3324,26 +3375,56 @@ def _screening_panel(screening: Dict) -> str:
     """
 
 
-def _relationship_color(relationships: Set[str]) -> str:
-    if len(relationships) >= 2:
+def _relationship_color(
+    relationships: Set[str], scored_relationships: Optional[Set[str]] = None
+) -> str:
+    effective_signals = relationships if scored_relationships is None else scored_relationships
+    if len(effective_signals) >= 2:
         return "#b42318"
-    if "Schedule R" in relationships:
+    color_relationships = effective_signals or relationships
+    if "Schedule R" in color_relationships:
         return "#7048a8"
-    if relationships & {"Shared officer", "Shared employee/key person"}:
+    if color_relationships & {"Shared officer", "Shared employee/key person", "Shared person name"}:
         return "#176b87"
-    if "Shared address" in relationships:
+    if "Shared address" in color_relationships:
         return "#2e7d5b"
-    if any(rel.startswith("Grant") for rel in relationships):
+    if any(rel.startswith("Grant") for rel in color_relationships):
         return "#b35c00"
     return "#647084"
+
+
+def _network_label_lines(value, width: int = 14, max_lines: int = 2) -> List[str]:
+    text = re.sub(r"\s+", " ", _text(value)).strip() or "Unknown"
+    width = max(4, int(width))
+    max_lines = max(1, int(max_lines))
+    wrapped = textwrap.wrap(
+        text,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+        replace_whitespace=True,
+    ) or ["Unknown"]
+    if len(wrapped) <= max_lines:
+        return wrapped
+    lines = wrapped[:max_lines]
+    lines[-1] = lines[-1][:(width - 1)].rstrip() + "…"
+    return lines
+
+
+def _network_tspans(lines: List[str], x: float, y: float, line_height: int) -> str:
+    rendered = []
+    for index, line in enumerate(lines):
+        position = f'y="{y:.1f}"' if index == 0 else f'dy="{line_height}"'
+        rendered.append(f'<tspan x="{x:.1f}" {position}>{_h(line)}</tspan>')
+    return "".join(rendered)
 
 
 def _network_svg(org_name: str, connections: List[Dict]) -> str:
     nodes = connections[:12]
     if not nodes:
         return '<div class="empty-note">No bounded network connections were found in the available local sources.</div>'
-    width, height = 900, 450
-    cx, cy, radius = width / 2, height / 2, 170
+    width, height = 960, 520
+    cx, cy, radius = width / 2, height / 2, 200
     pieces = [
         f'<svg class="network-map" viewBox="0 0 {width} {height}" role="img" aria-label="Relationship map centered on {_h(org_name)}">'
     ]
@@ -3352,19 +3433,34 @@ def _network_svg(org_name: str, connections: List[Dict]) -> str:
         angle = -math.pi / 2 + (2 * math.pi * index / max(len(nodes), 1))
         positions.append((cx + radius * math.cos(angle), cy + radius * math.sin(angle), item))
     for x, y, item in positions:
-        color = _relationship_color(item.get("relationships", set()))
+        color = _relationship_color(
+            item.get("relationships", set()), _connection_scored_relationships(item)
+        )
         title = f"{item.get('name')}: {', '.join(sorted(item.get('relationships', set())))}"
         pieces.append(
             f'<line x1="{cx:.1f}" y1="{cy:.1f}" x2="{x:.1f}" y2="{y:.1f}" stroke="{color}" stroke-width="2.5"><title>{_h(title)}</title></line>'
-        )
-    center_label = (_text(org_name)[:28] + "…") if len(_text(org_name)) > 29 else _text(org_name)
-    pieces.append(f'<circle cx="{cx}" cy="{cy}" r="58" fill="#173f5f"/><text x="{cx}" y="{cy - 4}" text-anchor="middle" class="network-center">{_h(center_label)}</text><text x="{cx}" y="{cy + 17}" text-anchor="middle" class="network-center-sub">filer</text>')
+    )
+    center_lines = _network_label_lines(org_name, width=18, max_lines=2)
+    center_y = cy - (7 if len(center_lines) > 1 else 1)
+    center_tspans = _network_tspans(center_lines, cx, center_y, 12)
+    pieces.append(
+        f'<g><title>{_h(_text(org_name))} · filer</title>'
+        f'<circle cx="{cx}" cy="{cy}" r="68" fill="#173f5f"/>'
+        f'<text x="{cx}" text-anchor="middle" class="network-center">{center_tspans}</text>'
+        f'<text x="{cx}" y="{cy + 28}" text-anchor="middle" class="network-center-sub">filer</text></g>'
+    )
     for x, y, item in positions:
-        color = _relationship_color(item.get("relationships", set()))
-        label = _text(item.get("name") or item.get("ein") or "Unknown")
-        label = label if len(label) <= 22 else label[:21] + "…"
+        relationships = item.get("relationships", set())
+        color = _relationship_color(relationships, _connection_scored_relationships(item))
+        full_label = _text(item.get("name") or item.get("ein") or "Unknown")
+        label_lines = _network_label_lines(full_label, width=15, max_lines=2)
+        label_y = y - (6 if len(label_lines) > 1 else 1)
+        label_tspans = _network_tspans(label_lines, x, label_y, 11)
+        title = f"{full_label} · {', '.join(sorted(relationships))}"
         pieces.append(
-            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="34" fill="{color}"/><text x="{x:.1f}" y="{y - 2:.1f}" text-anchor="middle" class="network-node">{_h(label)}</text><text x="{x:.1f}" y="{y + 13:.1f}" text-anchor="middle" class="network-node-sub">{_h(item.get("ein") or "entity")}</text>'
+            f'<g><title>{_h(title)}</title><circle cx="{x:.1f}" cy="{y:.1f}" r="46" fill="{color}"/>'
+            f'<text x="{x:.1f}" text-anchor="middle" class="network-node">{label_tspans}</text>'
+            f'<text x="{x:.1f}" y="{y + (21 if len(label_lines) > 1 else 15):.1f}" text-anchor="middle" class="network-node-sub">{_h(item.get("ein") or "entity")}</text></g>'
         )
     pieces.append("</svg>")
     return "".join(pieces)
@@ -3461,7 +3557,8 @@ def _network_panel(network: Dict, org_name: str, subject_ein: str) -> str:
         ("Multi-signal entities", metrics.get("multi_signal_entities", 0)),
         ("Grants paid", _money(metrics.get("grants_paid"))),
         ("Grants received", _money(metrics.get("grants_received"))),
-        ("Shared people", metrics.get("shared_people", 0)),
+        ("Shared person names", metrics.get("shared_people", 0)),
+        ("Common-name hubs hidden", metrics.get("shared_people_hubs_suppressed", 0)),
         ("Shared addresses", metrics.get("shared_addresses", 0)),
         ("Schedule R rows", metrics.get("schedule_r_edges", 0)),
         ("Unrelated partnership rows", metrics.get("schedule_r_unrelated_partnerships", 0)),
@@ -3517,12 +3614,12 @@ def _network_panel(network: Dict, org_name: str, subject_ein: str) -> str:
     return f"""
     <section class="risk-panel">
       <h3>Relationship Network</h3>
-      <p class="panel-footnote">Bounded exact-match evidence from resolved grants, Form 990/990-EZ/990-PF officers and key people, normalized addresses, contractors, and Schedule R. Shared identities are review leads, not proof of common control.</p>
+      <p class="panel-footnote">Bounded exact-match evidence from resolved grants, Form 990/990-EZ/990-PF officers and key people, normalized addresses, contractors, and Schedule R. On-demand person links are unscored name-only candidates because Form 990 provides no stable person identifier; common-name hubs are hidden across all person tables. Indexed person-name confidence describes match construction, not identity proof, and indexed edges are not used in the score. Shared identities are review leads, not proof of common control.</p>
       <div class="risk-grid network-metrics">{metrics_html}</div>
       <div class="network-layout">
-        <div>{_network_svg(org_name, connections)}</div>
+        <div class="network-map-wrap">{_network_svg(org_name, connections)}</div>
         <div class="network-legend">
-          <span style="--legend:#7048a8">Schedule R</span><span style="--legend:#176b87">Shared person</span>
+          <span style="--legend:#7048a8">Schedule R</span><span style="--legend:#176b87">Shared name candidate</span>
           <span style="--legend:#2e7d5b">Shared address</span><span style="--legend:#b35c00">Grant flow</span>
           <span style="--legend:#647084">Contractor</span><span style="--legend:#b42318">Multiple signals</span>
         </div>
@@ -3926,10 +4023,15 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
         .print-toolbar { display:none !important; }
         .risk-dashboard { font-size: 10px; }
         .risk-grid { grid-template-columns: repeat(4, 1fr); }
+        .risk-summary-grid { grid-template-columns: repeat(5, 1fr); }
+        .risk-summary-grid .risk-metric strong { font-size:16px; }
+        .metric-help { display:none !important; }
         .risk-card, .risk-panel { break-inside: avoid; page-break-inside: avoid; }
         .risk-card { padding: 8px; margin-bottom: 7px; }
         .risk-card h3 { font-size: 12px; }
         .network-table, .external-audit-table, .external-findings-table { min-width:0 !important; font-size:8px; }
+        .network-map { min-width:0 !important; }
+        .network-map-wrap { overflow:visible !important; }
         .table-scroll { overflow:visible !important; }
         details > * { display:block !important; }
       }
@@ -3941,9 +4043,16 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       .risk-hero h2 {{ margin:0 0 4px; }}
       .risk-subtitle {{ color:var(--muted); margin:0; }}
       .risk-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-top:14px; }}
+      .risk-summary-grid {{ grid-template-columns:repeat(5,minmax(135px,1fr)); }}
       .risk-metric {{ border:1px solid var(--border); background:#f7f9fc; padding:10px; }}
       .risk-metric span {{ display:block; color:var(--muted); font-size:12px; }}
       .risk-metric strong {{ display:block; font-size:22px; margin-top:3px; }}
+      .metric-label {{ display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; }}
+      .metric-help {{ position:relative; display:inline-block; }}
+      .metric-help summary, .info-link {{ display:inline-grid; place-items:center; width:17px; height:17px; box-sizing:border-box; border:1px solid #8793a3; border-radius:50%; color:#34495e; background:#fff; font:700 11px/1 sans-serif; cursor:pointer; text-decoration:none; list-style:none; }}
+      .metric-help summary::-webkit-details-marker {{ display:none; }}
+      .metric-help summary:focus-visible, .info-link:focus-visible {{ outline:2px solid #176b87; outline-offset:2px; }}
+      .metric-help-card {{ position:absolute; z-index:20; top:23px; left:0; width:285px; padding:9px 10px; border:1px solid var(--border); border-radius:4px; background:#fff; color:var(--ink); box-shadow:0 4px 14px rgba(31,45,61,.16); font-size:12px; font-weight:400; line-height:1.4; }}
       .risk-panel {{ border:1px solid var(--border); background:#fff; padding:14px; margin:16px 0; }}
       .risk-panel h3 {{ margin:0 0 10px; }}
       .panel-title-row {{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }}
@@ -3989,10 +4098,11 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       .risk-metric.compact strong {{ font-size:17px; }}
       .network-metrics {{ grid-template-columns:repeat(auto-fit,minmax(135px,1fr)); }}
       .network-layout {{ display:grid; grid-template-columns:minmax(0,1fr); gap:6px; align-items:center; }}
-      .network-map {{ width:100%; max-height:450px; min-height:300px; background:#fbfcfe; border:1px solid #edf0f4; }}
-      .network-center {{ fill:#fff; font-size:12px; font-weight:700; }}
+      .network-map-wrap {{ overflow-x:auto; }}
+      .network-map {{ display:block; width:100%; height:auto; aspect-ratio:960 / 520; background:#fbfcfe; border:1px solid #edf0f4; }}
+      .network-center {{ fill:#fff; font-size:11px; font-weight:700; }}
       .network-center-sub {{ fill:#d7e7f4; font-size:10px; }}
-      .network-node {{ fill:#fff; font-size:8px; font-weight:700; }}
+      .network-node {{ fill:#fff; font-size:9px; font-weight:700; }}
       .network-node-sub {{ fill:#eef4f8; font-size:7px; }}
       .network-legend {{ display:flex; gap:8px 14px; flex-wrap:wrap; color:var(--muted); font-size:12px; }}
       .network-legend span::before {{ content:""; display:inline-block; width:10px; height:10px; margin-right:5px; border-radius:50%; background:var(--legend); }}
@@ -4005,19 +4115,31 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       .risk-path-badge {{ background:#b42318; }}
       .improvement-list {{ margin:0; padding-left:18px; }}
       .improvement-list li {{ margin:7px 0; line-height:1.35; }}
+      @media (max-width: 780px) {{
+        .risk-summary-grid {{ grid-template-columns:repeat(2,minmax(135px,1fr)); }}
+        .network-map {{ min-width:700px; }}
+      }}
       {print_css}
     </style>
     <div class="risk-dashboard">
       <section class="risk-hero">
         <h2>{_h(report.get("org_name"))}</h2>
         <p class="risk-subtitle">EIN {_h(report.get("ein"))} &middot; Latest filing {_h(latest.get("tax_year"))} {_h(latest.get("return_type"))}</p>
-        <div class="risk-grid">
-          <div class="risk-metric"><span>Review Priority Score</span><strong>{score}</strong></div>
+        <div class="risk-grid risk-summary-grid">
+          <div class="risk-metric">
+            <div class="metric-label">Review Priority Score
+              <details class="metric-help"><summary aria-label="About the Review Priority Score">i</summary>
+                <div class="metric-help-card">Range 0–100. Scores 0–34 are baseline, 35–69 are moderate, and 70–100 are high review priority. This ranks review priority; it is not a fraud probability.</div>
+              </details>
+            </div>
+            <strong>{score}</strong>
+          </div>
           <div class="risk-metric"><span>Review Band</span><strong>{_h(_score_band(score))}</strong></div>
           <div class="risk-metric"><span>High</span><strong>{counts.get("High", 0)}</strong></div>
-          <div class="risk-metric"><span>Medium / Low</span><strong>{counts.get("Medium", 0)} / {counts.get("Low", 0)}</strong></div>
+          <div class="risk-metric"><span>Medium</span><strong>{counts.get("Medium", 0)}</strong></div>
+          <div class="risk-metric"><span>Low</span><strong>{counts.get("Low", 0)}</strong></div>
         </div>
-        <p class="screening-note"><b>Screening result, not a fraud probability or determination.</b> This is an explainable review-priority heuristic, not a statistically validated model. Repeated yearly observations are grouped so longer filing histories do not score higher merely because they contain more returns. {data_quality_count} data-quality, {disclosure_count} routine disclosure-context, and {external_lead_count} external coverage/lead indicator(s) are displayed but excluded from the score.</p>
+        <p class="screening-note"><b>Screening result, not a fraud probability or determination.</b> The score ranges from 0–100: 0–34 baseline, 35–69 moderate, and 70–100 high review priority. This is an explainable review-priority heuristic, not a statistically validated model. Repeated yearly observations are grouped so longer filing histories do not score higher merely because they contain more returns. {data_quality_count} data-quality, {disclosure_count} routine disclosure-context, and {external_lead_count} external coverage/lead indicator(s) are displayed but excluded from the score.</p>
       </section>
 
       {_bmf_panel(report.get("bmf") or {})}
