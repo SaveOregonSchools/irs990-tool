@@ -198,6 +198,7 @@ ORG_IDENTITY_FTS_BASE = "org_identity_fts"
 SIG_BASE = "grant_recipient_signature"
 SIG_GRANT_BASE = "grant_recipient_signature_grant"
 CAND_BASE = "grant_recipient_ai_candidate"
+CAND_RUN_BASE = "grant_recipient_candidate_generation_run"
 
 ORG_IDENTITY_TABLE = ORG_IDENTITY_BASE
 ORG_TOKEN_TABLE = ORG_TOKEN_BASE
@@ -205,6 +206,7 @@ ORG_IDENTITY_FTS_TABLE = ORG_IDENTITY_FTS_BASE
 SIG_TABLE = SIG_BASE
 SIG_GRANT_TABLE = SIG_GRANT_BASE
 CAND_TABLE = CAND_BASE
+CAND_RUN_TABLE = CAND_RUN_BASE
 DECISION_TABLE = "grant_recipient_ai_decision"
 APPLIED_TABLE = "grant_recipient_ai_applied"
 FINAL_VIEW = "grant_recipient_resolved_plus_ai_v1"
@@ -214,6 +216,10 @@ GRANT_WORK_SCHEMA = "grant_work"
 DEFAULT_GRANT_WORK_DB_NAME = "grant_matching_work.db"
 GRANT_WORK_DB_PATH: Optional[str] = None
 GRANT_WORK_SIDECAR_ENABLED = False
+CANDIDATE_GENERATION_VERSION = "candidate_generation_v1"
+
+SELECTION_DECISIONS = {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"}
+NONSELECTION_DECISIONS = {"NO_MATCH", "AMBIGUOUS", "HUMAN_REVIEW"}
 
 
 class OllamaCallError(RuntimeError):
@@ -258,10 +264,32 @@ def now_stamp() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def connect(db_path: str, readonly: bool = False, exclusive: bool = False) -> sqlite3.Connection:
+def _require_existing_database_file(path_value: str, label: str) -> Path:
+    """Resolve an existing regular database file without creating it."""
+    candidate = Path(path_value).expanduser()
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{label} database file does not exist: {candidate}") from exc
+    if not resolved.is_file():
+        raise RuntimeError(f"{label} database path is not a regular file: {resolved}")
+    return resolved
+
+
+def connect(
+    db_path: str,
+    readonly: bool = False,
+    exclusive: bool = False,
+    *,
+    require_existing_db: bool = False,
+    require_existing_work_db: bool = False,
+) -> sqlite3.Connection:
     if readonly:
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True)
+    elif require_existing_db:
+        existing_db = _require_existing_database_file(db_path, "Main")
+        conn = sqlite3.connect(existing_db.as_uri() + "?mode=rw", uri=True)
     else:
         conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -278,7 +306,12 @@ def connect(db_path: str, readonly: bool = False, exclusive: bool = False) -> sq
     except Exception:
         pass
     if GRANT_WORK_SIDECAR_ENABLED:
-        attach_grant_work_db(conn, db_path=db_path, readonly=readonly)
+        attach_grant_work_db(
+            conn,
+            db_path=db_path,
+            readonly=readonly,
+            require_existing=require_existing_work_db,
+        )
     return conn
 
 
@@ -319,7 +352,7 @@ def configure_grant_work_sidecar(db_path: str, work_db_path: Optional[str] = Non
     """Route enhanced matching working tables through the sidecar database."""
     global GRANT_WORK_DB_PATH, GRANT_WORK_SIDECAR_ENABLED
     global ORG_IDENTITY_TABLE, ORG_TOKEN_TABLE, ORG_IDENTITY_FTS_TABLE
-    global SIG_TABLE, SIG_GRANT_TABLE, CAND_TABLE
+    global SIG_TABLE, SIG_GRANT_TABLE, CAND_TABLE, CAND_RUN_TABLE
 
     GRANT_WORK_DB_PATH = work_db_path or default_grant_work_db_path(db_path)
     GRANT_WORK_SIDECAR_ENABLED = True
@@ -329,9 +362,16 @@ def configure_grant_work_sidecar(db_path: str, work_db_path: Optional[str] = Non
     SIG_TABLE = _qualified(GRANT_WORK_SCHEMA, SIG_BASE)
     SIG_GRANT_TABLE = _qualified(GRANT_WORK_SCHEMA, SIG_GRANT_BASE)
     CAND_TABLE = _qualified(GRANT_WORK_SCHEMA, CAND_BASE)
+    CAND_RUN_TABLE = _qualified(GRANT_WORK_SCHEMA, CAND_RUN_BASE)
 
 
-def attach_grant_work_db(conn: sqlite3.Connection, db_path: str, readonly: bool = False) -> None:
+def attach_grant_work_db(
+    conn: sqlite3.Connection,
+    db_path: str,
+    readonly: bool = False,
+    *,
+    require_existing: bool = False,
+) -> None:
     work_db_path = GRANT_WORK_DB_PATH or default_grant_work_db_path(db_path)
     if readonly and not Path(work_db_path).exists():
         conn.execute(f"ATTACH DATABASE ':memory:' AS {GRANT_WORK_SCHEMA}")
@@ -339,6 +379,13 @@ def attach_grant_work_db(conn: sqlite3.Connection, db_path: str, readonly: bool 
     if readonly:
         work_uri = Path(work_db_path).expanduser().resolve().as_uri() + "?mode=ro"
         conn.execute(f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}", (work_uri,))
+        return
+    if require_existing:
+        existing_work_db = _require_existing_database_file(work_db_path, "Grant work")
+        conn.execute(
+            f"ATTACH DATABASE ? AS {GRANT_WORK_SCHEMA}",
+            (existing_work_db.as_uri() + "?mode=rw",),
+        )
         return
     if not readonly:
         Path(work_db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1133,6 +1180,9 @@ def create_signature_schema(conn: sqlite3.Connection, full_refresh: bool = False
       queued_reason TEXT,
       candidate_count INTEGER DEFAULT 0,
       ai_queue_status TEXT DEFAULT 'new',
+      candidate_generation_phase TEXT DEFAULT 'pending',
+      candidate_generation_run_id TEXT,
+      candidate_generation_version TEXT,
       created_at TEXT,
       updated_at TEXT
     );
@@ -1253,7 +1303,7 @@ def signature_to_row(sig: SigAgg) -> Tuple[Any, ...]:
         json.dumps(dict(sig.statuses), sort_keys=True), json.dumps(dict(sig.methods), sort_keys=True),
         warn_flags, None if sig.min_confidence == 999.0 else round(sig.min_confidence, 4),
         round(sig.max_confidence, 4), round(avg, 4), sig.queued_reason,
-        0, "new", now_stamp(), now_stamp(),
+        0, "new", "pending", None, None, now_stamp(), now_stamp(),
     )
 
 
@@ -1308,7 +1358,9 @@ def insert_signature_batch(conn: sqlite3.Connection, sigs: Sequence[SigAgg], map
         "city", "state", "zip5", "country", "grant_count", "total_amount", "first_grant_id", "last_grant_id",
         "sample_purpose", "sample_grantor_ein", "sample_grantor_name", "first_pass_statuses_json",
         "first_pass_methods_json", "first_pass_warning_flags", "first_pass_min_confidence", "first_pass_max_confidence",
-        "first_pass_avg_confidence", "queued_reason", "candidate_count", "ai_queue_status", "created_at", "updated_at",
+        "first_pass_avg_confidence", "queued_reason", "candidate_count", "ai_queue_status",
+        "candidate_generation_phase", "candidate_generation_run_id", "candidate_generation_version",
+        "created_at", "updated_at",
     ]
     merged = _merge_existing_signature(conn, sigs)
     ph = ",".join("?" for _ in sig_cols)
@@ -1400,6 +1452,355 @@ def cmd_build_signatures(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Candidate generation
 # ---------------------------------------------------------------------------
+
+
+CANDIDATE_SIGNATURE_FINGERPRINT_COLUMNS = (
+    "signature_hash",
+    "reported_ein",
+    "recipient_name_norm",
+    "street_norm",
+    "city",
+    "state",
+    "zip5",
+    "country",
+)
+CANDIDATE_PROVENANCE_COLUMNS = (
+    "candidate_generation_phase",
+    "candidate_generation_run_id",
+    "candidate_generation_version",
+)
+
+
+def _ensure_candidate_generation_provenance_schema(conn: sqlite3.Connection) -> None:
+    """Add durable candidate-run provenance to old and newly rebuilt sidecars."""
+    columns = _table_columns(conn, SIG_TABLE)
+    additions = (
+        ("candidate_generation_phase", "TEXT DEFAULT 'pending'"),
+        ("candidate_generation_run_id", "TEXT"),
+        ("candidate_generation_version", "TEXT"),
+    )
+    for column, declaration in additions:
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {SIG_TABLE} ADD COLUMN {column} {declaration}")
+    conn.executescript(f"""
+    CREATE TABLE IF NOT EXISTS {CAND_RUN_TABLE} (
+      run_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL UNIQUE,
+      generator_version TEXT NOT NULL,
+      workflow_phase TEXT NOT NULL,
+      candidate_mode TEXT NOT NULL,
+      run_status TEXT NOT NULL,
+      full_refresh INTEGER NOT NULL,
+      regenerate INTEGER NOT NULL,
+      scope_json TEXT NOT NULL,
+      config_json TEXT NOT NULL,
+      config_fingerprint TEXT NOT NULL,
+      signature_count INTEGER NOT NULL,
+      signature_fingerprint TEXT NOT NULL,
+      selected_count INTEGER NOT NULL DEFAULT 0,
+      processed_count INTEGER NOT NULL DEFAULT 0,
+      with_candidates_count INTEGER NOT NULL DEFAULT 0,
+      base_fast_run_id TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      error_message TEXT
+    );
+    {_index_sql('idx_candidate_run_status_seq', CAND_RUN_TABLE, 'run_status, run_seq')}
+    """)
+    conn.commit()
+
+
+def _update_signature_population_digest(digest: Any, row: Any) -> None:
+    values = [row[column] for column in CANDIDATE_SIGNATURE_FINGERPRINT_COLUMNS]
+    payload = json.dumps(
+        values,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8", errors="surrogatepass")
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def candidate_signature_population_fingerprint(conn: sqlite3.Connection) -> Tuple[int, str]:
+    """Return an exact, deterministic fingerprint of candidate-relevant signatures."""
+    digest = hashlib.sha256()
+    count = 0
+    columns = ", ".join(CANDIDATE_SIGNATURE_FINGERPRINT_COLUMNS)
+    cursor = conn.execute(f"SELECT {columns} FROM {SIG_TABLE} ORDER BY signature_hash")
+    try:
+        for row in cursor:
+            signature_hash = row["signature_hash"]
+            signature_text = "" if signature_hash is None else str(signature_hash)
+            if (
+                signature_hash is None
+                or not signature_text.strip()
+                or signature_text != clean_text(signature_text)
+            ):
+                raise RuntimeError(
+                    "Candidate generation cannot certify a NULL/blank/malformed signature_hash."
+                )
+            _update_signature_population_digest(digest, row)
+            count += 1
+    finally:
+        cursor.close()
+    return count, "SIGPOP_" + digest.hexdigest()
+
+
+def _candidate_scope_where(
+    args: argparse.Namespace,
+    *,
+    full_refresh: bool,
+) -> Tuple[str, List[Any]]:
+    where: List[str] = []
+    params: List[Any] = []
+    if not bool(getattr(args, "regenerate", False)) and not full_refresh:
+        where.append(
+            f"NOT EXISTS (SELECT 1 FROM {CAND_TABLE} c "
+            "WHERE c.signature_hash = s.signature_hash)"
+        )
+    state = clean_text(getattr(args, "state", ""))
+    if state:
+        where.append("s.state=?")
+        params.append(state.upper())
+    min_total_amount = getattr(args, "min_total_amount", None)
+    if min_total_amount is not None:
+        where.append("s.total_amount >= ?")
+        params.append(min_total_amount)
+    queue_status = clean_text(getattr(args, "queue_status", ""))
+    if queue_status:
+        where.append("s.ai_queue_status=?")
+        params.append(queue_status)
+    return ("WHERE " + " AND ".join(where)) if where else "", params
+
+
+def _candidate_scope_limit(args: argparse.Namespace) -> str:
+    limit = getattr(args, "limit", None)
+    return f"LIMIT {int(limit)}" if limit else ""
+
+
+def _candidate_scope_update_statement(
+    args: argparse.Namespace,
+    run_id: str,
+) -> Tuple[str, List[Any]]:
+    full_refresh = bool(getattr(args, "full_refresh", False))
+    where, scope_params = _candidate_scope_where(args, full_refresh=full_refresh)
+    params: List[Any] = [run_id, CANDIDATE_GENERATION_VERSION, *scope_params]
+    limit = _candidate_scope_limit(args)
+    assignment = (
+        "candidate_generation_phase='pending', "
+        "candidate_generation_run_id=?, candidate_generation_version=?"
+    )
+    if not limit:
+        # Standard full-fast and balanced phases must not materialize a list or
+        # sort millions of signatures merely to mark an unbounded scope.
+        return f"UPDATE {SIG_TABLE} AS s SET {assignment} {where}", params
+    return (
+        f"""
+        UPDATE {SIG_TABLE}
+        SET {assignment}
+        WHERE signature_hash IN (
+          SELECT s.signature_hash
+          FROM {SIG_TABLE} s
+          {where}
+          ORDER BY s.total_amount DESC, s.grant_count DESC
+          {limit}
+        )
+        """,
+        params,
+    )
+
+
+def _candidate_run_workflow_phase(args: argparse.Namespace) -> str:
+    mode = clean_text(getattr(args, "candidate_mode", "fast")).lower()
+    no_filters = (
+        not clean_text(getattr(args, "state", ""))
+        and getattr(args, "min_total_amount", None) is None
+        and not getattr(args, "limit", None)
+    )
+    if (
+        mode == "fast"
+        and bool(getattr(args, "full_refresh", False))
+        and not bool(getattr(args, "regenerate", False))
+        and no_filters
+        and not clean_text(getattr(args, "queue_status", ""))
+    ):
+        return "fast_full"
+    if (
+        mode == "balanced"
+        and not bool(getattr(args, "full_refresh", False))
+        and not bool(getattr(args, "regenerate", False))
+        and no_filters
+        and clean_text(getattr(args, "queue_status", "")) == "no_candidates"
+    ):
+        return "balanced_no_candidates"
+    return "custom"
+
+
+def _candidate_run_config(args: argparse.Namespace) -> Tuple[str, str, str]:
+    scope = {
+        "full_refresh": bool(getattr(args, "full_refresh", False)),
+        "regenerate": bool(getattr(args, "regenerate", False)),
+        "state": clean_text(getattr(args, "state", "")),
+        "min_total_amount": getattr(args, "min_total_amount", None),
+        "queue_status": clean_text(getattr(args, "queue_status", "")),
+        "limit": getattr(args, "limit", None),
+    }
+    config = {
+        "generator_version": CANDIDATE_GENERATION_VERSION,
+        "candidate_mode": clean_text(getattr(args, "candidate_mode", "fast")).lower(),
+        "max_candidates": int(getattr(args, "max_candidates", 20)),
+        "min_candidate_score": float(getattr(args, "min_candidate_score", 45.0)),
+        "enough_candidates": int(getattr(args, "enough_candidates", 8)),
+        "token_limit": int(getattr(args, "token_limit", 50)),
+        "no_fts": bool(getattr(args, "no_fts", False)),
+    }
+    scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+    config_json = json.dumps(config, sort_keys=True, separators=(",", ":"))
+    fingerprint = "CANDCFG_" + hashlib.sha256(config_json.encode("utf-8")).hexdigest()
+    return scope_json, config_json, fingerprint
+
+
+def _new_candidate_run_id() -> str:
+    seed = f"{time.time_ns()}|{os.getpid()}|{time.perf_counter_ns()}"
+    return "CGR_" + hashlib.sha256(seed.encode("ascii")).hexdigest()[:24]
+
+
+def _latest_candidate_run(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        f"SELECT * FROM {CAND_RUN_TABLE} ORDER BY run_seq DESC LIMIT 1"
+    ).fetchone()
+
+
+def _start_candidate_generation_run(
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+) -> Tuple[str, int, str, int, str]:
+    """Persist one exact run scope before candidate rows can be mutated."""
+    _ensure_candidate_generation_provenance_schema(conn)
+    if not _has_leading_index(conn, SIG_TABLE, "signature_hash"):
+        raise RuntimeError(
+            f"{SIG_TABLE} needs a BINARY index beginning with signature_hash "
+            "for bounded-memory candidate certification."
+        )
+    signature_count, signature_fingerprint = candidate_signature_population_fingerprint(conn)
+    workflow_phase = _candidate_run_workflow_phase(args)
+    mode = clean_text(getattr(args, "candidate_mode", "fast")).lower()
+    scope_json, config_json, config_fingerprint = _candidate_run_config(args)
+    base_fast_run_id = ""
+    latest = _latest_candidate_run(conn)
+    if workflow_phase == "balanced_no_candidates":
+        if (
+            latest is None
+            or clean_text(latest["run_status"]) != "completed"
+            or clean_text(latest["workflow_phase"]) != "fast_full"
+            or clean_text(latest["generator_version"]) != CANDIDATE_GENERATION_VERSION
+            or int(latest["signature_count"] or -1) != signature_count
+            or clean_text(latest["signature_fingerprint"]) != signature_fingerprint
+        ):
+            raise RuntimeError(
+                "Balanced candidate generation requires the immediately preceding "
+                "completed current-version unfiltered fast --full-refresh run. "
+                "Rerun fast with --full-refresh before balanced mode."
+            )
+        base_fast_run_id = clean_text(latest["run_id"])
+
+    run_id = _new_candidate_run_id()
+    conn.execute(
+        f"""
+        INSERT INTO {CAND_RUN_TABLE} (
+          run_id, generator_version, workflow_phase, candidate_mode, run_status,
+          full_refresh, regenerate, scope_json, config_json, config_fingerprint,
+          signature_count, signature_fingerprint, selected_count,
+          processed_count, with_candidates_count, base_fast_run_id, started_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,0,0,?,?)
+        """,
+        (
+            run_id,
+            CANDIDATE_GENERATION_VERSION,
+            workflow_phase,
+            mode,
+            "running",
+            1 if bool(getattr(args, "full_refresh", False)) else 0,
+            1 if bool(getattr(args, "regenerate", False)) else 0,
+            scope_json,
+            config_json,
+            config_fingerprint,
+            signature_count,
+            signature_fingerprint,
+            base_fast_run_id or None,
+            now_stamp(),
+        ),
+    )
+
+    full_refresh = bool(getattr(args, "full_refresh", False))
+    scope_sql, scope_params = _candidate_scope_update_statement(args, run_id)
+    conn.execute(scope_sql, scope_params)
+    selected_count = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM {SIG_TABLE} "
+            "WHERE candidate_generation_run_id=? "
+            "AND candidate_generation_phase='pending'",
+            (run_id,),
+        ).fetchone()[0]
+    )
+
+    if full_refresh:
+        # Dropping the candidate table invalidates every old certification,
+        # including signatures excluded by an unsafe filtered full refresh.
+        conn.execute(
+            f"""
+            UPDATE {SIG_TABLE}
+            SET candidate_count=0,
+                ai_queue_status='new',
+                candidate_generation_phase='pending',
+                candidate_generation_run_id=CASE
+                  WHEN candidate_generation_run_id=? THEN ? ELSE NULL END,
+                candidate_generation_version=CASE
+                  WHEN candidate_generation_run_id=? THEN ? ELSE NULL END
+            """,
+            (run_id, run_id, run_id, CANDIDATE_GENERATION_VERSION),
+        )
+
+    conn.execute(
+        f"UPDATE {CAND_RUN_TABLE} SET selected_count=? WHERE run_id=?",
+        (selected_count, run_id),
+    )
+    conn.commit()
+    return run_id, selected_count, signature_fingerprint, signature_count, workflow_phase
+
+
+def _fail_candidate_generation_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    processed_count: int,
+    with_candidates_count: int,
+    error: BaseException,
+) -> None:
+    """Best-effort failure marker; a hard kill safely leaves ``running``."""
+    try:
+        conn.rollback()
+        conn.execute(
+            f"""
+            UPDATE {CAND_RUN_TABLE}
+            SET run_status='failed', processed_count=?, with_candidates_count=?,
+                completed_at=?, error_message=?
+            WHERE run_id=? AND run_status='running'
+            """,
+            (
+                processed_count,
+                with_candidates_count,
+                now_stamp(),
+                _snippet(f"{type(error).__name__}: {error}", 1000),
+                run_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 
 def create_candidate_indexes(conn: sqlite3.Connection, *, analyze: bool = True) -> None:
@@ -1816,7 +2217,12 @@ def stage_candidate_counts(conn: sqlite3.Connection, rows: Sequence[Tuple[str, i
     )
 
 
-def bulk_update_signature_candidate_status(conn: sqlite3.Connection, label: str = "candidate status") -> int:
+def bulk_update_signature_candidate_status(
+    conn: sqlite3.Connection,
+    run_id: str,
+    candidate_phase: str,
+    label: str = "candidate status",
+) -> int:
     """Bulk-update candidate_count / ai_queue_status for staged signatures.
 
     Returns the number of staged signatures updated. The temp rows are deleted
@@ -1844,28 +2250,29 @@ def bulk_update_signature_candidate_status(conn: sqlite3.Connection, label: str 
               ), 0) > 0 THEN 'candidates_ready'
               ELSE 'no_candidates'
             END,
+            candidate_generation_phase = ?,
+            candidate_generation_run_id = ?,
+            candidate_generation_version = ?,
             updated_at = ?
         WHERE signature_hash IN (SELECT signature_hash FROM temp.tmp_ai_candidate_counts)
-    """, (ts,))
+          AND candidate_generation_run_id = ?
+          AND candidate_generation_phase = 'pending'
+    """, (
+        candidate_phase,
+        run_id,
+        CANDIDATE_GENERATION_VERSION,
+        ts,
+        run_id,
+    ))
     conn.execute("DELETE FROM temp.tmp_ai_candidate_counts")
     return n
 
 def iter_signatures_for_candidates(conn: sqlite3.Connection, args: argparse.Namespace) -> Iterator[sqlite3.Row]:
-    where = []
-    params: List[Any] = []
-    if not args.regenerate:
-        where.append(f"NOT EXISTS (SELECT 1 FROM {CAND_TABLE} c WHERE c.signature_hash = s.signature_hash)")
-    if args.state:
-        where.append("s.state=?")
-        params.append(args.state.upper())
-    if args.min_total_amount is not None:
-        where.append("s.total_amount >= ?")
-        params.append(args.min_total_amount)
-    if args.queue_status:
-        where.append("s.ai_queue_status=?")
-        params.append(args.queue_status)
-    sql_where = "WHERE " + " AND ".join(where) if where else ""
-    limit = f"LIMIT {int(args.limit)}" if args.limit else ""
+    sql_where, params = _candidate_scope_where(
+        args,
+        full_refresh=bool(getattr(args, "full_refresh", False)),
+    )
+    limit = _candidate_scope_limit(args)
     sql = f"""
     SELECT * FROM {SIG_TABLE} s
     {sql_where}
@@ -1875,76 +2282,257 @@ def iter_signatures_for_candidates(conn: sqlite3.Connection, args: argparse.Name
     yield from conn.execute(sql, params)
 
 
+def _candidate_run_batch_statement(
+    run_id: str,
+    last_signature_hash: Optional[str],
+    batch_size: int,
+) -> Tuple[str, List[Any]]:
+    after_clause = "" if last_signature_hash is None else "AND s.signature_hash>?"
+    params: List[Any] = [run_id]
+    if last_signature_hash is not None:
+        params.append(last_signature_hash)
+    params.append(batch_size)
+    return (
+        f"""
+        SELECT *
+        FROM {SIG_TABLE} s
+        WHERE s.candidate_generation_run_id=?
+          AND s.candidate_generation_phase='pending'
+          {after_clause}
+        ORDER BY s.signature_hash
+        LIMIT ?
+        """,
+        params,
+    )
+
+
+def iter_signatures_for_candidate_run(
+    conn: sqlite3.Connection,
+    run_id: str,
+    batch_size: int = 5000,
+) -> Iterator[sqlite3.Row]:
+    """Iterate a durable run scope in bounded, index-ordered keyset batches."""
+    if batch_size < 1:
+        raise ValueError("candidate run batch_size must be at least 1")
+    last_signature_hash: Optional[str] = None
+    while True:
+        sql, params = _candidate_run_batch_statement(
+            run_id,
+            last_signature_hash,
+            batch_size,
+        )
+        rows = list(conn.execute(sql, params))
+        if not rows:
+            return
+        for row in rows:
+            yield row
+        last_signature_hash = str(rows[-1]["signature_hash"])
+
+
 def cmd_generate_candidates(args: argparse.Namespace) -> None:
     conn = connect(args.db, readonly=False, exclusive=True)
-    if not table_exists(conn, ORG_IDENTITY_TABLE):
-        raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
-    if not table_exists(conn, SIG_TABLE):
-        raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
-    create_candidate_schema(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh)
-    create_candidate_count_stage(conn)
-    delete_existing = not args.full_refresh
+    run_id = ""
     processed = 0
     with_candidates = 0
-    staged_count_rows: List[Tuple[str, int]] = []
     started = time.time()
-    mode = getattr(args, "candidate_mode", "fast")
-    use_fts = bool(mode == "broad" and not args.no_fts)
-    print(f"Candidate generation mode: {mode} (token fallback {'on' if mode in ('balanced','broad') else 'off'}, FTS {'on' if use_fts else 'off'})", flush=True)
-    print(
-        "v1.4 optimization: candidate counts are staged and bulk-updated; "
-        "signature status will update in batches instead of once per signature.",
-        flush=True,
-    )
-    if args.full_refresh and (args.limit or args.state or args.min_total_amount is not None or args.queue_status):
+    try:
+        if not table_exists(conn, ORG_IDENTITY_TABLE):
+            raise RuntimeError(f"Missing {ORG_IDENTITY_TABLE}. Run build-identity first.")
+        if not table_exists(conn, SIG_TABLE):
+            raise RuntimeError(f"Missing {SIG_TABLE}. Run build-signatures first.")
+        if int(getattr(args, "commit_every", 0) or 0) < 1:
+            raise ValueError("--commit-every must be at least 1.")
+        if int(getattr(args, "status_update_every", 0) or 0) < 0:
+            raise ValueError("--status-update-every cannot be negative.")
+
+        # A non-full pass needs the candidate table for its exact NOT EXISTS
+        # scope. A full pass must first invalidate provenance, then drop it.
+        if not args.full_refresh:
+            create_candidate_schema(conn, full_refresh=False, create_indexes=True)
+        (
+            run_id,
+            selected_count,
+            starting_signature_fingerprint,
+            starting_signature_count,
+            workflow_phase,
+        ) = _start_candidate_generation_run(conn, args)
+        if args.full_refresh:
+            create_candidate_schema(conn, full_refresh=True, create_indexes=False)
+
+        create_candidate_count_stage(conn)
+        delete_existing = not args.full_refresh
+        staged_count_rows: List[Tuple[str, int]] = []
+        mode = clean_text(getattr(args, "candidate_mode", "fast")).lower()
+        use_fts = bool(mode == "broad" and not args.no_fts)
         print(
-            "Note: --full-refresh drops the entire candidate table, but your filters/limit process only a subset of signatures. "
-            "Only processed signatures will have candidate_count/ai_queue_status refreshed.",
+            f"Candidate generation run {run_id}: mode={mode}, "
+            f"workflow={workflow_phase}, selected={selected_count:,} "
+            f"(token fallback {'on' if mode in ('balanced','broad') else 'off'}, "
+            f"FTS {'on' if use_fts else 'off'})",
             flush=True,
         )
-
-    status_update_every = max(int(getattr(args, "status_update_every", 0) or 0), 0)
-    for sig in iter_signatures_for_candidates(conn, args):
-        identity_rows = get_candidate_identity_rows(
-            conn,
-            sig,
-            candidate_mode=mode,
-            use_fts=use_fts,
-            token_limit=args.token_limit,
-            enough_candidates=args.enough_candidates,
+        print(
+            "Candidate counts and durable phase provenance are staged and "
+            "bulk-updated in the same commits.",
+            flush=True,
         )
-        candidates = best_candidates_by_ein(sig, identity_rows, args.max_candidates, args.min_candidate_score)
-        insert_candidate_rows(conn, sig["signature_hash"], candidates, delete_existing=delete_existing, update_signature=False)
-        processed += 1
-        cand_count = len(candidates)
-        staged_count_rows.append((sig["signature_hash"], cand_count))
-        if candidates:
-            with_candidates += 1
-        if processed % args.commit_every == 0:
+        if args.full_refresh and (
+            args.limit
+            or args.state
+            or args.min_total_amount is not None
+            or args.queue_status
+        ):
+            print(
+                "Warning: filtered --full-refresh invalidates every signature, "
+                "so unselected signatures remain pending and migration readiness "
+                "will fail until a clean unfiltered fast + balanced sequence runs.",
+                flush=True,
+            )
+
+        configured_status_update_every = max(
+            int(getattr(args, "status_update_every", 0) or 0),
+            0,
+        )
+        # temp_store=MEMORY makes an end-only staging table unsafe at millions
+        # of signatures. Zero therefore selects a bounded automatic batch,
+        # while an explicit positive value remains available for tuning.
+        status_update_every = configured_status_update_every or max(
+            int(args.commit_every),
+            100000,
+        )
+        staged_since_status_update = 0
+        for sig in iter_signatures_for_candidate_run(
+            conn,
+            run_id,
+            batch_size=int(args.commit_every),
+        ):
+            identity_rows = get_candidate_identity_rows(
+                conn,
+                sig,
+                candidate_mode=mode,
+                use_fts=use_fts,
+                token_limit=args.token_limit,
+                enough_candidates=args.enough_candidates,
+            )
+            candidates = best_candidates_by_ein(
+                sig,
+                identity_rows,
+                args.max_candidates,
+                args.min_candidate_score,
+            )
+            insert_candidate_rows(
+                conn,
+                sig["signature_hash"],
+                candidates,
+                delete_existing=delete_existing,
+                update_signature=False,
+            )
+            processed += 1
+            cand_count = len(candidates)
+            staged_count_rows.append((sig["signature_hash"], cand_count))
+            if candidates:
+                with_candidates += 1
+            if processed % args.commit_every == 0:
+                staged_since_status_update += len(staged_count_rows)
+                stage_candidate_counts(conn, staged_count_rows)
+                staged_count_rows.clear()
+                if staged_since_status_update >= status_update_every:
+                    bulk_update_signature_candidate_status(
+                        conn,
+                        run_id,
+                        mode,
+                        "candidate status progress",
+                    )
+                    staged_since_status_update = 0
+                conn.commit()
+                elapsed = max(1.0, time.time() - started)
+                print(
+                    f"Generated candidates for {processed:,}/{selected_count:,} "
+                    f"signatures; {with_candidates:,} have candidates; "
+                    f"{processed/elapsed:,.0f}/sec",
+                    flush=True,
+                )
+        if staged_count_rows:
             stage_candidate_counts(conn, staged_count_rows)
             staged_count_rows.clear()
-            # For long non-full-refresh targeted passes, periodic bulk status updates
-            # make progress visible without returning to per-row UPDATE behavior.
-            if status_update_every and processed % status_update_every == 0:
-                bulk_update_signature_candidate_status(conn, "candidate status progress")
-            conn.commit()
-            elapsed = max(1.0, time.time() - started)
-            print(f"Generated candidates for {processed:,} signatures; {with_candidates:,} have candidates; {processed/elapsed:,.0f}/sec", flush=True)
-    if staged_count_rows:
-        stage_candidate_counts(conn, staged_count_rows)
-        staged_count_rows.clear()
-    conn.commit()
+        conn.commit()
 
-    # This is the v1.4 speedup: one or a few set-based UPDATEs instead of one
-    # UPDATE per processed signature.
-    bulk_update_signature_candidate_status(conn, "final candidate status")
-    conn.commit()
+        bulk_update_signature_candidate_status(
+            conn,
+            run_id,
+            mode,
+            "final candidate status",
+        )
+        conn.commit()
 
-    if args.full_refresh:
-        print("Candidate generation complete; creating candidate indexes after load...", flush=True)
-        create_candidate_indexes(conn)
-    elapsed = max(1.0, time.time() - started)
-    print(f"Candidate generation complete: {processed:,} signatures, {with_candidates:,} with candidates at {processed/elapsed:,.0f}/sec", flush=True)
+        if args.full_refresh:
+            print(
+                "Candidate generation complete; creating candidate indexes after load...",
+                flush=True,
+            )
+            create_candidate_indexes(conn)
+
+        ending_signature_count, ending_signature_fingerprint = (
+            candidate_signature_population_fingerprint(conn)
+        )
+        covered_count = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {SIG_TABLE}
+                WHERE candidate_generation_run_id=?
+                  AND candidate_generation_phase=?
+                  AND candidate_generation_version=?
+                """,
+                (run_id, mode, CANDIDATE_GENERATION_VERSION),
+            ).fetchone()[0]
+        )
+        if (
+            processed != selected_count
+            or covered_count != selected_count
+            or ending_signature_count != starting_signature_count
+            or ending_signature_fingerprint != starting_signature_fingerprint
+        ):
+            raise RuntimeError(
+                "Candidate run completion invariant failed: "
+                f"selected={selected_count:,}, processed={processed:,}, "
+                f"durably_covered={covered_count:,}, "
+                f"signature_count={starting_signature_count:,}->{ending_signature_count:,}, "
+                "or the signature fingerprint changed."
+            )
+        conn.execute(
+            f"""
+            UPDATE {CAND_RUN_TABLE}
+            SET run_status='completed', processed_count=?,
+                with_candidates_count=?, completed_at=?, error_message=NULL
+            WHERE run_id=? AND run_status='running'
+            """,
+            (processed, with_candidates, now_stamp(), run_id),
+        )
+        if int(conn.execute("SELECT changes()").fetchone()[0]) != 1:
+            raise RuntimeError(
+                f"Candidate run {run_id} could not be marked completed exactly once."
+            )
+        conn.commit()
+        elapsed = max(1.0, time.time() - started)
+        print(
+            f"Candidate generation complete: run={run_id}, "
+            f"{processed:,} signatures, {with_candidates:,} with candidates "
+            f"at {processed/elapsed:,.0f}/sec",
+            flush=True,
+        )
+    except BaseException as exc:
+        if run_id:
+            _fail_candidate_generation_run(
+                conn,
+                run_id,
+                processed,
+                with_candidates,
+                exc,
+            )
+        raise
+    finally:
+        conn.close()
 
 
 
@@ -2513,13 +3101,30 @@ def reported_ein_rule_decision_row(
     extra_input: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, ...]:
     """Build a DECISION_TABLE tuple for reported-EIN triage without calling Ollama."""
+    decision = clean_text(decision)
     selected_ein = digits9(selected_ein)
+    selected_name = clean_text(selected_name)
     reported_ein = digits9(sig["reported_ein"] if "reported_ein" in sig.keys() else "")
     selected_cand = matching_candidate_for_ein(candidates, selected_ein) if selected_ein else None
     candidate_id = clean_text(selected_cand["candidate_id"]) if selected_cand is not None else ("REPORTED_EIN" if selected_ein else "")
+    selects_identity = decision in SELECTION_DECISIONS
+    triage_input = dict(extra_input or {})
+    if not selects_identity and (candidate_id or selected_ein or selected_name):
+        # A HUMAN_REVIEW/NO_MATCH/AMBIGUOUS row must not look resolved in the
+        # decision columns.  Retain the identity that prompted review as input
+        # evidence instead; it is context, not a selected output.
+        triage_input["review_identity_evidence"] = {
+            "candidate_id": candidate_id,
+            "ein": selected_ein,
+            "display_name": selected_name,
+        }
+    stored_candidate_id = candidate_id if selects_identity else ""
+    stored_selected_ein = selected_ein if selects_identity else ""
+    stored_selected_name = selected_name if selects_identity else ""
+    stored_auto_accept = bool(auto_accept) if selects_identity else False
     output = {
         "decision": decision,
-        "candidate_id": candidate_id if decision in {"SELECT_CANDIDATE", "KEEP_REPORTED_EIN"} else "",
+        "candidate_id": stored_candidate_id,
         "confidence": round(float(confidence or 0), 4),
         "confidence_label": confidence_label,
         "reason_codes": list(reason_codes),
@@ -2546,7 +3151,7 @@ def reported_ein_rule_decision_row(
             "first_pass_statuses_json": clean_text(sig["first_pass_statuses_json"] if "first_pass_statuses_json" in sig.keys() else ""),
             "first_pass_warning_flags": clean_text(sig["first_pass_warning_flags"] if "first_pass_warning_flags" in sig.keys() else ""),
         },
-        "reported_ein_triage": extra_input or {},
+        "reported_ein_triage": triage_input,
     }
     if isinstance(extra_input, dict):
         selected_identity = extra_input.get("selected_identity")
@@ -2561,15 +3166,15 @@ def reported_ein_rule_decision_row(
     return (
         sig["signature_hash"],
         decision,
-        output["candidate_id"],
-        selected_ein,
-        clean_text(selected_name),
+        stored_candidate_id,
+        stored_selected_ein,
+        stored_selected_name,
         round(float(confidence or 0), 4),
         confidence_label,
         json.dumps(list(reason_codes), ensure_ascii=False, sort_keys=True),
         clean_text(explanation),
         1 if needs_human_review else 0,
-        1 if auto_accept else 0,
+        1 if stored_auto_accept else 0,
         validation_status,
         validation_error,
         model_label,
@@ -3110,6 +3715,19 @@ def decision_row_tuple(sig_hash: str, input_obj: Dict[str, Any], candidates: Seq
 
 
 def insert_decision(conn: sqlite3.Connection, row: Tuple[Any, ...]) -> None:
+    decision = clean_text(row[1])
+    if decision not in SELECTION_DECISIONS:
+        selected_identity = tuple(clean_text(row[index]) for index in (2, 3, 4))
+        if any(selected_identity):
+            raise RuntimeError(
+                f"Refusing to store non-selection decision {decision or '<blank>'!r} for "
+                f"{clean_text(row[0]) or '<blank signature>'}: selected identity fields must be blank."
+            )
+        if bool(row[10]):
+            raise RuntimeError(
+                f"Refusing to store non-selection decision {decision or '<blank>'!r} for "
+                f"{clean_text(row[0]) or '<blank signature>'}: auto_accept must be false."
+            )
     cols = [
         "signature_hash", "decision", "selected_candidate_id", "selected_ein", "selected_name", "confidence",
         "confidence_label", "reason_codes_json", "explanation", "needs_human_review", "auto_accept",
@@ -4087,6 +4705,444 @@ def _require_signature_grant_coverage(conn: sqlite3.Connection) -> None:
         )
 
 
+def _candidate_readiness_recovery() -> str:
+    return (
+        " Rerun a clean fast candidate pass with --full-refresh, then rerun "
+        "balanced mode for --queue-status no_candidates."
+    )
+
+
+def _has_leading_index_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_names: Sequence[str],
+) -> bool:
+    schema, table = _split_qualified_name(table_name)
+    schema = schema or "main"
+    required = [clean_text(column) for column in column_names]
+    if not required:
+        return False
+    escaped_table = table.replace("'", "''")
+    for index_row in conn.execute(f"PRAGMA {schema}.index_list('{escaped_table}')"):
+        index_name = clean_text(index_row[1])
+        escaped_index = index_name.replace("'", "''")
+        extended = [
+            row
+            for row in conn.execute(f"PRAGMA {schema}.index_xinfo('{escaped_index}')")
+            if int(row[5] or 0) == 1 and row[2] is not None
+        ]
+        if len(extended) < len(required):
+            continue
+        leading_names = [clean_text(row[2]) for row in extended[:len(required)]]
+        leading_collations = [clean_text(row[4]).upper() for row in extended[:len(required)]]
+        if leading_names == required and all(collation == "BINARY" for collation in leading_collations):
+            return True
+    return False
+
+
+def _has_leading_index(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    return _has_leading_index_columns(conn, table_name, (column_name,))
+
+
+def _require_candidate_streaming_indexes(conn: sqlite3.Connection) -> None:
+    for table_name in (SIG_TABLE, CAND_TABLE):
+        if not _has_leading_index(conn, table_name, "signature_hash"):
+            raise RuntimeError(
+                f"{table_name} needs an index beginning with signature_hash for "
+                "bounded-memory migration readiness." + _candidate_readiness_recovery()
+            )
+
+
+def _parse_candidate_run_json(row: sqlite3.Row, field: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(clean_text(row[field]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Candidate generation run {clean_text(row['run_id'])!r} has invalid {field}."
+            + _candidate_readiness_recovery()
+        ) from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f"Candidate generation run {clean_text(row['run_id'])!r} has non-object {field}."
+            + _candidate_readiness_recovery()
+        )
+    return value
+
+
+def _require_candidate_generation_run_chain(
+    conn: sqlite3.Connection,
+) -> Tuple[sqlite3.Row, sqlite3.Row]:
+    """Require the exact completed full-fast -> balanced-no-candidates chain."""
+    recovery = _candidate_readiness_recovery()
+    if not table_exists(conn, CAND_RUN_TABLE):
+        raise RuntimeError(
+            "Target has no durable candidate-generation run ledger." + recovery
+        )
+    required = (
+        "run_seq", "run_id", "generator_version", "workflow_phase",
+        "candidate_mode", "run_status", "full_refresh", "regenerate",
+        "scope_json", "config_json", "config_fingerprint", "signature_count",
+        "signature_fingerprint", "selected_count", "processed_count",
+        "with_candidates_count", "base_fast_run_id", "started_at",
+        "completed_at", "error_message",
+    )
+    _require_columns(conn, CAND_RUN_TABLE, required)
+    balanced = _latest_candidate_run(conn)
+    if balanced is None:
+        raise RuntimeError("Candidate-generation run ledger is empty." + recovery)
+    if (
+        clean_text(balanced["run_status"]) != "completed"
+        or clean_text(balanced["workflow_phase"]) != "balanced_no_candidates"
+        or clean_text(balanced["candidate_mode"]) != "balanced"
+        or clean_text(balanced["generator_version"]) != CANDIDATE_GENERATION_VERSION
+        or int(balanced["full_refresh"] or 0) != 0
+        or int(balanced["regenerate"] or 0) != 0
+        or not clean_text(balanced["completed_at"])
+    ):
+        raise RuntimeError(
+            "Latest candidate-generation run is not a completed current-version "
+            "balanced --queue-status no_candidates phase." + recovery
+        )
+    base_fast_run_id = clean_text(balanced["base_fast_run_id"])
+    fast = conn.execute(
+        f"SELECT * FROM {CAND_RUN_TABLE} WHERE run_id=?",
+        (base_fast_run_id,),
+    ).fetchone()
+    if fast is None:
+        raise RuntimeError(
+            "Balanced candidate run does not reference an existing fast base run."
+            + recovery
+        )
+    if (
+        clean_text(fast["run_status"]) != "completed"
+        or clean_text(fast["workflow_phase"]) != "fast_full"
+        or clean_text(fast["candidate_mode"]) != "fast"
+        or clean_text(fast["generator_version"]) != CANDIDATE_GENERATION_VERSION
+        or int(fast["full_refresh"] or 0) != 1
+        or int(fast["regenerate"] or 0) != 0
+        or not clean_text(fast["completed_at"])
+    ):
+        raise RuntimeError(
+            "Balanced candidate run references an invalid or incomplete fast base run."
+            + recovery
+        )
+    if int(balanced["run_seq"]) != int(fast["run_seq"]) + 1:
+        raise RuntimeError(
+            "Candidate-generation phases are not an uninterrupted fast-to-balanced chain."
+            + recovery
+        )
+
+    expected_fast_scope = {
+        "full_refresh": True,
+        "regenerate": False,
+        "state": "",
+        "min_total_amount": None,
+        "queue_status": "",
+        "limit": None,
+    }
+    expected_balanced_scope = {
+        "full_refresh": False,
+        "regenerate": False,
+        "state": "",
+        "min_total_amount": None,
+        "queue_status": "no_candidates",
+        "limit": None,
+    }
+    configs: List[Dict[str, Any]] = []
+    for row, expected_scope, expected_mode in (
+        (fast, expected_fast_scope, "fast"),
+        (balanced, expected_balanced_scope, "balanced"),
+    ):
+        if _parse_candidate_run_json(row, "scope_json") != expected_scope:
+            raise RuntimeError(
+                f"Candidate run {clean_text(row['run_id'])!r} used a filtered/nonstandard scope."
+                + recovery
+            )
+        config = _parse_candidate_run_json(row, "config_json")
+        configs.append(config)
+        expected_fingerprint = "CANDCFG_" + hashlib.sha256(
+            clean_text(row["config_json"]).encode("utf-8")
+        ).hexdigest()
+        if clean_text(row["config_fingerprint"]) != expected_fingerprint:
+            raise RuntimeError(
+                f"Candidate run {clean_text(row['run_id'])!r} has a stale/invalid config fingerprint."
+                + recovery
+            )
+        if (
+            clean_text(config.get("generator_version")) != CANDIDATE_GENERATION_VERSION
+            or clean_text(config.get("candidate_mode")) != expected_mode
+        ):
+            raise RuntimeError(
+                f"Candidate run {clean_text(row['run_id'])!r} has incompatible configuration."
+                + recovery
+            )
+
+    for shared_field in ("max_candidates", "min_candidate_score"):
+        if configs[0].get(shared_field) != configs[1].get(shared_field):
+            raise RuntimeError(
+                f"Fast and balanced candidate runs disagree on {shared_field}." + recovery
+            )
+    for row in (fast, balanced):
+        selected = row["selected_count"]
+        processed = row["processed_count"]
+        if selected is None or processed is None or int(selected) != int(processed):
+            raise RuntimeError(
+                f"Candidate run {clean_text(row['run_id'])!r} did not process its exact selected scope."
+                + recovery
+            )
+    if int(fast["selected_count"]) != int(fast["signature_count"]):
+        raise RuntimeError(
+            "Fast candidate run did not select the entire signature population."
+            + recovery
+        )
+    if (
+        int(fast["signature_count"]) != int(balanced["signature_count"])
+        or clean_text(fast["signature_fingerprint"])
+        != clean_text(balanced["signature_fingerprint"])
+    ):
+        raise RuntimeError(
+            "Fast and balanced candidate runs reference different signature populations."
+            + recovery
+        )
+    return fast, balanced
+
+
+def _candidate_consistency_scan_sql() -> Tuple[str, str]:
+    signature_columns = list(CANDIDATE_SIGNATURE_FINGERPRINT_COLUMNS) + [
+        "candidate_count",
+        "ai_queue_status",
+        "candidate_generation_phase",
+        "candidate_generation_run_id",
+        "candidate_generation_version",
+    ]
+    return (
+        f"SELECT {', '.join(signature_columns)} FROM {SIG_TABLE} "
+        "ORDER BY signature_hash",
+        f"SELECT signature_hash, COUNT(*) AS actual_candidate_count "
+        f"FROM {CAND_TABLE} GROUP BY signature_hash ORDER BY signature_hash",
+    )
+
+
+def _require_candidate_generation_consistency(
+    conn: sqlite3.Connection,
+    fast_run: sqlite3.Row,
+    balanced_run: sqlite3.Row,
+) -> None:
+    """Stream exact counts and verify every signature's durable phase provenance."""
+    recovery = _candidate_readiness_recovery()
+    fast_run_id = clean_text(fast_run["run_id"])
+    balanced_run_id = clean_text(balanced_run["run_id"])
+    covered_by_fast = 0
+    covered_by_balanced = 0
+    population_count = 0
+    population_digest = hashlib.sha256()
+
+    def raw_hash(row: sqlite3.Row, source: str) -> str:
+        value = row["signature_hash"]
+        if value is None:
+            raise RuntimeError(f"{source} contains a NULL signature_hash." + recovery)
+        text = str(value)
+        if not text.strip() or text != clean_text(text):
+            raise RuntimeError(
+                f"{source} contains a blank/malformed signature_hash {text!r}." + recovery
+            )
+        return text
+
+    def require_signature_row(signature: sqlite3.Row, actual_count: int) -> None:
+        nonlocal covered_by_fast, covered_by_balanced, population_count
+        signature_hash = raw_hash(signature, "Signature table")
+        _update_signature_population_digest(population_digest, signature)
+        population_count += 1
+        stored_count = signature["candidate_count"]
+        queue_status = clean_text(signature["ai_queue_status"])
+        phase = clean_text(signature["candidate_generation_phase"])
+        run_id = clean_text(signature["candidate_generation_run_id"])
+        version = clean_text(signature["candidate_generation_version"])
+        issues: List[str] = []
+        if stored_count is None or stored_count != actual_count:
+            issues.append(
+                f"stored candidate_count={stored_count!r} but candidate table has "
+                f"{actual_count:,} row(s)"
+            )
+        if queue_status == "no_candidates" and actual_count != 0:
+            issues.append("queue status 'no_candidates' requires zero candidate rows")
+        if queue_status == "candidates_ready" and actual_count == 0:
+            issues.append("queue status 'candidates_ready' requires at least one candidate row")
+        if version != CANDIDATE_GENERATION_VERSION:
+            issues.append("candidate-generation version is missing or stale")
+        if phase == "fast" and run_id == fast_run_id:
+            covered_by_fast += 1
+            if actual_count == 0:
+                issues.append("zero-candidate signatures require completed balanced coverage")
+        elif phase == "balanced" and run_id == balanced_run_id:
+            covered_by_balanced += 1
+        else:
+            issues.append("candidate phase/run does not belong to the certified fast/balanced chain")
+        if issues:
+            raise RuntimeError(
+                "Target candidate generation is inconsistent; signature "
+                f"{signature_hash!r}: " + "; ".join(issues) + "." + recovery
+            )
+
+    _require_candidate_streaming_indexes(conn)
+    signature_sql, candidate_sql = _candidate_consistency_scan_sql()
+    signature_cursor = conn.execute(signature_sql)
+    candidate_cursor = conn.execute(candidate_sql)
+    try:
+        signature = signature_cursor.fetchone()
+        candidate = candidate_cursor.fetchone()
+        while signature is not None or candidate is not None:
+            signature_hash = raw_hash(signature, "Signature table") if signature is not None else None
+            candidate_hash = raw_hash(candidate, "Candidate table") if candidate is not None else None
+            if signature is None or (
+                candidate is not None and candidate_hash < signature_hash
+            ):
+                actual_count = int(candidate["actual_candidate_count"] or 0)
+                raise RuntimeError(
+                    "Candidate table is referentially invalid; signature "
+                    f"{candidate_hash!r} has {actual_count:,} candidate row(s) "
+                    "but no signature row." + recovery
+                )
+            if candidate is None or signature_hash < candidate_hash:
+                require_signature_row(signature, 0)
+                signature = signature_cursor.fetchone()
+                continue
+            require_signature_row(signature, int(candidate["actual_candidate_count"] or 0))
+            signature = signature_cursor.fetchone()
+            candidate = candidate_cursor.fetchone()
+    finally:
+        signature_cursor.close()
+        candidate_cursor.close()
+
+    population_fingerprint = "SIGPOP_" + population_digest.hexdigest()
+    expected_count = int(fast_run["signature_count"])
+    expected_fingerprint = clean_text(fast_run["signature_fingerprint"])
+    if population_count != expected_count or population_fingerprint != expected_fingerprint:
+        raise RuntimeError(
+            "Current signature population does not match the certified candidate runs."
+            + recovery
+        )
+    if covered_by_fast + covered_by_balanced != population_count:
+        raise RuntimeError("Candidate phase coverage is incomplete." + recovery)
+    if covered_by_balanced != int(balanced_run["selected_count"]):
+        raise RuntimeError(
+            "Balanced run selected/processed counts do not match per-signature coverage."
+            + recovery
+        )
+
+
+def _require_adjudicated_decision_integrity(
+    conn: sqlite3.Connection,
+    decision_table_exists: bool,
+) -> None:
+    adjudicated = conn.execute(
+        f"SELECT signature_hash FROM {SIG_TABLE} "
+        "WHERE ai_queue_status='adjudicated' LIMIT 1"
+    ).fetchone()
+    if not decision_table_exists:
+        if adjudicated is not None:
+            raise RuntimeError(
+                "Target has an adjudicated signature but no decision table."
+            )
+        return
+    missing = conn.execute(
+        f"SELECT s.signature_hash FROM {SIG_TABLE} s "
+        f"LEFT JOIN {DECISION_TABLE} d ON d.signature_hash=s.signature_hash "
+        "WHERE s.ai_queue_status='adjudicated' AND d.signature_hash IS NULL LIMIT 1"
+    ).fetchone()
+    if missing is not None:
+        raise RuntimeError(
+            "Target adjudication is inconsistent; signature "
+            f"{clean_text(missing['signature_hash'])!r} has no matching decision row."
+        )
+    orphan_decision = conn.execute(
+        f"SELECT d.signature_hash FROM {DECISION_TABLE} d "
+        f"LEFT JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash "
+        "WHERE s.signature_hash IS NULL LIMIT 1"
+    ).fetchone()
+    if orphan_decision is not None:
+        raise RuntimeError(
+            "Target adjudication is inconsistent; decision for signature "
+            f"{clean_text(orphan_decision['signature_hash'])!r} has no matching signature row."
+        )
+    invalid_select = conn.execute(
+        f"""
+        SELECT d.signature_hash
+        FROM {DECISION_TABLE} d
+        JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash
+        LEFT JOIN {CAND_TABLE} c
+          ON c.signature_hash=d.signature_hash
+         AND c.candidate_id=d.selected_candidate_id
+         AND c.ein=d.selected_ein
+        WHERE s.ai_queue_status='adjudicated'
+          AND d.decision='SELECT_CANDIDATE'
+          AND (
+            TRIM(COALESCE(d.selected_candidate_id,''))=''
+            OR TRIM(COALESCE(d.selected_ein,''))=''
+            OR c.signature_hash IS NULL
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_select is not None:
+        raise RuntimeError(
+            "Target adjudication is inconsistent; SELECT_CANDIDATE decision for "
+            f"signature {clean_text(invalid_select['signature_hash'])!r} does not "
+            "reference an exact current candidate_id/EIN row."
+        )
+    invalid_nonselect = conn.execute(
+        f"""
+        SELECT d.signature_hash
+        FROM {DECISION_TABLE} d
+        JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash
+        WHERE s.ai_queue_status='adjudicated'
+          AND d.decision IN ('NO_MATCH','AMBIGUOUS','HUMAN_REVIEW')
+          AND (
+            TRIM(COALESCE(d.selected_candidate_id,''))<>''
+            OR TRIM(COALESCE(d.selected_ein,''))<>''
+            OR TRIM(COALESCE(d.selected_name,''))<>''
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_nonselect is not None:
+        raise RuntimeError(
+            "Target adjudication is inconsistent; nonselect decision for signature "
+            f"{clean_text(invalid_nonselect['signature_hash'])!r} retains selected identity fields."
+        )
+    invalid_kind = conn.execute(
+        f"SELECT d.signature_hash FROM {DECISION_TABLE} d "
+        f"JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash "
+        "WHERE s.ai_queue_status='adjudicated' "
+        "AND COALESCE(d.decision,'') NOT IN "
+        "('SELECT_CANDIDATE','KEEP_REPORTED_EIN','NO_MATCH','AMBIGUOUS','HUMAN_REVIEW') "
+        "LIMIT 1"
+    ).fetchone()
+    if invalid_kind is not None:
+        raise RuntimeError(
+            "Target adjudication is inconsistent; decision for signature "
+            f"{clean_text(invalid_kind['signature_hash'])!r} has an invalid decision value."
+        )
+    for keep in conn.execute(
+        f"SELECT d.signature_hash, d.selected_ein, s.reported_ein "
+        f"FROM {DECISION_TABLE} d JOIN {SIG_TABLE} s "
+        "ON s.signature_hash=d.signature_hash "
+        "WHERE s.ai_queue_status='adjudicated' "
+        "AND d.decision='KEEP_REPORTED_EIN'"
+    ):
+        reported_ein = usable_reported_ein(keep["reported_ein"])
+        if not reported_ein or digits9(keep["selected_ein"]) != reported_ein:
+            raise RuntimeError(
+                "Target adjudication is inconsistent; KEEP_REPORTED_EIN decision "
+                f"for signature {clean_text(keep['signature_hash'])!r} does not "
+                "match the current usable reported EIN."
+            )
+
+
 def _record_value(record: Any, key: str, default: Any = None) -> Any:
     if isinstance(record, dict):
         return record.get(key, default)
@@ -4449,6 +5505,12 @@ def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
         _require_columns(source_conn, DECISION_TABLE, DECISION_COLUMNS)
 
         target_conn = _connect_migration_target(target_path, work_path, readonly=not args.apply)
+        if args.apply:
+            original_journal_modes = _prepare_migration_journal_modes(target_conn)
+            target_conn.execute("BEGIN EXCLUSIVE")
+        else:
+            target_conn.execute("BEGIN")
+        transaction_started = True
         if not table_exists(target_conn, RESOLVED_TABLE):
             raise RuntimeError(
                 f"Target is missing {RESOLVED_TABLE}. Run deterministic grant resolution before migrating reviewed decisions."
@@ -4465,7 +5527,19 @@ def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
         _require_columns(
             target_conn,
             SIG_TABLE,
-            ["signature_hash", "reported_ein", "recipient_name", "sample_grantor_ein", "ai_queue_status", "updated_at"],
+            [
+                "signature_hash",
+                "reported_ein",
+                "recipient_name",
+                "sample_grantor_ein",
+                "candidate_count",
+                "ai_queue_status",
+                "candidate_generation_phase",
+                "candidate_generation_run_id",
+                "candidate_generation_version",
+                "updated_at",
+                *CANDIDATE_SIGNATURE_FINGERPRINT_COLUMNS,
+            ],
         )
         _require_columns(
             target_conn,
@@ -4485,13 +5559,13 @@ def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
                 f"{pending_signature['signature_hash']} has queue status "
                 f"{pending_signature['ai_queue_status']!r}."
             )
+        fast_run, balanced_run = _require_candidate_generation_run_chain(target_conn)
+        _require_candidate_generation_consistency(target_conn, fast_run, balanced_run)
         decision_table_exists = table_exists(target_conn, DECISION_TABLE)
         if decision_table_exists:
             _require_columns(target_conn, DECISION_TABLE, DECISION_COLUMNS)
+        _require_adjudicated_decision_integrity(target_conn, decision_table_exists)
         if args.apply:
-            original_journal_modes = _prepare_migration_journal_modes(target_conn)
-            target_conn.execute("BEGIN EXCLUSIVE")
-            transaction_started = True
             _ensure_decision_schema_in_transaction(target_conn)
             decision_table_exists = True
 
@@ -4748,6 +5822,9 @@ def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
                     "DATABASE COMMITTED, but SQLite journal-mode restoration failed; reports remain staged; "
                     + _staged_recovery_message(temp_paths)
                 ) from exc
+        else:
+            target_conn.rollback()
+            transaction_started = False
         try:
             _publish_staged_migration_outputs(temp_paths)
             outputs_published = True
@@ -4806,6 +5883,489 @@ def cmd_migrate_reviewed_decisions(args: argparse.Namespace) -> None:
     print(f"Audit CSV: {audit_path}", flush=True)
     print(f"Quarantine JSONL: {quarantine_path}", flush=True)
     print("Rule-generated decisions were intentionally excluded; regenerate them against the repaired data.", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Narrow repair for legacy reported-EIN non-selection identity leakage
+# ---------------------------------------------------------------------------
+
+
+RULE_NONSELECTION_IDENTITY_REPAIR_SHAPES = {
+    "rule:reported_ein_no_ai_review": {"HUMAN_REVIEW"},
+    "rule:invalid_reported_ein_no_ai": {"HUMAN_REVIEW", "NO_MATCH"},
+}
+
+RULE_NONSELECTION_IDENTITY_REPAIR_AUDIT_COLUMNS = [
+    "repair_status", "repair_reasons", "target_action", "current_reported_ein",
+    "current_best_identity_name", "has_applied_row", *DECISION_COLUMNS,
+]
+
+
+def _strict_stored_boolean(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return None
+
+
+def _rule_nonselection_repair_assessment(conn: sqlite3.Connection, row: sqlite3.Row) -> List[str]:
+    """Return fail-closed reasons why one malformed legacy rule row is unsafe to normalize."""
+    reasons: List[str] = []
+    signature_hash = row["signature_hash"] if isinstance(row["signature_hash"], str) else ""
+    decision = row["decision"] if isinstance(row["decision"], str) else ""
+    model = row["model"] if isinstance(row["model"], str) else ""
+    selected_candidate_id = row["selected_candidate_id"] if isinstance(row["selected_candidate_id"], str) else None
+    selected_ein = row["selected_ein"] if isinstance(row["selected_ein"], str) else None
+    selected_name = row["selected_name"] if isinstance(row["selected_name"], str) else None
+    current_reported_ein = clean_text(row["current_reported_ein"])
+
+    allowed_decisions = RULE_NONSELECTION_IDENTITY_REPAIR_SHAPES.get(model)
+    if allowed_decisions is None or decision not in allowed_decisions:
+        reasons.append("unexpected_model_or_decision")
+    if _strict_stored_boolean(row["auto_accept"]) is not False:
+        reasons.append("auto_accept_not_canonical_false")
+    if selected_candidate_id != "":
+        reasons.append("selected_candidate_id_not_exact_blank")
+    if not isinstance(selected_ein, str) or not isinstance(selected_name, str):
+        reasons.append("selected_identity_not_text")
+    if row["validation_status"] != "ok" or row["validation_error"] != "":
+        reasons.append("decision_not_exact_clean_validation")
+    expected_review = decision == "HUMAN_REVIEW"
+    if _strict_stored_boolean(row["needs_human_review"]) != expected_review:
+        reasons.append("needs_human_review_mismatch")
+    if row["current_signature_hash"] != signature_hash:
+        reasons.append("current_signature_missing_or_mismatch")
+    if row["current_ai_queue_status"] != "adjudicated":
+        reasons.append("current_signature_not_adjudicated")
+    if int(row["has_applied_row"] or 0) != 0:
+        reasons.append("unexpected_applied_row")
+
+    input_obj = _json_dict(row["input_json"]) or {}
+    expected_input_keys = {"task", "rules", "grant_recipient_signature", "reported_ein_triage"}
+    expected_rules = [
+        "The filing supplied a recipient EIN.",
+        "Non-conflicting reported EINs should not be sent to Ollama for second-guessing.",
+        "Only reported-EIN cases with strong contradiction signals should proceed to AI adjudication.",
+    ]
+    if set(input_obj) != expected_input_keys:
+        reasons.append("input_keys_mismatch")
+    if input_obj.get("task") != "reported_ein_triage_no_ollama":
+        reasons.append("input_task_mismatch")
+    if input_obj.get("rules") != expected_rules:
+        reasons.append("input_rules_mismatch")
+    input_signature = input_obj.get("grant_recipient_signature")
+    expected_signature_keys = {
+        "signature_hash", "reported_ein", "recipient_name", "street", "city", "state", "zip5",
+        "grant_count", "total_amount", "first_pass_statuses_json", "first_pass_warning_flags",
+    }
+    if not isinstance(input_signature, dict):
+        reasons.append("input_signature_missing")
+        input_signature = {}
+    elif set(input_signature) != expected_signature_keys:
+        reasons.append("input_signature_keys_mismatch")
+    exact_signature_fields = {
+        "signature_hash": signature_hash,
+        "reported_ein": digits9(current_reported_ein),
+        "recipient_name": clean_text(row["current_recipient_name"]),
+        "street": clean_text(row["current_street"]),
+        "city": clean_text(row["current_city"]),
+        "state": clean_text(row["current_state"]),
+        "zip5": clean_text(row["current_zip5"]),
+        "first_pass_statuses_json": clean_text(row["current_first_pass_statuses_json"]),
+        "first_pass_warning_flags": clean_text(row["current_first_pass_warning_flags"]),
+    }
+    for field, expected in exact_signature_fields.items():
+        if input_signature.get(field) != expected:
+            reasons.append(f"input_{field}_mismatch")
+    input_grant_count = input_signature.get("grant_count")
+    if isinstance(input_grant_count, bool) or not isinstance(input_grant_count, int) or input_grant_count != int(row["current_grant_count"] or 0):
+        reasons.append("input_grant_count_mismatch")
+    input_total_amount = input_signature.get("total_amount")
+    if not isinstance(input_total_amount, float) or input_total_amount != float(row["current_total_amount"] or 0):
+        reasons.append("input_total_amount_mismatch")
+    if not isinstance(row["input_json"], str) or row["input_json"] != json.dumps(input_obj, ensure_ascii=False, sort_keys=True):
+        reasons.append("input_json_not_exact_producer_encoding")
+    if row["prompt_hash"] != stable_hash([row["input_json"] if isinstance(row["input_json"], str) else ""], "PROMPT_"):
+        reasons.append("prompt_hash_mismatch")
+    if row["model_options_json"] != json.dumps({"rule": "reported_ein_triage"}, sort_keys=True):
+        reasons.append("model_options_mismatch")
+
+    try:
+        row_reason_codes = json.loads(row["reason_codes_json"]) if isinstance(row["reason_codes_json"], str) else None
+    except json.JSONDecodeError:
+        row_reason_codes = None
+    if not isinstance(row_reason_codes, list) or not all(isinstance(code, str) for code in row_reason_codes):
+        reasons.append("reason_codes_json_invalid")
+        row_reason_codes = []
+    elif row["reason_codes_json"] != json.dumps(row_reason_codes, ensure_ascii=False, sort_keys=True):
+        reasons.append("reason_codes_json_not_exact_producer_encoding")
+
+    output_obj = _json_dict(row["output_json"]) or {}
+    expected_output_keys = {
+        "decision", "candidate_id", "confidence", "confidence_label", "reason_codes",
+        "explanation", "needs_human_review",
+    }
+    if set(output_obj) != expected_output_keys:
+        reasons.append("output_keys_mismatch")
+    expected_confidence = 0.0 if expected_review else 1.0
+    expected_confidence_label = "none" if expected_review else "high"
+    if output_obj.get("decision") != decision:
+        reasons.append("output_decision_mismatch")
+    if output_obj.get("candidate_id") != "":
+        reasons.append("output_candidate_id_not_exact_blank")
+    output_review = output_obj.get("needs_human_review")
+    if not isinstance(output_review, bool) or output_review != expected_review:
+        reasons.append("output_review_flag_mismatch")
+    if not isinstance(output_obj.get("confidence"), (int, float)) or isinstance(output_obj.get("confidence"), bool) or float(output_obj.get("confidence", -1)) != expected_confidence:
+        reasons.append("output_confidence_mismatch")
+    if output_obj.get("confidence_label") != expected_confidence_label:
+        reasons.append("output_confidence_label_mismatch")
+    if output_obj.get("reason_codes") != row_reason_codes:
+        reasons.append("output_reason_codes_mismatch")
+    if output_obj.get("explanation") != row["explanation"]:
+        reasons.append("output_explanation_mismatch")
+    if row["confidence"] != expected_confidence or row["confidence_label"] != expected_confidence_label:
+        reasons.append("stored_confidence_mismatch")
+    if not isinstance(row["output_json"], str) or row["output_json"] != json.dumps(output_obj, ensure_ascii=False, sort_keys=True):
+        reasons.append("output_json_not_exact_producer_encoding")
+
+    triage_input = input_obj.get("reported_ein_triage")
+    if not isinstance(triage_input, dict):
+        reasons.append("reported_ein_triage_input_missing")
+        triage_input = {}
+    if model == "rule:reported_ein_no_ai_review":
+        usable_current_ein = usable_reported_ein(current_reported_ein)
+        if not usable_current_ein or selected_ein != usable_current_ein:
+            reasons.append("selected_ein_not_current_usable_reported_ein")
+        if selected_ein and selected_ein not in raw_digits(str(row["explanation"] or "")):
+            reasons.append("selected_ein_not_preserved_in_explanation")
+
+        known_reasons = [
+            "reported_ein_present", "reported_ein_known_but_name_disagrees",
+            "ollama_skipped_nonconflicting_reported_ein",
+        ]
+        unknown_blank_reasons = [
+            "reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_blank", "ollama_skipped",
+        ]
+        unknown_name_reasons = [
+            "reported_ein_present", "reported_ein_not_in_org_identity", "recipient_name_present", "ollama_skipped",
+        ]
+        unhandled_reasons = ["reported_ein_present", "reported_ein_unhandled", "ollama_skipped"]
+        input_recipient_name = input_signature.get("recipient_name") if isinstance(input_signature.get("recipient_name"), str) else None
+        if row_reason_codes == known_reasons:
+            if set(triage_input) != {"shortcut_reason", "identity_source"}:
+                reasons.append("known_identity_triage_keys_mismatch")
+            if triage_input.get("shortcut_reason") != "recipient_name_disagrees_with_reported_ein_identity":
+                reasons.append("known_identity_shortcut_reason_mismatch")
+            if triage_input.get("identity_source") != clean_text(row["current_best_identity_source"]):
+                reasons.append("known_identity_source_mismatch")
+            if selected_name != clean_text(row["current_best_identity_name"]) or not selected_name:
+                reasons.append("known_identity_selected_name_mismatch")
+            expected_explanation = (
+                f"Reported recipient EIN {usable_current_ein} is known in org_identity as '{selected_name}', "
+                "but the recipient name has weak agreement with that identity. Ollama was skipped because "
+                "there was no strong first-pass contradiction flag; this should be reviewed manually."
+            )
+            if row["explanation"] != expected_explanation:
+                reasons.append("known_identity_explanation_mismatch")
+        elif row_reason_codes == unknown_blank_reasons or row_reason_codes == unknown_name_reasons:
+            if set(triage_input) != {"shortcut_reason"} or triage_input.get("shortcut_reason") != "reported_ein_not_in_org_identity":
+                reasons.append("unknown_identity_shortcut_input_mismatch")
+            if row["current_best_identity_name"] not in {None, ""}:
+                reasons.append("unknown_identity_now_has_current_identity")
+            if selected_name != input_recipient_name:
+                reasons.append("unknown_identity_selected_name_mismatch")
+            if row_reason_codes == unknown_blank_reasons and input_recipient_name != "":
+                reasons.append("unknown_blank_branch_recipient_not_blank")
+            if row_reason_codes == unknown_name_reasons and not input_recipient_name:
+                reasons.append("unknown_name_branch_recipient_blank")
+            if row_reason_codes == unknown_blank_reasons:
+                expected_explanation = (
+                    f"The filing supplied recipient EIN {usable_current_ein}, but org_identity has no name for it and "
+                    "the recipient name is blank. Ollama was skipped to avoid selecting unrelated same-address candidates; "
+                    "this should be reviewed manually."
+                )
+            else:
+                expected_explanation = (
+                    f"The filing supplied recipient EIN {usable_current_ein}, but org_identity has no name for it. "
+                    "Ollama was skipped because there was no strong reported-EIN contradiction; this should be reviewed manually."
+                )
+            if row["explanation"] != expected_explanation:
+                reasons.append("unknown_identity_explanation_mismatch")
+        elif row_reason_codes == unhandled_reasons:
+            # This fallback exists defensively in the producer, but all known
+            # shortcut return reasons are consumed by earlier branches.  There
+            # is no independently reproducible legacy state for it, so do not
+            # mutate such a row automatically.
+            reasons.append("unhandled_branch_requires_manual_review")
+        else:
+            reasons.append("reported_ein_review_branch_not_exact")
+    elif model == "rule:invalid_reported_ein_no_ai":
+        expected_validity_reason = reported_ein_validity_reason(current_reported_ein)
+        expected_invalid_reasons = ["reported_ein_invalid", expected_validity_reason, "ollama_skipped"]
+        if selected_ein != "" or selected_candidate_id != "":
+            reasons.append("invalid_ein_rule_has_candidate_or_ein")
+        if expected_validity_reason == "ok":
+            reasons.append("current_reported_ein_is_now_usable")
+        if selected_name != input_signature.get("recipient_name") or not selected_name:
+            reasons.append("invalid_ein_selected_name_not_exact_input_recipient")
+        if set(triage_input) != {"shortcut_reason", "reported_ein_raw"}:
+            reasons.append("invalid_ein_triage_keys_mismatch")
+        if triage_input.get("reported_ein_raw") != current_reported_ein:
+            reasons.append("invalid_ein_raw_input_mismatch")
+        if triage_input.get("shortcut_reason") != expected_validity_reason:
+            reasons.append("invalid_ein_shortcut_reason_mismatch")
+        if row_reason_codes != expected_invalid_reasons:
+            reasons.append("invalid_ein_reason_codes_mismatch")
+        expected_explanation = (
+            f"The filing-supplied recipient EIN value '{current_reported_ein}' is not a usable EIN "
+            f"({expected_validity_reason}). It was not kept as a recipient EIN, and Ollama was skipped by policy."
+        )
+        if row["explanation"] != expected_explanation:
+            reasons.append("invalid_ein_explanation_mismatch")
+
+    current_candidates = list(
+        conn.execute(
+            f"SELECT candidate_id, ein, candidate_score FROM {CAND_TABLE} "
+            "WHERE signature_hash=? ORDER BY candidate_rank",
+            (signature_hash,),
+        )
+    )
+    stored_candidate_hash = row["candidate_set_hash"] if isinstance(row["candidate_set_hash"], str) else ""
+    prefix_lengths = range(1, len(current_candidates) + 1) if current_candidates else (0,)
+    if not any(candidate_set_fingerprint(current_candidates[:prefix_len]) == stored_candidate_hash for prefix_len in prefix_lengths):
+        reasons.append("candidate_set_hash_not_current_ordered_prefix")
+
+    return reasons
+
+
+def _iter_rule_nonselection_identity_repair_rows(conn: sqlite3.Connection) -> Iterator[sqlite3.Row]:
+    applied_expr = (
+        f"EXISTS (SELECT 1 FROM {APPLIED_TABLE} a WHERE a.signature_hash=d.signature_hash)"
+        if table_exists(conn, APPLIED_TABLE)
+        else "0"
+    )
+    yield from conn.execute(
+        f"""
+        SELECT d.*,
+               s.signature_hash AS current_signature_hash,
+               s.reported_ein AS current_reported_ein,
+               s.recipient_name AS current_recipient_name,
+               s.street AS current_street,
+               s.city AS current_city,
+               s.state AS current_state,
+               s.zip5 AS current_zip5,
+               s.grant_count AS current_grant_count,
+               s.total_amount AS current_total_amount,
+               s.first_pass_statuses_json AS current_first_pass_statuses_json,
+               s.first_pass_warning_flags AS current_first_pass_warning_flags,
+               s.ai_queue_status AS current_ai_queue_status,
+               (
+                 SELECT oi.display_name
+                 FROM {ORG_IDENTITY_TABLE} oi
+                 WHERE oi.ein=d.selected_ein
+                   AND oi.display_name IS NOT NULL AND TRIM(oi.display_name) <> ''
+                 ORDER BY
+                   CASE
+                     WHEN oi.source='returns_org_name' THEN 0
+                     WHEN oi.source='bmf_name' THEN 1
+                     WHEN oi.source='returns_dba_name' THEN 2
+                     WHEN oi.source='bmf_sort_name' THEN 3
+                     WHEN oi.source='bmf_ico' THEN 9
+                     ELSE 5
+                   END,
+                   oi.source_rank ASC,
+                   COALESCE(oi.tax_year,0) DESC,
+                   oi.identity_id ASC
+                 LIMIT 1
+               ) AS current_best_identity_name,
+               (
+                 SELECT oi.source
+                 FROM {ORG_IDENTITY_TABLE} oi
+                 WHERE oi.ein=d.selected_ein
+                   AND oi.display_name IS NOT NULL AND TRIM(oi.display_name) <> ''
+                 ORDER BY
+                   CASE
+                     WHEN oi.source='returns_org_name' THEN 0
+                     WHEN oi.source='bmf_name' THEN 1
+                     WHEN oi.source='returns_dba_name' THEN 2
+                     WHEN oi.source='bmf_sort_name' THEN 3
+                     WHEN oi.source='bmf_ico' THEN 9
+                     ELSE 5
+                   END,
+                   oi.source_rank ASC,
+                   COALESCE(oi.tax_year,0) DESC,
+                   oi.identity_id ASC
+                 LIMIT 1
+               ) AS current_best_identity_source,
+               {applied_expr} AS has_applied_row
+        FROM {DECISION_TABLE} d
+        LEFT JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash
+        WHERE (d.decision IS NULL OR d.decision NOT IN ('SELECT_CANDIDATE', 'KEEP_REPORTED_EIN'))
+          AND (
+            COALESCE(TRIM(d.selected_candidate_id),'') <> ''
+            OR COALESCE(TRIM(d.selected_ein),'') <> ''
+            OR COALESCE(TRIM(d.selected_name),'') <> ''
+          )
+        ORDER BY d.signature_hash
+        """
+    )
+
+
+def cmd_repair_rule_nonselect_identities(args: argparse.Namespace) -> None:
+    """Audit and narrowly clear leaked identity columns from two legacy rule shapes."""
+    main_path = str(Path(args.db).expanduser().resolve())
+    work_arg = clean_text(getattr(args, "work_db", ""))
+    work_path = str(
+        Path(work_arg or GRANT_WORK_DB_PATH or default_grant_work_db_path(args.db)).expanduser().resolve()
+    )
+    if _same_file_path(main_path, work_path):
+        raise RuntimeError("Refusing rule repair because --db and --work-db are the same file.")
+    if not Path(main_path).is_file():
+        raise FileNotFoundError(main_path)
+    if not Path(work_path).is_file():
+        raise FileNotFoundError(work_path)
+
+    audit_path = Path(args.audit_csv).expanduser().resolve()
+    _reject_database_output_path(audit_path, (main_path, work_path))
+    temp_paths = _atomic_output_paths([audit_path], args.overwrite_audit)
+    temp_path = temp_paths[audit_path]
+
+    conn: Optional[sqlite3.Connection] = None
+    audit_fh = None
+    transaction_started = False
+    database_committed = False
+    output_published = False
+    original_journal_modes: Optional[Dict[str, str]] = None
+    journal_modes_restored = False
+    counts: Counter = Counter()
+    try:
+        conn = _connect_migration_target(main_path, work_path, readonly=not args.apply)
+        if not table_exists(conn, DECISION_TABLE):
+            raise RuntimeError(f"Target database is missing {DECISION_TABLE}.")
+        if not table_exists(conn, SIG_TABLE) or not table_exists(conn, CAND_TABLE) or not table_exists(conn, ORG_IDENTITY_TABLE):
+            raise RuntimeError("Target work database is missing current signatures, candidates, or org identity rows.")
+        _require_columns(conn, DECISION_TABLE, DECISION_COLUMNS)
+
+        if args.apply:
+            original_journal_modes = _prepare_migration_journal_modes(conn)
+            conn.execute("BEGIN EXCLUSIVE")
+        else:
+            conn.execute("BEGIN")
+        transaction_started = True
+
+        audit_fh = temp_path.open("x", newline="", encoding="utf-8-sig")
+        writer = csv.writer(audit_fh)
+        writer.writerow(RULE_NONSELECTION_IDENTITY_REPAIR_AUDIT_COLUMNS)
+        for row in _iter_rule_nonselection_identity_repair_rows(conn):
+            counts["examined"] += 1
+            reasons = _rule_nonselection_repair_assessment(conn, row)
+            status = "eligible_known_legacy_bug" if not reasons else "refused_unexpected_shape"
+            action = "clear_selected_identity" if not reasons else "leave_unchanged"
+            counts["eligible" if not reasons else "refused"] += 1
+            writer.writerow([
+                status,
+                ";".join(reasons),
+                action,
+                clean_text(row["current_reported_ein"]),
+                clean_text(row["current_best_identity_name"]),
+                int(row["has_applied_row"] or 0),
+                *(row[column] for column in DECISION_COLUMNS),
+            ])
+        _flush_and_sync_output(audit_fh)
+        audit_fh.close()
+        audit_fh = None
+
+        if counts["refused"]:
+            conn.rollback()
+            transaction_started = False
+            if original_journal_modes is not None:
+                _restore_migration_journal_modes(conn, original_journal_modes)
+                journal_modes_restored = True
+            _publish_staged_migration_outputs(temp_paths)
+            output_published = True
+            raise RuntimeError(
+                f"Refusing rule repair: {counts['refused']:,} malformed non-selection decision(s) "
+                f"did not match the verified legacy producer shape. No database rows changed; inspect {audit_path}."
+            )
+
+        if args.apply:
+            update = conn.execute(
+                f"""
+                UPDATE {DECISION_TABLE}
+                SET selected_candidate_id='', selected_ein='', selected_name=''
+                WHERE auto_accept=0
+                  AND (
+                    (model='rule:reported_ein_no_ai_review' AND decision='HUMAN_REVIEW')
+                    OR
+                    (model='rule:invalid_reported_ein_no_ai' AND decision IN ('HUMAN_REVIEW','NO_MATCH'))
+                  )
+                  AND (
+                    COALESCE(TRIM(selected_candidate_id),'') <> ''
+                    OR COALESCE(TRIM(selected_ein),'') <> ''
+                    OR COALESCE(TRIM(selected_name),'') <> ''
+                  )
+                """
+            )
+            if int(update.rowcount) != counts["eligible"]:
+                raise RuntimeError(
+                    f"Rule repair changed {int(update.rowcount):,} rows but audited {counts['eligible']:,}; rolling back."
+                )
+            _commit_migration_transaction(conn)
+            transaction_started = False
+            database_committed = True
+            counts["written"] = int(update.rowcount)
+        else:
+            conn.rollback()
+            transaction_started = False
+
+        if original_journal_modes is not None:
+            _restore_migration_journal_modes(conn, original_journal_modes)
+            journal_modes_restored = True
+        _publish_staged_migration_outputs(temp_paths)
+        output_published = True
+    except Exception as exc:
+        if conn is not None and transaction_started:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        if conn is not None and original_journal_modes is not None and not journal_modes_restored:
+            try:
+                _restore_migration_journal_modes(conn, original_journal_modes)
+                journal_modes_restored = True
+            except Exception as restore_exc:
+                if database_committed:
+                    raise RuntimeError(
+                        f"DATABASE COMMITTED, but journal restoration failed: {restore_exc}; "
+                        + _staged_recovery_message(temp_paths)
+                    ) from exc
+                raise
+        if database_committed and not output_published:
+            raise RuntimeError(
+                "DATABASE COMMITTED, but the repair audit could not be published; "
+                + _staged_recovery_message(temp_paths)
+            ) from exc
+        raise
+    finally:
+        if audit_fh is not None:
+            audit_fh.close()
+        if not output_published and not database_committed:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+        if conn is not None:
+            conn.close()
+
+    mode = "APPLIED" if args.apply else "DRY RUN"
+    print(
+        f"Rule non-selection identity repair {mode}: examined={counts['examined']:,}; "
+        f"eligible={counts['eligible']:,}; written={counts['written']:,}",
+        flush=True,
+    )
+    print(f"Audit CSV: {audit_path}", flush=True)
 
 
 
@@ -6072,17 +7632,26 @@ def cmd_candidate_rule_decisions(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_applied_indexes(conn: sqlite3.Connection) -> None:
+APPLIED_STAGING_TABLE = f"{APPLIED_TABLE}__building"
+
+
+def create_applied_indexes(
+    conn: sqlite3.Connection,
+    table_name: str = APPLIED_TABLE,
+    *,
+    index_prefix: str = "idx_ai_applied",
+    analyze: bool = True,
+) -> None:
     statements = [
-        f"CREATE INDEX IF NOT EXISTS idx_ai_applied_selected_ein ON {APPLIED_TABLE}(selected_ein);",
-        f"CREATE INDEX IF NOT EXISTS idx_ai_applied_sig ON {APPLIED_TABLE}(signature_hash);",
+        f"CREATE INDEX IF NOT EXISTS {index_prefix}_selected_ein ON {table_name}(selected_ein);",
+        f"CREATE INDEX IF NOT EXISTS {index_prefix}_sig ON {table_name}(signature_hash);",
     ]
     run_index_statements(conn, statements, "applied")
-    analyze_tables(conn, [APPLIED_TABLE])
+    if analyze:
+        analyze_tables(conn, [table_name])
 
 
-def refresh_final_view(conn: sqlite3.Connection) -> None:
-    conn.execute(f"DROP VIEW IF EXISTS {FINAL_VIEW}")
+def _create_final_view(conn: sqlite3.Connection) -> None:
     conn.execute(f"""
     CREATE VIEW {FINAL_VIEW} AS
     SELECT
@@ -6105,15 +7674,27 @@ def refresh_final_view(conn: sqlite3.Connection) -> None:
     FROM {RESOLVED_TABLE} rr
     LEFT JOIN {APPLIED_TABLE} aa ON aa.grant_id = rr.grant_id
     """)
-    conn.commit()
 
 
-def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True, create_view: bool = True) -> None:
-    if full_refresh:
-        conn.executescript(f"DROP VIEW IF EXISTS {FINAL_VIEW}; DROP TABLE IF EXISTS {APPLIED_TABLE};")
+def refresh_final_view(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute(f"DROP VIEW IF EXISTS {FINAL_VIEW}")
+        _create_final_view(conn)
         conn.commit()
-    conn.executescript(f"""
-    CREATE TABLE IF NOT EXISTS {APPLIED_TABLE} (
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _create_applied_table(
+    conn: sqlite3.Connection,
+    table_name: str,
+    *,
+    if_not_exists: bool = False,
+) -> None:
+    qualifier = "IF NOT EXISTS " if if_not_exists else ""
+    conn.execute(f"""
+    CREATE TABLE {qualifier}{table_name} (
       grant_id INTEGER PRIMARY KEY,
       signature_hash TEXT NOT NULL,
       selected_ein TEXT NOT NULL,
@@ -6122,8 +7703,14 @@ def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool 
       ai_decision TEXT,
       model TEXT,
       applied_at TEXT
-    );
+    )
     """)
+
+
+def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool = False, create_indexes: bool = True, create_view: bool = True) -> None:
+    if full_refresh:
+        raise RuntimeError("Full applied-layer refreshes must use the staged atomic rebuild path.")
+    _create_applied_table(conn, APPLIED_TABLE, if_not_exists=True)
     conn.commit()
     if create_indexes:
         create_applied_indexes(conn)
@@ -6131,51 +7718,486 @@ def create_applied_schema_and_view(conn: sqlite3.Connection, full_refresh: bool 
         refresh_final_view(conn)
 
 
-def cmd_apply_decisions(args: argparse.Namespace) -> None:
-    conn = connect(args.db, readonly=False, exclusive=True)
-    if not table_exists(conn, DECISION_TABLE):
-        raise RuntimeError(f"Missing {DECISION_TABLE}. Run adjudicate first.")
-    if args.full_refresh:
-        print("Full refresh: deferring applied-match indexes and final view until after bulk apply...", flush=True)
-    create_applied_schema_and_view(conn, full_refresh=args.full_refresh, create_indexes=not args.full_refresh, create_view=not args.full_refresh)
+def _require_table_object(conn: sqlite3.Connection, table_name: str) -> None:
+    schema, table = _split_qualified_name(table_name)
+    row = conn.execute(
+        f"SELECT type FROM {_sqlite_master_name(schema)} WHERE name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"Missing required table {table_name}.")
+    if clean_text(row[0]).lower() != "table":
+        raise RuntimeError(f"Required object {table_name} is not a table.")
+
+
+def _require_optional_object_type(
+    conn: sqlite3.Connection,
+    object_name: str,
+    expected_type: str,
+) -> None:
+    schema, name = _split_qualified_name(object_name)
+    row = conn.execute(
+        f"SELECT type FROM {_sqlite_master_name(schema)} WHERE name=? LIMIT 1",
+        (name,),
+    ).fetchone()
+    if row is not None and clean_text(row[0]).lower() != expected_type:
+        raise RuntimeError(
+            f"Existing object {object_name} must be a {expected_type}, not {clean_text(row[0]) or 'unknown'}."
+        )
+
+
+def _apply_decision_freshness_sql() -> str:
+    return f"""
+    SELECT d.signature_hash,
+           d.decision,
+           d.candidate_set_hash,
+           d.model,
+           d.auto_accept
+    FROM {DECISION_TABLE} d
+    ORDER BY d.signature_hash
+    """
+
+
+def _apply_candidate_freshness_sql() -> str:
+    return f"""
+    SELECT c.signature_hash,
+           c.candidate_rank,
+           c.candidate_id,
+           c.ein,
+           c.candidate_score
+    FROM {CAND_TABLE} c
+    JOIN {DECISION_TABLE} d ON d.signature_hash=c.signature_hash
+    ORDER BY c.signature_hash, c.candidate_rank
+    """
+
+
+def _legacy_nonselection_candidate_prefix_allowed(row: sqlite3.Row) -> bool:
+    """Permit only the audited, never-applied legacy repair shapes to use a prefix.
+
+    Older reported-EIN triage commands could intentionally hash a configured
+    ordered candidate prefix.  The narrow repair command independently verifies
+    those exact producer shapes before clearing their leaked selected identity.
+    They are non-selection decisions with auto_accept=0, so they can never enter
+    the applied layer.  Every selectable/current rule or migrated decision must
+    match the entire current candidate set.
+    """
+    model = clean_text(row["model"])
+    decision = clean_text(row["decision"])
+    return (
+        _strict_stored_boolean(row["auto_accept"]) is False
+        and decision in RULE_NONSELECTION_IDENTITY_REPAIR_SHAPES.get(model, set())
+    )
+
+
+def _require_current_decision_candidate_sets(conn: sqlite3.Connection) -> None:
+    """Stream-prove every stored decision against its current ordered candidates.
+
+    This deliberately merge-walks two index-ordered cursors with one SHA-1
+    accumulator and constant memory.  It must not regress to per-decision
+    candidate queries or a temp GROUP BY at production scale.
+    """
+    if not _has_leading_index(conn, DECISION_TABLE, "signature_hash"):
+        raise RuntimeError(
+            f"Applied-layer readiness requires {DECISION_TABLE} to have an index "
+            "beginning with signature_hash for bounded candidate provenance validation."
+        )
+    if not _has_leading_index_columns(
+        conn,
+        CAND_TABLE,
+        ("signature_hash", "candidate_rank"),
+    ):
+        raise RuntimeError(
+            f"Applied-layer readiness requires {CAND_TABLE} to have an index beginning "
+            "with (signature_hash, candidate_rank) for bounded candidate provenance validation."
+        )
+    for label, sql in (
+        ("decision", _apply_decision_freshness_sql()),
+        ("candidate", _apply_candidate_freshness_sql()),
+    ):
+        plan_details = [
+            clean_text(row[3]).upper()
+            for row in conn.execute("EXPLAIN QUERY PLAN " + sql)
+        ]
+        if any("TEMP B-TREE" in detail for detail in plan_details):
+            raise RuntimeError(
+                "Applied-layer readiness refused a non-streaming candidate provenance "
+                f"plan for the {label} cursor: {'; '.join(plan_details)}. Rebuild/analyze "
+                "the documented signature/candidate indexes before applying decisions."
+            )
+
+    checked = 0
+    legacy_prefixes = 0
+    decision_cursor = conn.execute(_apply_decision_freshness_sql())
+    candidate_cursor = conn.execute(_apply_candidate_freshness_sql())
+    try:
+        candidate = candidate_cursor.fetchone()
+        for decision_row in decision_cursor:
+            raw_signature_hash = decision_row["signature_hash"]
+            signature_hash = clean_text(raw_signature_hash)
+            if (
+                not isinstance(raw_signature_hash, str)
+                or not signature_hash
+                or raw_signature_hash != signature_hash
+            ):
+                raise RuntimeError(
+                    "Applied-layer readiness failed; decision table contains a blank/malformed signature_hash."
+                )
+            stored_hash = (
+                decision_row["candidate_set_hash"]
+                if isinstance(decision_row["candidate_set_hash"], str)
+                else ""
+            )
+            digest = hashlib.sha1()
+            digest.update(b"[")
+            candidate_count = 0
+            matched_legacy_prefix = False
+            while (
+                candidate is not None
+                and candidate["signature_hash"] == raw_signature_hash
+            ):
+                expected_rank = candidate_count + 1
+                candidate_rank = candidate["candidate_rank"]
+                if candidate_rank != expected_rank:
+                    raise RuntimeError(
+                        "Applied-layer readiness failed; current candidates for signature "
+                        f"{signature_hash!r} are not ranked exactly 1..N (expected "
+                        f"{expected_rank}, found {candidate_rank!r})."
+                    )
+                if candidate_count:
+                    digest.update(b", ")
+                payload = {
+                    "id": clean_text(candidate["candidate_id"]),
+                    "ein": clean_text(candidate["ein"]),
+                    "score": candidate["candidate_score"],
+                }
+                digest.update(
+                    json.dumps(payload, sort_keys=True).encode("utf-8", errors="ignore")
+                )
+                candidate_count += 1
+                prefix_digest = digest.copy()
+                prefix_digest.update(b"]")
+                if stored_hash == "CANDS_" + prefix_digest.hexdigest():
+                    matched_legacy_prefix = True
+                candidate = candidate_cursor.fetchone()
+
+            completed = digest.copy()
+            completed.update(b"]")
+            current_hash = "CANDS_" + completed.hexdigest()
+            exact = stored_hash == current_hash
+            legacy_prefix = (
+                not exact
+                and matched_legacy_prefix
+                and _legacy_nonselection_candidate_prefix_allowed(decision_row)
+            )
+            if not exact and not legacy_prefix:
+                raise RuntimeError(
+                    "Applied-layer readiness failed; adjudicated decision for signature "
+                    f"{signature_hash!r} has stale/invalid candidate_set_hash "
+                    f"{stored_hash!r}; exact current hash is {current_hash!r} across "
+                    f"{candidate_count:,} candidate row(s). Regenerate or revalidate the "
+                    "decision against the current certified candidates before applying it."
+                )
+            checked += 1
+            if legacy_prefix:
+                legacy_prefixes += 1
+            if checked % 250000 == 0:
+                print(
+                    f"Verified current candidate-set provenance for {checked:,} adjudicated decisions...",
+                    flush=True,
+                )
+        if candidate is not None:
+            raise RuntimeError(
+                "Applied-layer readiness failed; index-ordered candidate provenance stream "
+                f"fell out of sync at signature {clean_text(candidate['signature_hash'])!r}."
+            )
+    finally:
+        decision_cursor.close()
+        candidate_cursor.close()
+    print(
+        f"Verified exact current candidate-set provenance for {checked:,} adjudicated decisions"
+        + (
+            f" ({legacy_prefixes:,} audited legacy nonselection prefix exception(s))."
+            if legacy_prefixes
+            else "."
+        ),
+        flush=True,
+    )
+
+
+def _require_apply_decision_readiness(conn: sqlite3.Connection) -> None:
+    """Fail before rebuilding unless decisions and their work mappings are current."""
+    for table_name in (
+        DECISION_TABLE,
+        RESOLVED_TABLE,
+        SIG_TABLE,
+        SIG_GRANT_TABLE,
+        CAND_TABLE,
+    ):
+        _require_table_object(conn, table_name)
+    _require_columns(
+        conn,
+        DECISION_TABLE,
+        (
+            "signature_hash", "decision", "selected_candidate_id", "selected_ein",
+            "selected_name", "confidence", "auto_accept", "validation_status", "model",
+            "candidate_set_hash",
+        ),
+    )
+    _require_columns(conn, RESOLVED_TABLE, ("grant_id", "resolved_ein", "resolved_org_name", "confidence"))
+    _require_columns(conn, SIG_TABLE, ("signature_hash", "reported_ein", "ai_queue_status"))
+    _require_columns(conn, SIG_GRANT_TABLE, ("signature_hash", "grant_id"))
+    _require_columns(
+        conn,
+        CAND_TABLE,
+        ("signature_hash", "candidate_id", "candidate_rank", "ein", "candidate_score"),
+    )
+    _require_optional_object_type(conn, APPLIED_TABLE, "table")
+    _require_optional_object_type(conn, FINAL_VIEW, "view")
+
+    _require_signature_grant_coverage(conn)
+    _require_adjudicated_decision_integrity(conn, True)
+
+    stale_decision = conn.execute(
+        f"SELECT d.signature_hash FROM {DECISION_TABLE} d "
+        f"JOIN {SIG_TABLE} s ON s.signature_hash=d.signature_hash "
+        "WHERE COALESCE(s.ai_queue_status,'')<>'adjudicated' LIMIT 1"
+    ).fetchone()
+    if stale_decision is not None:
+        raise RuntimeError(
+            "Applied-layer readiness failed; decision for signature "
+            f"{clean_text(stale_decision['signature_hash'])!r} is not marked adjudicated."
+        )
+
+    invalid_auto = conn.execute(
+        f"""
+        SELECT signature_hash
+        FROM {DECISION_TABLE}
+        WHERE auto_accept=1
+          AND (
+            COALESCE(validation_status,'')<>'ok'
+            OR COALESCE(decision,'') NOT IN ('SELECT_CANDIDATE','KEEP_REPORTED_EIN')
+            OR TRIM(COALESCE(selected_ein,''))=''
+            OR confidence IS NULL
+            OR confidence < 0
+            OR confidence > 1
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    if invalid_auto is not None:
+        raise RuntimeError(
+            "Applied-layer readiness failed; auto-accepted decision for signature "
+            f"{clean_text(invalid_auto['signature_hash'])!r} is not valid and selectable."
+        )
+
+    duplicate_mapping = conn.execute(
+        f"SELECT grant_id FROM {SIG_GRANT_TABLE} GROUP BY grant_id HAVING COUNT(*)<>1 LIMIT 1"
+    ).fetchone()
+    if duplicate_mapping is not None:
+        raise RuntimeError(
+            "Applied-layer readiness failed; rebuilt grant_id "
+            f"{duplicate_mapping['grant_id']!r} is mapped to more than one signature."
+        )
+
+    _require_current_decision_candidate_sets(conn)
+
+
+def _drop_stale_applied_staging(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT type FROM sqlite_master WHERE name=? LIMIT 1",
+        (APPLIED_STAGING_TABLE,),
+    ).fetchone()
+    if row is None:
+        return
+    object_type = clean_text(row[0]).lower()
+    if object_type == "table":
+        conn.execute(f"DROP TABLE {APPLIED_STAGING_TABLE}")
+    elif object_type == "view":
+        conn.execute(f"DROP VIEW {APPLIED_STAGING_TABLE}")
+    else:
+        raise RuntimeError(
+            f"Unexpected staging object type for {APPLIED_STAGING_TABLE}: {object_type or 'unknown'}"
+        )
+    conn.commit()
+
+
+def _applied_source_sql(min_confidence: Optional[float]) -> Tuple[str, List[Any]]:
     where = "WHERE d.auto_accept=1 AND d.validation_status='ok' AND d.selected_ein IS NOT NULL AND d.selected_ein <> ''"
     params: List[Any] = []
-    if args.min_confidence is not None:
+    if min_confidence is not None:
         where += " AND d.confidence >= ?"
-        params.append(args.min_confidence)
-    sql = f"""
-    SELECT sg.grant_id, d.signature_hash, d.selected_ein, d.selected_name, d.confidence, d.decision, d.model
-    FROM {DECISION_TABLE} d
-    JOIN {SIG_GRANT_TABLE} sg ON sg.signature_hash = d.signature_hash
-    {where}
-    """
-    count = 0
-    batch = []
-    for r in conn.execute(sql, params):
-        batch.append((
-            r["grant_id"], r["signature_hash"], r["selected_ein"], r["selected_name"], r["confidence"], r["decision"], r["model"], now_stamp()
-        ))
-        if len(batch) >= args.batch_size:
-            conn.executemany(
-                f"INSERT OR REPLACE INTO {APPLIED_TABLE} (grant_id, signature_hash, selected_ein, selected_name, ai_confidence, ai_decision, model, applied_at) VALUES (?,?,?,?,?,?,?,?)",
-                batch,
-            )
-            count += len(batch)
-            batch.clear()
-            conn.commit()
-            print(f"Applied {count:,} grant-level AI matches...", flush=True)
-    if batch:
-        conn.executemany(
-            f"INSERT OR REPLACE INTO {APPLIED_TABLE} (grant_id, signature_hash, selected_ein, selected_name, ai_confidence, ai_decision, model, applied_at) VALUES (?,?,?,?,?,?,?,?)",
-            batch,
+        params.append(min_confidence)
+    return (
+        f"""
+        SELECT sg.grant_id, d.signature_hash, d.selected_ein, d.selected_name,
+               d.confidence, d.decision, d.model
+        FROM {DECISION_TABLE} d
+        JOIN {SIG_GRANT_TABLE} sg ON sg.signature_hash = d.signature_hash
+        {where}
+        """,
+        params,
+    )
+
+
+def _require_staged_applied_matches(
+    conn: sqlite3.Connection,
+    staging_table: str,
+    source_sql: str,
+    params: Sequence[Any],
+) -> int:
+    expected_count = int(
+        conn.execute(f"SELECT COUNT(*) FROM ({source_sql})", tuple(params)).fetchone()[0]
+    )
+    staged_count = int(conn.execute(f"SELECT COUNT(*) FROM {staging_table}").fetchone()[0])
+    if staged_count != expected_count:
+        raise RuntimeError(
+            "Applied-layer staging count changed before cutover: "
+            f"expected {expected_count:,}, staged {staged_count:,}."
         )
-        count += len(batch)
+    mismatch = conn.execute(
+        f"""
+        WITH expected AS ({source_sql})
+        SELECT e.grant_id
+        FROM expected e
+        LEFT JOIN {staging_table} a ON a.grant_id=e.grant_id
+        WHERE a.grant_id IS NULL
+           OR a.signature_hash IS NOT e.signature_hash
+           OR a.selected_ein IS NOT e.selected_ein
+           OR a.selected_name IS NOT e.selected_name
+           OR a.ai_confidence IS NOT e.confidence
+           OR a.ai_decision IS NOT e.decision
+           OR a.model IS NOT e.model
+        LIMIT 1
+        """,
+        tuple(params),
+    ).fetchone()
+    if mismatch is not None:
+        raise RuntimeError(
+            "Applied-layer staging no longer exactly matches current accepted decisions; "
+            f"first mismatched grant_id={mismatch['grant_id']!r}."
+        )
+    return expected_count
+
+
+def _install_staged_applied_layer(
+    conn: sqlite3.Connection,
+    source_sql: str,
+    params: Sequence[Any],
+    loaded_count: int,
+) -> int:
+    """Atomically replace the visible applied table/view after an exact recheck."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        expected_count = _require_staged_applied_matches(
+            conn,
+            APPLIED_STAGING_TABLE,
+            source_sql,
+            params,
+        )
+        if expected_count != loaded_count:
+            raise RuntimeError(
+                "Applied-layer install count changed unexpectedly before cutover: "
+                f"loaded {loaded_count:,}, current expected {expected_count:,}."
+            )
+        conn.execute(f"DROP VIEW IF EXISTS {FINAL_VIEW}")
+        conn.execute(f"DROP TABLE IF EXISTS {APPLIED_TABLE}")
+        conn.execute(f"ALTER TABLE {APPLIED_STAGING_TABLE} RENAME TO {APPLIED_TABLE}")
+        _create_final_view(conn)
+        conn.execute(f"ANALYZE {APPLIED_TABLE}")
         conn.commit()
-    if args.full_refresh:
-        print("Bulk apply complete; creating applied-match indexes and final view...", flush=True)
-        create_applied_indexes(conn)
-        refresh_final_view(conn)
-    print(f"Applied {count:,} grant-level AI matches into {APPLIED_TABLE}; final view is {FINAL_VIEW}", flush=True)
+        return expected_count
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def cmd_apply_decisions(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "full_refresh", False)):
+        raise RuntimeError(
+            "apply-decisions requires --full-refresh; incremental application can retain "
+            "stale or revoked matches and is intentionally disabled."
+        )
+    batch_size = int(args.batch_size)
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1.")
+    min_confidence = args.min_confidence
+    if min_confidence is not None and not 0.0 <= float(min_confidence) <= 1.0:
+        raise ValueError("--min-confidence must be between 0 and 1.")
+
+    main_path = _require_existing_database_file(args.db, "Main")
+    work_arg = clean_text(getattr(args, "work_db", ""))
+    work_path = _require_existing_database_file(
+        work_arg or GRANT_WORK_DB_PATH or default_grant_work_db_path(str(main_path)),
+        "Grant work",
+    )
+    try:
+        same_database = main_path.samefile(work_path)
+    except OSError:
+        same_database = main_path == work_path
+    if same_database:
+        raise RuntimeError("Refusing applied-layer rebuild because --db and --work-db are the same file.")
+
+    configure_grant_work_sidecar(str(main_path), str(work_path))
+    conn = connect(
+        str(main_path),
+        readonly=False,
+        exclusive=True,
+        require_existing_db=True,
+        require_existing_work_db=True,
+    )
+    try:
+        _require_apply_decision_readiness(conn)
+        source_sql, params = _applied_source_sql(min_confidence)
+        print(
+            "Full refresh: building and indexing a hidden applied-match table before atomic cutover...",
+            flush=True,
+        )
+        _drop_stale_applied_staging(conn)
+        _create_applied_table(conn, APPLIED_STAGING_TABLE)
+        conn.commit()
+
+        insert_sql = (
+            f"INSERT INTO {APPLIED_STAGING_TABLE} "
+            "(grant_id, signature_hash, selected_ein, selected_name, ai_confidence, "
+            "ai_decision, model, applied_at) VALUES (?,?,?,?,?,?,?,?)"
+        )
+        count = 0
+        batch: List[Tuple[Any, ...]] = []
+        for row in conn.execute(source_sql, params):
+            batch.append(
+                (
+                    row["grant_id"], row["signature_hash"], row["selected_ein"],
+                    row["selected_name"], row["confidence"], row["decision"],
+                    row["model"], now_stamp(),
+                )
+            )
+            if len(batch) >= batch_size:
+                conn.executemany(insert_sql, batch)
+                count += len(batch)
+                batch.clear()
+                conn.commit()
+                print(f"Applied {count:,} grant-level AI matches...", flush=True)
+        if batch:
+            conn.executemany(insert_sql, batch)
+            count += len(batch)
+            conn.commit()
+
+        print("Bulk apply complete; indexing and validating the hidden table...", flush=True)
+        index_token = f"{os.getpid()}_{time.time_ns()}"
+        create_applied_indexes(
+            conn,
+            APPLIED_STAGING_TABLE,
+            index_prefix=f"idx_ai_applied_build_{index_token}",
+            analyze=False,
+        )
+        _install_staged_applied_layer(conn, source_sql, params, count)
+        print(
+            f"Applied {count:,} grant-level AI matches into {APPLIED_TABLE}; "
+            f"final view is {FINAL_VIEW}",
+            flush=True,
+        )
+    finally:
+        conn.close()
 
 
 
@@ -6780,7 +8802,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-fts", action="store_true", help="Disable FTS even in broad candidate mode")
     p.add_argument("--commit-every", type=int, default=5000)
     p.add_argument("--status-update-every", type=int, default=0,
-                   help="Bulk-update signature candidate_count/queue status every N processed signatures; default 0 updates only at end for maximum speed")
+                   help="Bulk-update signature candidate status/provenance every N processed signatures; default 0 uses a bounded automatic 100,000-row batch")
     p.set_defaults(func=cmd_generate_candidates)
 
     p = sub.add_parser("test-ollama", help="Send one tiny structured test request to Ollama and print diagnostics")
@@ -7018,6 +9040,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--progress-every", type=int, default=10000)
     p.set_defaults(func=cmd_migrate_reviewed_decisions)
 
+    p = sub.add_parser(
+        "repair-rule-nonselect-identities",
+        help=(
+            "Audit and narrowly clear leaked selected identity columns from verified legacy "
+            "reported-EIN HUMAN_REVIEW/NO_MATCH rule rows"
+        ),
+    )
+    add_common_db(p)
+    p.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the verified cleanup in one exclusive transaction; default is a read-only dry run.",
+    )
+    p.add_argument("--audit-csv", default="exports/rule_nonselect_identity_repair_audit.csv")
+    p.add_argument("--overwrite-audit", action="store_true", help="Atomically replace an existing audit CSV.")
+    p.set_defaults(func=cmd_repair_rule_nonselect_identities)
+
     p = sub.add_parser("nonadjudicable-recipient-triage", help="Create no-AI NO_MATCH/HUMAN_REVIEW decisions for See Attachment / Various / placeholder recipient signatures")
     add_common_db(p)
     p.add_argument("--regenerate", action="store_true", help="Overwrite/include signatures that already have a decision")
@@ -7211,7 +9250,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("apply-decisions", help="Apply accepted decisions to separate table and final view")
     add_common_db(p)
-    p.add_argument("--full-refresh", action="store_true")
+    p.add_argument(
+        "--full-refresh",
+        action="store_true",
+        required=True,
+        help="Required: atomically replace the complete applied layer; incremental application is unsafe and disabled.",
+    )
     p.add_argument("--min-confidence", type=float, default=0.0, help="Optional minimum confidence for applying auto-accepted decisions. v1.28 default is 0.0 because valid AI SELECT_CANDIDATE decisions are accepted by policy.")
     p.add_argument("--batch-size", type=int, default=50000)
     p.set_defaults(func=cmd_apply_decisions)

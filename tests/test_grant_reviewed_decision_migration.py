@@ -29,8 +29,18 @@ def create_work_db(path: Path) -> None:
           signature_hash TEXT PRIMARY KEY,
           reported_ein TEXT,
           recipient_name TEXT,
+          recipient_name_norm TEXT,
+          street_norm TEXT,
+          city TEXT,
+          state TEXT,
+          zip5 TEXT,
+          country TEXT,
           sample_grantor_ein TEXT,
+          candidate_count INTEGER,
           ai_queue_status TEXT,
+          candidate_generation_phase TEXT,
+          candidate_generation_run_id TEXT,
+          candidate_generation_version TEXT,
           updated_at TEXT
         );
         CREATE TABLE grant_recipient_ai_candidate (
@@ -65,8 +75,32 @@ def add_signature(
 ) -> None:
     conn = sqlite3.connect(work_db)
     conn.execute(
-        "INSERT INTO grant_recipient_signature VALUES (?,?,?,?,?,?)",
-        (signature_hash, reported_ein, "Learning Policy Institute", "999999990", "candidates_ready", "fixture"),
+        """
+        INSERT INTO grant_recipient_signature (
+          signature_hash, reported_ein, recipient_name, recipient_name_norm,
+          street_norm, city, state, zip5, country, sample_grantor_ein,
+          candidate_count, ai_queue_status, candidate_generation_phase,
+          candidate_generation_run_id, candidate_generation_version, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            signature_hash,
+            reported_ein,
+            "Learning Policy Institute",
+            "LEARNING POLICY INSTITUTE",
+            "",
+            "",
+            "",
+            "",
+            "US",
+            "999999990",
+            1,
+            "candidates_ready",
+            "pending",
+            None,
+            None,
+            "fixture",
+        ),
     )
     conn.execute(
         "INSERT INTO grant_recipient_ai_candidate VALUES (?,?,?,?,?,?)",
@@ -80,6 +114,181 @@ def add_signature(
     target.execute("INSERT INTO grant_recipient_resolved(grant_id) VALUES (?)", (grant_id,))
     target.commit()
     target.close()
+
+
+def add_signature_without_candidate(
+    target_db: Path,
+    work_db: Path,
+    signature_hash: str,
+    *,
+    candidate_count=0,
+    queue_status: str = "no_candidates",
+) -> None:
+    conn = sqlite3.connect(work_db)
+    conn.execute(
+        """
+        INSERT INTO grant_recipient_signature (
+          signature_hash, reported_ein, recipient_name, recipient_name_norm,
+          street_norm, city, state, zip5, country, sample_grantor_ein,
+          candidate_count, ai_queue_status, candidate_generation_phase,
+          candidate_generation_run_id, candidate_generation_version, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            signature_hash,
+            "",
+            "No Candidate Fixture",
+            "NO CANDIDATE FIXTURE",
+            "",
+            "",
+            "",
+            "",
+            "US",
+            "999999990",
+            candidate_count,
+            queue_status,
+            "pending",
+            None,
+            None,
+            "fixture",
+        ),
+    )
+    grant_id = conn.execute(
+        "SELECT COALESCE(MAX(grant_id),0)+1 FROM grant_recipient_signature_grant"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO grant_recipient_signature_grant VALUES (?,?)",
+        (signature_hash, grant_id),
+    )
+    conn.commit()
+    conn.close()
+    target = sqlite3.connect(target_db)
+    target.execute(
+        "INSERT INTO grant_recipient_resolved(grant_id) VALUES (?)",
+        (grant_id,),
+    )
+    target.commit()
+    target.close()
+
+
+def certify_candidate_runs(target_db: Path, work_db: Path) -> None:
+    """Create a tiny valid fast->balanced provenance chain for migration fixtures."""
+    conn = sqlite3.connect(target_db)
+    conn.row_factory = sqlite3.Row
+    conn.execute("ATTACH DATABASE ? AS grant_work", (str(work_db),))
+    gai._ensure_candidate_generation_provenance_schema(conn)
+    signature_count, signature_fingerprint = gai.candidate_signature_population_fingerprint(conn)
+    defaults = dict(
+        regenerate=False,
+        state=None,
+        min_total_amount=None,
+        limit=None,
+        max_candidates=20,
+        min_candidate_score=45.0,
+        enough_candidates=8,
+        token_limit=50,
+        no_fts=False,
+    )
+    fast_args = SimpleNamespace(
+        **defaults,
+        full_refresh=True,
+        queue_status=None,
+        candidate_mode="fast",
+    )
+    balanced_args = SimpleNamespace(
+        **defaults,
+        full_refresh=False,
+        queue_status="no_candidates",
+        candidate_mode="balanced",
+    )
+    fast_scope, fast_config, fast_config_hash = gai._candidate_run_config(fast_args)
+    balanced_scope, balanced_config, balanced_config_hash = gai._candidate_run_config(
+        balanced_args
+    )
+    no_candidate_count = int(
+        conn.execute(
+            f"SELECT COUNT(*) FROM {gai.SIG_TABLE} s "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {gai.CAND_TABLE} c "
+            "WHERE c.signature_hash=s.signature_hash)"
+        ).fetchone()[0]
+    )
+    with_candidate_count = signature_count - no_candidate_count
+    conn.execute(f"DELETE FROM {gai.CAND_RUN_TABLE}")
+    run_columns = (
+        "run_id, generator_version, workflow_phase, candidate_mode, run_status, "
+        "full_refresh, regenerate, scope_json, config_json, config_fingerprint, "
+        "signature_count, signature_fingerprint, selected_count, processed_count, "
+        "with_candidates_count, base_fast_run_id, started_at, completed_at, error_message"
+    )
+    conn.execute(
+        f"INSERT INTO {gai.CAND_RUN_TABLE} ({run_columns}) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "RUN_FAST",
+            gai.CANDIDATE_GENERATION_VERSION,
+            "fast_full",
+            "fast",
+            "completed",
+            1,
+            0,
+            fast_scope,
+            fast_config,
+            fast_config_hash,
+            signature_count,
+            signature_fingerprint,
+            signature_count,
+            signature_count,
+            with_candidate_count,
+            None,
+            "fixture",
+            "fixture",
+            None,
+        ),
+    )
+    conn.execute(
+        f"INSERT INTO {gai.CAND_RUN_TABLE} ({run_columns}) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "RUN_BALANCED",
+            gai.CANDIDATE_GENERATION_VERSION,
+            "balanced_no_candidates",
+            "balanced",
+            "completed",
+            0,
+            0,
+            balanced_scope,
+            balanced_config,
+            balanced_config_hash,
+            signature_count,
+            signature_fingerprint,
+            no_candidate_count,
+            no_candidate_count,
+            0,
+            "RUN_FAST",
+            "fixture",
+            "fixture",
+            None,
+        ),
+    )
+    conn.execute(
+        f"""
+        UPDATE {gai.SIG_TABLE}
+        SET candidate_generation_phase=CASE
+              WHEN EXISTS (
+                SELECT 1 FROM {gai.CAND_TABLE} c
+                WHERE c.signature_hash={gai.SIG_BASE}.signature_hash
+              ) THEN 'fast' ELSE 'balanced' END,
+            candidate_generation_run_id=CASE
+              WHEN EXISTS (
+                SELECT 1 FROM {gai.CAND_TABLE} c
+                WHERE c.signature_hash={gai.SIG_BASE}.signature_hash
+              ) THEN 'RUN_FAST' ELSE 'RUN_BALANCED' END,
+            candidate_generation_version=?
+        """,
+        (gai.CANDIDATE_GENERATION_VERSION,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def create_source_db(path: Path) -> None:
@@ -196,6 +405,7 @@ class ReviewedDecisionMigrationTests(unittest.TestCase):
                 "SIG_TABLE",
                 "SIG_GRANT_TABLE",
                 "CAND_TABLE",
+                "CAND_RUN_TABLE",
             )
         }
 
@@ -203,8 +413,16 @@ class ReviewedDecisionMigrationTests(unittest.TestCase):
         for name, value in self.saved_globals.items():
             setattr(gai, name, value)
 
-    def configure(self, target_db: Path, work_db: Path) -> None:
+    def configure(
+        self,
+        target_db: Path,
+        work_db: Path,
+        *,
+        certify: bool = True,
+    ) -> None:
         gai.configure_grant_work_sidecar(str(target_db), str(work_db))
+        if certify:
+            certify_candidate_runs(target_db, work_db)
 
     def test_dry_run_is_read_only_and_excludes_rule_decisions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -707,6 +925,449 @@ class ReviewedDecisionMigrationTests(unittest.TestCase):
             for db_path in (target_db, work_db):
                 conn = sqlite3.connect(db_path)
                 self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
+                conn.close()
+
+    def test_readiness_accepts_exact_zero_candidate_and_adjudicated_states(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            add_signature(target_db, work_db, "SIG_ADJUDICATED_SELECT")
+            conn = sqlite3.connect(work_db)
+            conn.execute(
+                "UPDATE grant_recipient_signature SET ai_queue_status='adjudicated' "
+                "WHERE signature_hash='SIG_ADJUDICATED_SELECT'"
+            )
+            conn.commit()
+            conn.close()
+            add_signature_without_candidate(
+                target_db,
+                work_db,
+                "SIG_NO_CANDIDATES",
+                queue_status="no_candidates",
+            )
+            add_signature_without_candidate(
+                target_db,
+                work_db,
+                "SIG_ADJUDICATED_NO_MATCH",
+                queue_status="adjudicated",
+            )
+            target = sqlite3.connect(target_db)
+            gai.create_decision_schema(target)
+            placeholders = ",".join("?" for _ in gai.DECISION_COLUMNS)
+            target.execute(
+                f"INSERT INTO grant_recipient_ai_decision "
+                f"({','.join(gai.DECISION_COLUMNS)}) VALUES ({placeholders})",
+                decision_tuple("SIG_ADJUDICATED_SELECT"),
+            )
+            no_match_row = list(
+                decision_tuple(
+                    "SIG_ADJUDICATED_NO_MATCH",
+                    decision="NO_MATCH",
+                    candidate_id="",
+                    selected_ein="",
+                )
+            )
+            no_match_row[4] = ""
+            target.execute(
+                f"INSERT INTO grant_recipient_ai_decision "
+                f"({','.join(gai.DECISION_COLUMNS)}) VALUES ({placeholders})",
+                no_match_row,
+            )
+            target.commit()
+            target.close()
+            insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+            self.configure(target_db, work_db)
+            args = migration_args(root, source_db, target_db, work_db, suffix="valid-counts")
+
+            gai.cmd_migrate_reviewed_decisions(args)
+
+            with Path(args.audit_csv).open(newline="", encoding="utf-8-sig") as fh:
+                audit_rows = list(csv.DictReader(fh))
+            self.assertEqual(len(audit_rows), 1)
+            self.assertEqual(audit_rows[0]["status"], "eligible")
+
+    def test_readiness_rejects_stale_candidate_counts_and_queue_semantics(self):
+        cases = (
+            (
+                "balanced_interruption",
+                "UPDATE grant_recipient_signature SET candidate_count=0, "
+                "ai_queue_status='no_candidates' WHERE signature_hash='SIG_VALID'",
+                None,
+                "no_candidates.*zero candidate rows",
+            ),
+            (
+                "stored_count_mismatch",
+                "UPDATE grant_recipient_signature SET candidate_count=2 "
+                "WHERE signature_hash='SIG_VALID'",
+                None,
+                "stored candidate_count=2.*candidate table has 1",
+            ),
+            (
+                "ready_without_candidate",
+                "UPDATE grant_recipient_signature SET candidate_count=0 "
+                "WHERE signature_hash='SIG_VALID'",
+                "DELETE FROM grant_recipient_ai_candidate "
+                "WHERE signature_hash='SIG_VALID'",
+                "candidates_ready.*at least one candidate row",
+            ),
+            (
+                "adjudicated_count_mismatch",
+                "UPDATE grant_recipient_signature SET candidate_count=0, "
+                "ai_queue_status='adjudicated' WHERE signature_hash='SIG_VALID'",
+                None,
+                "stored candidate_count=0.*candidate table has 1",
+            ),
+            (
+                "stored_positive_without_candidate",
+                "UPDATE grant_recipient_signature SET candidate_count=1, "
+                "ai_queue_status='no_candidates' WHERE signature_hash='SIG_VALID'",
+                "DELETE FROM grant_recipient_ai_candidate "
+                "WHERE signature_hash='SIG_VALID'",
+                "stored candidate_count=1.*candidate table has 0",
+            ),
+            (
+                "null_count",
+                "UPDATE grant_recipient_signature SET candidate_count=NULL "
+                "WHERE signature_hash='SIG_VALID'",
+                None,
+                "stored candidate_count=None.*candidate table has 1",
+            ),
+            (
+                "invalid_new_status",
+                "UPDATE grant_recipient_signature SET ai_queue_status='new' "
+                "WHERE signature_hash='SIG_VALID'",
+                None,
+                "candidate generation is incomplete.*queue status 'new'",
+            ),
+        )
+        for case, signature_sql, candidate_sql, expected in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source_db = root / "source.db"
+                target_db = root / "target.db"
+                work_db = root / "work.db"
+                create_source_db(source_db)
+                create_empty_db(target_db)
+                create_work_db(work_db)
+                add_signature(target_db, work_db, "SIG_VALID")
+                insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+                conn = sqlite3.connect(work_db)
+                conn.execute(signature_sql)
+                if candidate_sql:
+                    conn.execute(candidate_sql)
+                conn.commit()
+                conn.close()
+                self.configure(target_db, work_db)
+                args = migration_args(
+                    root,
+                    source_db,
+                    target_db,
+                    work_db,
+                    suffix=case,
+                )
+
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    gai.cmd_migrate_reviewed_decisions(args)
+                self.assertFalse(Path(args.audit_csv).exists())
+                self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_rejects_candidate_rows_without_a_signature(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+            conn = sqlite3.connect(work_db)
+            conn.execute(
+                "INSERT INTO grant_recipient_ai_candidate VALUES (?,?,?,?,?,?)",
+                ("SIG_ORPHAN", "C1", 1, TARGET_EIN, "Orphan", 95),
+            )
+            conn.commit()
+            conn.close()
+            self.configure(target_db, work_db)
+            args = migration_args(root, source_db, target_db, work_db, suffix="orphan-candidate")
+
+            with self.assertRaisesRegex(RuntimeError, "candidate row.*no signature row"):
+                gai.cmd_migrate_reviewed_decisions(args)
+            self.assertFalse(Path(args.audit_csv).exists())
+            self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_rejects_blank_candidate_signature_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+            self.configure(target_db, work_db)
+            work = sqlite3.connect(work_db)
+            work.execute(
+                "INSERT INTO grant_recipient_ai_candidate VALUES (?,?,?,?,?,?)",
+                ("", "C1", 1, TARGET_EIN, "Blank hash", 95),
+            )
+            work.commit()
+            work.close()
+            args = migration_args(root, source_db, target_db, work_db, suffix="blank-hash")
+
+            with self.assertRaisesRegex(RuntimeError, "blank/malformed signature_hash"):
+                gai.cmd_migrate_reviewed_decisions(args)
+            self.assertFalse(Path(args.audit_csv).exists())
+            self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_requires_candidate_count_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+            conn = sqlite3.connect(work_db)
+            conn.execute(
+                "ALTER TABLE grant_recipient_signature DROP COLUMN candidate_count"
+            )
+            conn.commit()
+            conn.close()
+            self.configure(target_db, work_db)
+            args = migration_args(root, source_db, target_db, work_db, suffix="missing-count")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "missing required columns: candidate_count",
+            ):
+                gai.cmd_migrate_reviewed_decisions(args)
+            self.assertFalse(Path(args.audit_csv).exists())
+            self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_rejects_valid_looking_zero_row_without_balanced_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature_without_candidate(target_db, work_db, "SIG_ZERO")
+            insert_source_decision(
+                source_db,
+                decision_tuple(
+                    "SIG_ZERO",
+                    decision="NO_MATCH",
+                    candidate_id="",
+                    selected_ein="",
+                ),
+            )
+            self.configure(target_db, work_db)
+            work = sqlite3.connect(work_db)
+            work.execute(
+                "UPDATE grant_recipient_signature "
+                "SET candidate_generation_phase='fast', "
+                "candidate_generation_run_id='RUN_FAST' "
+                "WHERE signature_hash='SIG_ZERO'"
+            )
+            work.commit()
+            work.close()
+            args = migration_args(root, source_db, target_db, work_db, suffix="unbalanced-zero")
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "zero-candidate signatures require completed balanced coverage",
+            ):
+                gai.cmd_migrate_reviewed_decisions(args)
+            self.assertFalse(Path(args.audit_csv).exists())
+            self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_rejects_incomplete_or_stale_run_evidence(self):
+        cases = (
+            (
+                "incomplete_balanced",
+                "UPDATE grant_recipient_candidate_generation_run "
+                "SET run_status='running', processed_count=0, completed_at=NULL "
+                "WHERE run_id='RUN_BALANCED'",
+                "Latest candidate-generation run is not a completed",
+            ),
+            (
+                "stale_signature_population",
+                "UPDATE grant_recipient_signature "
+                "SET recipient_name_norm='CHANGED AFTER GENERATION' "
+                "WHERE signature_hash='SIG_VALID'",
+                "Current signature population does not match",
+            ),
+            (
+                "forged_config",
+                "UPDATE grant_recipient_candidate_generation_run "
+                "SET config_fingerprint='CANDCFG_FORGED' "
+                "WHERE run_id='RUN_BALANCED'",
+                "stale/invalid config fingerprint",
+            ),
+            (
+                "completed_count_mismatch",
+                "UPDATE grant_recipient_candidate_generation_run "
+                "SET processed_count=selected_count+1 "
+                "WHERE run_id='RUN_BALANCED'",
+                "did not process its exact selected scope",
+            ),
+            (
+                "stale_per_signature_version",
+                "UPDATE grant_recipient_signature "
+                "SET candidate_generation_version='legacy' "
+                "WHERE signature_hash='SIG_VALID'",
+                "candidate-generation version is missing or stale",
+            ),
+        )
+        for case, mutation, expected in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source_db = root / "source.db"
+                target_db = root / "target.db"
+                work_db = root / "work.db"
+                create_source_db(source_db)
+                create_empty_db(target_db)
+                create_work_db(work_db)
+                add_signature(target_db, work_db, "SIG_VALID")
+                insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+                self.configure(target_db, work_db)
+                work = sqlite3.connect(work_db)
+                work.execute(mutation)
+                work.commit()
+                work.close()
+                args = migration_args(root, source_db, target_db, work_db, suffix=case)
+
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    gai.cmd_migrate_reviewed_decisions(args)
+                self.assertFalse(Path(args.audit_csv).exists())
+                self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_rejects_legacy_candidate_generation_without_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_db = root / "source.db"
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_source_db(source_db)
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+            self.configure(target_db, work_db, certify=False)
+            args = migration_args(root, source_db, target_db, work_db, suffix="no-ledger")
+
+            with self.assertRaisesRegex(RuntimeError, "no durable candidate-generation run ledger"):
+                gai.cmd_migrate_reviewed_decisions(args)
+            self.assertFalse(Path(args.audit_csv).exists())
+            self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_requires_adjudicated_decision_integrity(self):
+        cases = (
+            "adjudicated_without_decision",
+            "orphan_decision",
+            "select_missing_current_candidate",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source_db = root / "source.db"
+                target_db = root / "target.db"
+                work_db = root / "work.db"
+                create_source_db(source_db)
+                create_empty_db(target_db)
+                create_work_db(work_db)
+                add_signature(target_db, work_db, "SIG_VALID")
+                insert_source_decision(source_db, decision_tuple("SIG_VALID"))
+                if case == "adjudicated_without_decision":
+                    work = sqlite3.connect(work_db)
+                    work.execute(
+                        "UPDATE grant_recipient_signature "
+                        "SET ai_queue_status='adjudicated'"
+                    )
+                    work.commit()
+                    work.close()
+                    expected = "adjudicated signature but no decision table"
+                else:
+                    target = sqlite3.connect(target_db)
+                    gai.create_decision_schema(target)
+                    placeholders = ",".join("?" for _ in gai.DECISION_COLUMNS)
+                    target.execute(
+                        f"INSERT INTO grant_recipient_ai_decision "
+                        f"({','.join(gai.DECISION_COLUMNS)}) VALUES ({placeholders})",
+                        decision_tuple(
+                            "SIG_ORPHAN" if case == "orphan_decision" else "SIG_VALID",
+                            candidate_id=(
+                                "C_MISSING"
+                                if case == "select_missing_current_candidate"
+                                else "C1"
+                            ),
+                        ),
+                    )
+                    target.commit()
+                    target.close()
+                    if case == "select_missing_current_candidate":
+                        work = sqlite3.connect(work_db)
+                        work.execute(
+                            "UPDATE grant_recipient_signature "
+                            "SET ai_queue_status='adjudicated'"
+                        )
+                        work.commit()
+                        work.close()
+                        expected = "does not reference an exact current candidate_id/EIN row"
+                    else:
+                        expected = "has no matching signature row"
+                self.configure(target_db, work_db)
+                args = migration_args(root, source_db, target_db, work_db, suffix=case)
+
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    gai.cmd_migrate_reviewed_decisions(args)
+                self.assertFalse(Path(args.audit_csv).exists())
+                self.assertFalse(Path(args.quarantine_jsonl).exists())
+
+    def test_readiness_streaming_scans_use_signature_indexes_without_temp_sort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target_db = root / "target.db"
+            work_db = root / "work.db"
+            create_empty_db(target_db)
+            create_work_db(work_db)
+            add_signature(target_db, work_db, "SIG_VALID")
+            self.configure(target_db, work_db)
+            conn = gai._connect_migration_target(
+                str(target_db),
+                str(work_db),
+                readonly=True,
+            )
+            try:
+                for sql in gai._candidate_consistency_scan_sql():
+                    details = [
+                        str(row[3]).upper()
+                        for row in conn.execute("EXPLAIN QUERY PLAN " + sql)
+                    ]
+                    self.assertFalse(
+                        any("TEMP B-TREE" in detail for detail in details),
+                        details,
+                    )
+                    self.assertTrue(
+                        any("INDEX" in detail for detail in details),
+                        details,
+                    )
+            finally:
                 conn.close()
 
     def test_readiness_requires_complete_signature_grant_references(self):

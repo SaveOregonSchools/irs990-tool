@@ -9,15 +9,15 @@ PowerShell.
 > finding. Name matches, network links, and external records are investigative
 > leads. Verify identity, dates, source records, and context before escalation.
 
-## Deployment state on August 14, 2026
+## Deployment state on August 15, 2026
 
 | Operation | State in this workspace |
 |---|---|
 | Full IRS/OFAC/HHS screening download and atomic sidecar build | **Run.** `db\screening_data.db` exists (about 1.82 GiB). |
-| Full risk-network planning command | **Run read-only.** It estimated 5,723,809 filings and 98,925,700 possible source rows. |
+| Full risk-network planning command | **Run read-only.** The latest plan estimated 5,723,809 filings, a 92,650,326 source-row ceiling, and a 25.9-56.1 GiB finished sidecar. |
 | FAC current/historical bulk download and sidecar build | **Run and verified.** `db\fac_audits.db` is 24.32 GiB, source-as-of August 14, 2026, and covers 19,153,987 accepted source rows and 1,135,938 reports from 1998–2026. |
-| Production child-row replay audit/repair and post-repair grant rebuild | **Not run.** Complete these before the first full network build. |
-| Full risk-network build | **Not run.** `db\risk_network.db` is absent. |
+| Production child-row replay audit/repair and post-repair grant rebuild | **Completed and verified.** The repaired main database is `db\irs990-repaired-20260815-003434.db`; its matching grant workspace and enhanced applied layer are complete. |
+| Full risk-network build | **Running on `C:`.** It reads `db\irs990-repaired-20260815-003434.db`, stages a `.building-*` database beside the `db\risk_network.db` target, and uses `db\_risk_network_tmp` for SQLite scratch. `db\risk_network.db` is not published until final validation and atomic replacement succeed. |
 | Personal API registration and secret installation | **Not performed.** Shared `DEMO_KEY` values are configured for FAC/FEC development but can exhaust their shared quota; no SAM key is installed. Secret values were not printed. |
 
 ## Credentials and no-key coverage
@@ -322,36 +322,75 @@ Use this order; do not build the global network from the known-dirty children:
    & $python grant_ai_assist_v1.py apply-decisions --db $main --work-db $work --full-refresh
    ```
 
-5. **Cut over the validated main DB, then build the risk network.** Update
-   `IRS_DB_PATH`, restart, smoke-test local dashboard results, and only then run
-   the full network commands below. Keep writers stopped through the network
-   snapshot so the source WAL cannot grow for hours.
+5. **Cut over the validated main/work pair, then build the risk network.** Update
+   both `IRS_DB_PATH` and `IRS_GRANT_WORK_DB_PATH` to the matching versioned
+   files, restart every long-lived process, smoke-test local dashboard results,
+   and only then run the full network commands below. Updating only the main
+   path would fall back to the generic sibling `grant_matching_work.db`. Keep
+   writers stopped through the network snapshot so the source WAL cannot grow
+   for hours.
 
 ## Full risk-network build
 
-Re-run the read-only plan after repair/cutover because its estimate depends on
-current SQLite statistics. Replace the path below if `.env` points
-`IRS_DB_PATH` at a versioned file:
+The user-authorized production build is running on `C:`. It uses the repaired
+versioned source, stages its same-directory temporary database beside the final
+sidecar, and keeps SQLite sort scratch under `db`. Do not launch a second
+builder while this run is active. These are the current paths and the capacity
+preflight to repeat before a future rebuild:
 
 ```powershell
-.\.venv\Scripts\python.exe build_risk_network.py plan --db db\irs990.db --full
+$networkSource = (Resolve-Path 'db\irs990-repaired-20260815-003434.db').Path
+$networkRoot = (Resolve-Path 'db').Path
+$networkSidecar = Join-Path $networkRoot 'risk_network.db'
+$networkScratch = Join-Path $networkRoot '_risk_network_tmp'
+New-Item -ItemType Directory -Force -Path $networkScratch | Out-Null
+$networkDrive = Get-PSDrive -Name C
+$networkDrive | Select-Object Name,Root,@{Name='FreeGiB';Expression={[math]::Round($_.Free / 1GB, 2)}}
+if ($networkDrive.Free -lt 180GB) {
+  throw 'C: has less than the conservative 180 GiB free-space floor.'
+}
 ```
 
-The August 14 plan estimated a **27.6-59.9 GiB** finished sidecar. Reserve at
-least about **70 GiB free for a first build**; an atomic replacement can briefly
-need the old and new sidecars together, so budget roughly **130 GiB** when
-refreshing a near-upper-bound sidecar. Runtime has not been measured here.
-Treat it as a multi-hour/overnight maintenance job and monitor free space; the
-builder writes a temporary database and atomically replaces only a completed
-sidecar.
+The latest plan estimated a **25.9-56.1 GiB** finished sidecar. Budget a
+conservative **two to three times final size** for the `.building-*` database,
+old sidecar during replacement, rollback/index work, and SQLite sort scratch.
+Retain a conservative **180 GiB free-space floor** and recheck current `C:`
+capacity rather than relying on an older snapshot. Keep process-local
+`TEMP`/`TMP` on `$networkScratch` while the builder runs so index-sort scratch
+also remains on `C:`. Treat it as a multi-hour/overnight maintenance job and
+monitor free space.
 
-Full command (not yet run here):
+Stop every writer, checkpoint the source WAL, inspect the plan, and only then
+run the confirmed full build. The plan requires the enhanced grant view and all
+source `filing_id` indexes; rebuild start additionally proves unique grant keys,
+exact `(grant_id, filing_id)` ownership across the raw/resolver/enhanced layers,
+artifact-backed enhanced provenance, and an independent nonzero selected-filing
+count. Selector syntax, missing filing IDs, reversed year ranges, expression or
+non-BINARY lookup indexes, and nullable pseudo-keys fail closed. Atomic
+publication also refuses a
+populated WAL or rollback journal beside an old destination, because those old
+pages could otherwise be replayed over the validated replacement. See
+[Precomputed risk-network sidecar](risk-network.md) for the complete path, WAL,
+stale-temp, provenance-scoring, validation, and cutover checks.
 
 ```powershell
-.\.venv\Scripts\python.exe build_risk_network.py rebuild `
-  --db db\irs990.db `
-  --full `
-  --yes
+$networkPython = (Resolve-Path '.\.venv\Scripts\python.exe').Path
+& $networkPython -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone(); print(r); c.close(); assert r[0] == 0 and r[1] == r[2], r" $networkSource
+
+$networkPreviousTemp = $env:TEMP
+$networkPreviousTmp = $env:TMP
+try {
+  $env:TEMP = $networkScratch
+  $env:TMP = $networkScratch
+  & $networkPython build_risk_network.py plan --db $networkSource --sidecar $networkSidecar --full
+  if ($LASTEXITCODE -ne 0) { throw 'Risk-network plan failed.' }
+  & $networkPython build_risk_network.py rebuild --db $networkSource --sidecar $networkSidecar --full --yes
+  if ($LASTEXITCODE -ne 0) { throw 'Risk-network rebuild failed.' }
+}
+finally {
+  $env:TEMP = $networkPreviousTemp
+  $env:TMP = $networkPreviousTmp
+}
 ```
 
 After completion, restart Flask, rerun the local `available()` smoke check, and

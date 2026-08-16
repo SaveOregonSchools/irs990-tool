@@ -247,6 +247,21 @@ Then run balanced mode for signatures without candidates:
 py grant_ai_assist_v1.py generate-candidates --candidate-mode balanced --queue-status no_candidates
 ```
 
+These two commands are one certified workflow. The generator now records a
+durable run ledger plus each signature's phase, run ID, and generator version.
+It marks the exact selected scope pending before changing candidates and marks a
+run complete only after its selected and processed counts match. Balanced mode
+requires the immediately preceding completed, unfiltered, current-version fast
+full refresh. If either command is interrupted or fails, do not infer progress
+from candidate/status rows and do not resume with balanced alone: rerun the
+unfiltered fast `--full-refresh` command, then rerun the balanced
+`--queue-status no_candidates` command. Candidate runs produced by older code
+have no durable completion evidence and require the same two-command rerun.
+The default `--status-update-every 0` now means an automatic bounded
+100,000-signature status/provenance flush (never an all-run in-memory staging
+table). Set a positive value only for deliberate tuning; it changes flush
+frequency, not candidate results or certification rules.
+
 Use broad mode only for targeted batches:
 
 ```powershell
@@ -582,7 +597,32 @@ py grant_ai_assist_v1.py build-signatures --full-refresh
 py grant_ai_assist_v1.py generate-candidates --full-refresh --candidate-mode fast
 ```
 
-`apply-decisions --full-refresh` is safe and comparatively lightweight. It rebuilds the applied/final layer from existing decisions.
+`apply-decisions` requires the explicit `--full-refresh` flag and has no
+incremental mode. Incremental application can retain a match after its decision
+is revoked, invalidated, or moved below `--min-confidence`, so the command
+refuses to run without a complete staged replacement. It is comparatively
+lightweight, but it is still a production cutover step. It refuses a missing or
+non-file main/work path and checks the required decision, resolved-grant,
+signature, mapping, and candidate objects before rebuilding.
+
+Readiness also merge-walks two index-ordered streams and proves every
+adjudicated decision's `candidate_set_hash` against its complete current
+candidate rows without per-signature queries, an in-memory all-row structure,
+or a temporary grouped sort. A changed candidate ID, EIN, score, rank, or set
+fails before the hidden table is created. The sole prefix exception is for the
+two audited legacy reported-EIN non-selection repair shapes; those rows must be
+`HUMAN_REVIEW`/`NO_MATCH` with `auto_accept=0` and therefore cannot enter the
+applied layer. Current selectable, rule-generated, and migrated decisions
+require the exact complete candidate-set hash.
+
+The command loads and indexes a hidden applied table, rechecks that it exactly
+matches the current accepted decisions, and replaces the visible applied table
+and final view in one transaction. `--min-confidence` is inclusive; the default
+`0.0` adds no threshold beyond the validated auto-accept policy. A preflight,
+load/index, validation, or transactional view-creation failure leaves the prior
+visible applied/final layer intact. A hard interruption can leave only the
+hidden `grant_recipient_ai_applied__building` table; a rerun removes that stale
+build table after readiness passes and starts cleanly.
 
 ### Migrate reviewed decisions after a clean rebuild
 
@@ -612,9 +652,83 @@ $work = "db\grant_matching_work-repaired-YYYYMMDD-HHMMSS.db"
 
 The migration readiness check requires every signature to have a
 `signature_grant` mapping, every mapping to reference an existing signature and
-rebuilt resolved grant, every signature to have completed candidate generation,
-and all required columns to exist. Run the migration first in its default
+rebuilt resolved grant, and all required columns to exist. It requires the
+latest candidate runs to be an uninterrupted completed current-version
+unfiltered fast-full-refresh then balanced-`no_candidates` pair. Both runs must
+reference the same exact signature-population fingerprint, use compatible
+candidate limits/thresholds, and have equal selected and processed counts.
+Every signature must reference one of those completed runs; a zero-candidate
+signature specifically needs balanced coverage, so a balanced interruption
+cannot masquerade as a valid fast `no_candidates` result.
+
+The check then uses indexed, ordered streams (constant Python memory) to require
+every stored `candidate_count` to equal its exact candidate-row count, reject
+orphan/blank candidate keys, require `no_candidates` to mean zero rows and
+`candidates_ready` to mean at least one, and permit `adjudicated` only with a
+matching target decision. A decision represented as currently `adjudicated`
+must still reference the exact candidate ID/EIN for `SELECT_CANDIDATE`, while
+nonselect decisions cannot retain selected identity fields. Preexisting target
+decisions whose signature is no longer marked adjudicated may remain only as
+stale/conflict inputs to the migration's row-level revalidation; orphan target
+decisions are rejected. Dry runs hold one read snapshot through all checks and
+report generation; apply runs hold an exclusive transaction through readiness
+and writes. If any readiness check fails, rerun the clean full-refresh fast
+command above and then balanced for `--queue-status no_candidates` before
+migrating.
+
+Older builds of `reported-ein-triage` could store the filing EIN and/or an
+identity name in the selected-output columns of a `HUMAN_REVIEW` or `NO_MATCH`
+row even though its `output_json` correctly made no selection. Current code
+normalizes all non-selection rule rows and the shared decision writer rejects
+selected identity on any non-selection decision. If migration readiness reports
+this exact legacy defect, do **not** rerun triage with `--regenerate`: that could
+replace an already migrated review. First run the narrow repair in its default
 read-only mode:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+& $python grant_ai_assist_v1.py repair-rule-nonselect-identities `
+  --db $main `
+  --work-db $work `
+  --audit-csv "exports\rule-nonselect-identity-repair-dry-$stamp.csv"
+```
+
+The repair recognizes only the historical
+`rule:reported_ein_no_ai_review`/`HUMAN_REVIEW` and
+`rule:invalid_reported_ein_no_ai`/`HUMAN_REVIEW|NO_MATCH` producer shapes. It
+requires an exact current signature snapshot, canonical stored booleans, clean
+validation, prompt/input/output parity, the expected model and branch reasons,
+a blank selected candidate ID, an exact ordered current-candidate prefix hash,
+retained reported-EIN/name evidence, an `adjudicated` current signature, and no
+applied row. An empty stored candidate set is accepted only when the current set
+is also empty. The defensive `reported_ein_unhandled` fallback has no
+independently reproducible historical producer state, so it is audited and
+refused for manual review rather than normalized automatically. The audit
+contains every original decision column. Any unexpected malformed
+non-selection row refuses the whole operation and remains unchanged.
+
+After reviewing the audit, stop every writer and apply with a new audit path:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+& $python grant_ai_assist_v1.py repair-rule-nonselect-identities `
+  --db $main `
+  --work-db $work `
+  --audit-csv "exports\rule-nonselect-identity-repair-apply-$stamp.csv" `
+  --apply
+```
+
+Apply clears only `selected_candidate_id`, `selected_ein`, and `selected_name`;
+it preserves the full rule input/output, explanation, reasons, hashes, model,
+timestamps, review state, and queue status. It never updates a non-rule/manual
+decision or a `SELECT_CANDIDATE`/`KEEP_REPORTED_EIN` row. The target main/work
+pair is checked under one exclusive transaction and the pre-change CSV is
+published atomically after commit. Rerun the migration dry run immediately
+afterward. The repaired-row count must equal the dry-run eligible count, and a
+second repair dry run must report zero rows. Rebuild the applied layer later in
+the documented sequence; do not edit it directly.
+
+Run the migration first in its default read-only mode:
 
 ```powershell
 $stamp = Get-Date -Format yyyyMMdd-HHmmss
@@ -712,4 +826,23 @@ layer:
 
 Only after those commands pass should you run `stats`, refresh the web data
 statistics cache, checkpoint both DBs, validate representative grant rows, and
-cut over the repaired main/work pair together.
+cut over the repaired main/work pair together. Pass both paths explicitly to
+every command; `apply-decisions` refuses a typo instead of creating an empty
+sidecar. For the statistics CSV and web cache, collect the expensive grant
+statistics once:
+
+```powershell
+$stamp = Get-Date -Format yyyyMMdd-HHmmss
+& $python refresh_data_stats.py `
+  --db $main `
+  --work-db $work `
+  --grant-stats-csv "exports\grant-match-stats-final-$stamp.csv"
+```
+
+Stop all remaining database users before the final WAL checkpoints and keep
+them stopped through integrity/invariant checks. The application opens its
+databases with SQLite `immutable=1`, so no post-checkpoint write may occur before
+restart. At cutover set both `IRS_DB_PATH` and `IRS_GRANT_WORK_DB_PATH`; changing
+only the main path can silently pair the repaired main database with the generic
+old `grant_matching_work.db`. Restart every long-lived process because these
+paths are resolved when the Python modules are imported.

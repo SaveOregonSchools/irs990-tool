@@ -16,6 +16,7 @@ db/*.db-shm
 db/*.db-wal
 *.db-journal
 db/backup/
+db/_risk_network_tmp/
 
 # Database schema dumps
 db/*.db.sql

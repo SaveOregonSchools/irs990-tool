@@ -106,6 +106,137 @@ def _create_source(path: Path) -> None:
     conn.close()
 
 
+def _prepare_full_source(path: Path, *, include_enhanced: bool = True) -> None:
+    """Add the empty-but-indexed production source families required by --full."""
+
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_by_ein_year (
+              ein TEXT NOT NULL, tax_year INTEGER NOT NULL, filing_id TEXT NOT NULL,
+              PRIMARY KEY(ein,tax_year)
+            ) WITHOUT ROWID;
+            INSERT OR IGNORE INTO canonical_by_ein_year VALUES
+              ('111111111',2023,'F1'),('222222222',2024,'F2'),('333333333',2024,'F3');
+            CREATE INDEX IF NOT EXISTS idx_fixture_canonical_filing
+              ON canonical_by_ein_year(filing_id);
+
+            CREATE TABLE IF NOT EXISTS highest_comp_employees (
+              id INTEGER PRIMARY KEY, filing_id TEXT, person_name TEXT, title_txt TEXT,
+              comp_from_org NUMERIC, comp_from_related NUMERIC, other_compensation NUMERIC
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_highcomp_filing
+              ON highest_comp_employees(filing_id);
+            CREATE TABLE IF NOT EXISTS former_key_people (
+              id INTEGER PRIMARY KEY, filing_id TEXT, person_name TEXT, title_txt TEXT,
+              comp_from_org NUMERIC, comp_from_related NUMERIC, other_compensation NUMERIC
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_former_filing
+              ON former_key_people(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_ez_officer_director_trustee_empl_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT, person_nm TEXT, title_txt TEXT,
+              compensation_amt NUMERIC, employee_benefit_program_amt NUMERIC,
+              expense_account_other_allwnc_amt NUMERIC
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_ez_person_filing
+              ON irs990_ez_officer_director_trustee_empl_grp(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_pf_officer_dir_trst_key_empl_info_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT, person_nm TEXT, title_txt TEXT,
+              compensation_amt NUMERIC, employee_benefits_amt NUMERIC,
+              expense_account_amt NUMERIC
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_pf_person_filing
+              ON irs990_pf_officer_dir_trst_key_empl_info_grp(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_schedule_j_rltd_org_officer_trst_key_empl_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT, person_nm TEXT, title_txt TEXT,
+              total_compensation_filing_org_amt NUMERIC,
+              total_compensation_rltd_orgs_amt NUMERIC
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_schedj_person_filing
+              ON irs990_schedule_j_rltd_org_officer_trst_key_empl_grp(filing_id);
+
+            CREATE TABLE IF NOT EXISTS irs990_schedule_r_id_related_org_txbl_corp_tr_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT, ein TEXT,
+              related_organization_name_business_name_line1_txt TEXT,
+              related_organization_name_business_name_line2_txt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_schedr_corp_filing
+              ON irs990_schedule_r_id_related_org_txbl_corp_tr_grp(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_schedule_r_id_related_org_txbl_partnership_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT, ein TEXT,
+              related_organization_name_business_name_line1_txt TEXT,
+              related_organization_name_business_name_line2_txt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_schedr_partnership_filing
+              ON irs990_schedule_r_id_related_org_txbl_partnership_grp(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_schedule_r_id_disregarded_entities_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT,
+              disregarded_entity_name_business_name_line1_txt TEXT,
+              disregarded_entity_name_business_name_line2_txt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_schedr_disregarded_filing
+              ON irs990_schedule_r_id_disregarded_entities_grp(filing_id);
+            CREATE TABLE IF NOT EXISTS irs990_schedule_r_transactions_related_org_grp (
+              id INTEGER PRIMARY KEY, filing_id TEXT,
+              business_name_line1_txt TEXT, business_name_line2_txt TEXT,
+              involved_amt NUMERIC, transaction_type_txt TEXT,
+              method_of_amount_determination_txt TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_fixture_schedr_transactions_filing
+              ON irs990_schedule_r_transactions_related_org_grp(filing_id);
+
+            CREATE TABLE IF NOT EXISTS grant_recipient_ai_applied (
+              grant_id INTEGER PRIMARY KEY,
+              signature_hash TEXT NOT NULL,
+              selected_ein TEXT NOT NULL,
+              selected_name TEXT,
+              ai_confidence NUMERIC,
+              ai_decision TEXT,
+              model TEXT,
+              applied_at TEXT
+            );
+            """
+        )
+        if include_enhanced:
+            conn.executescript(
+                """
+                DROP VIEW IF EXISTS grant_recipient_resolved_plus_ai_v1;
+                CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
+                SELECT rr.*,
+                       aa.selected_ein AS ai_resolved_ein,
+                       aa.selected_name AS ai_resolved_name,
+                       aa.ai_confidence,
+                       aa.ai_decision,
+                       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                            THEN aa.selected_ein ELSE rr.resolved_ein END AS final_resolved_ein,
+                       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                            THEN aa.selected_name ELSE rr.resolved_org_name END AS final_resolved_org_name,
+                       CASE
+                         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                           AND aa.model='rule:reported_ein_identity_lookup'
+                           THEN 'reported_ein_identity_lookup'
+                         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                           AND aa.model='rule:reported_ein_address_location'
+                           THEN 'reported_ein_address_location'
+                         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                           AND aa.model='rule:reported_ein_from_filing_unverified'
+                           THEN 'reported_ein_from_filing_unverified'
+                         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                           AND aa.model LIKE 'rule:%'
+                           THEN 'reported_ein_rule'
+                         WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                           THEN 'ai_assisted'
+                         ELSE 'deterministic'
+                       END AS final_match_source,
+                       CASE WHEN aa.selected_ein IS NOT NULL AND aa.selected_ein<>''
+                            THEN aa.ai_confidence ELSE rr.confidence END AS final_confidence
+                FROM grant_recipient_resolved AS rr
+                LEFT JOIN grant_recipient_ai_applied AS aa ON aa.grant_id=rr.grant_id;
+                """
+            )
+        conn.commit()
+
+
 def _all_filings(source: Path):
     with closing(network.connect_source_readonly(source)) as conn:
         return network.select_filings(conn, max_filings=10)
@@ -253,12 +384,23 @@ def test_incremental_preserves_global_coverage_marker_after_full_build(tmp_path)
     source = tmp_path / "source.db"
     sidecar = tmp_path / "risk.db"
     _create_source(source)
+    _prepare_full_source(source)
     config = network.BuildConfig(batch_size=2)
     network.rebuild_full_sidecar(source, sidecar, config, page_size=2)
     with closing(sqlite3.connect(sidecar)) as conn:
         assert conn.execute(
             "SELECT value FROM risk_network_build_meta WHERE key='build_scope'"
         ).fetchone()[0] == "full"
+        meta = dict(conn.execute("SELECT key,value FROM risk_network_build_meta"))
+        assert meta["full_source_preflight"] == "complete"
+        assert meta["enhanced_grant_view_name"] == network.ENHANCED_GRANT_VIEW
+        assert meta["source_grant_count"] == "2"
+        assert meta["source_resolver_count"] == "2"
+        assert meta["source_enhanced_grant_count"] == "2"
+        assert meta["source_checkpoint_condition"] == "wal_absent_or_empty"
+        assert conn.execute(
+            "SELECT object_name,available FROM risk_network_source_status WHERE source_name='grants'"
+        ).fetchone() == (network.ENHANCED_GRANT_VIEW, 1)
 
     with closing(network.connect_source_readonly(source)) as conn:
         selected = network.select_filings(conn, eins=["111111111"], max_filings=10)
@@ -285,6 +427,7 @@ def test_incremental_removes_superseded_canonical_filing_edges(tmp_path):
             """
         )
         conn.commit()
+    _prepare_full_source(source)
     config = network.BuildConfig(batch_size=2)
     network.rebuild_full_sidecar(source, sidecar, config, page_size=2)
 
@@ -358,12 +501,13 @@ def test_enhanced_grant_view_takes_precedence_when_present(tmp_path):
         conn.executescript(
             """
             CREATE TABLE grant_recipient_ai_applied (
-              grant_id INTEGER PRIMARY KEY, selected_ein TEXT, selected_name TEXT,
-              ai_confidence NUMERIC, model TEXT
+              grant_id INTEGER PRIMARY KEY, signature_hash TEXT NOT NULL,
+              selected_ein TEXT NOT NULL, selected_name TEXT,
+              ai_confidence NUMERIC, ai_decision TEXT, model TEXT
             );
             INSERT INTO grant_recipient_ai_applied VALUES
-              (1,'555555555','AI Selected Recipient',0.99,'rule:test'),
-              (2,'666666666','Unverified Filing EIN',0.99,'rule:reported_ein_from_filing_unverified');
+              (1,'SIG1','555555555','AI Selected Recipient',0.99,'SELECT_CANDIDATE','rule:test'),
+              (2,'SIG2','666666666','Unverified Filing EIN',0.99,'KEEP_REPORTED_EIN','rule:reported_ein_from_filing_unverified');
             CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
             SELECT rr.*,
                    aa.selected_ein AS ai_resolved_ein,
@@ -401,6 +545,422 @@ def test_enhanced_grant_view_takes_precedence_when_present(tmp_path):
         "666666666", 0,
         "enhanced_grant:reported_ein_from_filing_unverified",
     )
+
+
+def test_full_build_requires_enhanced_grant_view_and_exact_row_parity(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source, include_enhanced=False)
+
+    with pytest.raises(RuntimeError, match="missing required source objects.*grant_recipient_resolved_plus_ai_v1"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert not sidecar.exists()
+
+    with closing(sqlite3.connect(source)) as conn:
+        conn.executescript(
+            """
+            CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
+            SELECT rr.*,
+                   rr.resolved_ein AS final_resolved_ein,
+                   rr.resolved_org_name AS final_resolved_org_name,
+                   'deterministic' AS final_match_source,
+                   rr.confidence AS final_confidence
+            FROM grant_recipient_resolved AS rr
+            WHERE rr.grant_id=1;
+            """
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="enhanced-grant row parity failed"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert not sidecar.exists()
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_full_preflight_requires_every_leading_filing_id_index(tmp_path):
+    source = tmp_path / "source.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute("DROP INDEX idx_fixture_schedr_transactions_filing")
+        conn.execute(
+            """CREATE INDEX idx_fixture_schedr_transactions_partial
+               ON irs990_schedule_r_transactions_related_org_grp(filing_id)
+               WHERE filing_id<>''"""
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        with pytest.raises(
+            RuntimeError,
+            match=r"requires leading filing_id indexes.*irs990_schedule_r_transactions_related_org_grp\(filing_id\)",
+        ):
+            network.validate_full_source(conn, check_row_parity=False)
+
+
+def test_full_preflight_requires_real_enhanced_view_and_unique_grant_keys(tmp_path):
+    source = tmp_path / "source.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute(
+            "CREATE TABLE enhanced_copy AS "
+            "SELECT * FROM grant_recipient_resolved_plus_ai_v1"
+        )
+        conn.execute("DROP VIEW grant_recipient_resolved_plus_ai_v1")
+        conn.execute(
+            "ALTER TABLE enhanced_copy RENAME TO grant_recipient_resolved_plus_ai_v1"
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        with pytest.raises(RuntimeError, match=r"wrong type:.*expected view"):
+            network.validate_full_source(conn, check_row_parity=False)
+
+    source = tmp_path / "nonunique.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.executescript(
+            """
+            DROP VIEW grant_recipient_resolved_plus_ai_v1;
+            ALTER TABLE grant_recipient_resolved RENAME TO resolver_with_pk;
+            CREATE TABLE grant_recipient_resolved AS SELECT * FROM resolver_with_pk;
+            DROP TABLE resolver_with_pk;
+            CREATE INDEX idx_nonunique_resolver_grant
+              ON grant_recipient_resolved(grant_id);
+            CREATE INDEX idx_nonunique_resolver_filing
+              ON grant_recipient_resolved(filing_id);
+            CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
+            SELECT rr.*,
+                   rr.resolved_ein AS final_resolved_ein,
+                   rr.resolved_org_name AS final_resolved_org_name,
+                   'deterministic' AS final_match_source,
+                   rr.confidence AS final_confidence
+            FROM grant_recipient_resolved AS rr;
+            """
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        with pytest.raises(
+            RuntimeError,
+            match=r"requires exact unique grant-ID keys.*grant_recipient_resolved\(grant_id\)",
+        ):
+            network.validate_full_source(conn, check_row_parity=False)
+
+
+def test_full_preflight_rejects_grant_filing_ownership_mismatch(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute(
+            "UPDATE grant_recipient_resolved SET filing_id='F2' WHERE grant_id=1"
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="grant filing parity failed"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=1
+        )
+    assert not sidecar.exists()
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_full_plan_runs_structural_preflight_without_writing(tmp_path, capsys):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    assert network.main([
+        "plan", "--db", str(source), "--sidecar", str(sidecar), "--full",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert network.ENHANCED_GRANT_VIEW in output
+    assert "Checkpoint state:   source WAL absent or empty" in output
+    assert "exact grant row parity runs at rebuild start" in output
+    assert not sidecar.exists()
+
+
+def test_full_build_refuses_publication_if_source_changes_during_snapshot(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        conn.commit()
+
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    original_build_edges = network.NetworkBuilder.build_edges
+    mutated = False
+
+    def build_then_mutate(builder):
+        nonlocal mutated
+        result = original_build_edges(builder)
+        if not mutated:
+            with closing(sqlite3.connect(source, timeout=10)) as writer:
+                writer.execute(
+                    "UPDATE returns SET org_name='Concurrent mutation' WHERE filing_id='F1'"
+                )
+                writer.commit()
+            mutated = True
+        return result
+
+    monkeypatch.setattr(network.NetworkBuilder, "build_edges", build_then_mutate)
+    with pytest.raises(RuntimeError, match="changed during the risk-network build"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert mutated is True
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+@pytest.mark.parametrize(
+    "match_source",
+    ["REPORTED_EIN_FROM_FILING_UNVERIFIED", "unknown_future_source"],
+)
+def test_full_preflight_rejects_unattributed_enhanced_source_labels(
+    tmp_path, match_source
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute("DROP VIEW grant_recipient_resolved_plus_ai_v1")
+        conn.execute(f"""
+            CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
+            SELECT rr.*,
+                   CASE WHEN rr.grant_id=2 THEN '666666666'
+                        ELSE rr.resolved_ein END AS final_resolved_ein,
+                   CASE WHEN rr.grant_id=2 THEN 'Unverified Recipient'
+                        ELSE rr.resolved_org_name END AS final_resolved_org_name,
+                   CASE WHEN rr.grant_id=2 THEN '{match_source}'
+                        ELSE 'deterministic' END AS final_match_source,
+                   CASE WHEN rr.grant_id=2 THEN 0.99
+                        ELSE rr.confidence END AS final_confidence
+            FROM grant_recipient_resolved AS rr
+        """)
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="enhanced-grant provenance"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert not sidecar.exists()
+
+
+def test_full_validator_independently_rejects_unsafe_scored_grant(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    result = network.rebuild_full_sidecar(
+        source, sidecar, network.BuildConfig(), page_size=2
+    )
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.execute(
+            """UPDATE risk_network_edge
+               SET is_scored=1,
+                   target_ein='666666666',
+                   confidence=0.99,
+                   confidence_basis='enhanced_grant:REPORTED_EIN_FROM_FILING_UNVERIFIED'
+               WHERE edge_type='grant_paid' AND provenance_row_id='2'"""
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        snapshot = network.begin_source_snapshot(
+            conn, source, require_checkpointed=True
+        )
+        base = network.validate_full_source(conn, check_row_parity=True)
+        preflight = network.FullSourcePreflight(
+            base.grant_count,
+            base.resolver_count,
+            base.enhanced_count,
+            base.filing_indexes,
+            network.count_selected_filings(conn),
+        )
+    with pytest.raises(RuntimeError, match="without approved enhanced provenance"):
+        network.validate_completed_sidecar(
+            sidecar,
+            expected_filings=result["filings"],
+            expected_edges=result["edges"],
+            expected_scope="full",
+            source_snapshot=snapshot,
+            full_preflight=preflight,
+        )
+
+
+def test_full_snapshot_requires_truncated_wal(tmp_path):
+    source = tmp_path / "source.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        writer.execute(
+            "UPDATE returns SET org_name='Committed in WAL' WHERE filing_id='F1'"
+        )
+        writer.commit()
+        with closing(network.connect_source_readonly(source)) as reader:
+            with pytest.raises(RuntimeError, match="requires a checkpointed source database"):
+                network.begin_source_snapshot(
+                    reader, source, require_checkpointed=True
+                )
+
+
+def test_completed_sidecar_validation_rejects_hub_metadata_drift(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    filings = _all_filings(source)
+    result = network.rebuild_sidecar(
+        source, sidecar, filings, network.BuildConfig()
+    )
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.execute(
+            "UPDATE risk_network_edge SET hub_degree=hub_degree+1 WHERE edge_id=(SELECT edge_id FROM risk_network_edge LIMIT 1)"
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        snapshot = network.begin_source_snapshot(
+            conn, source, require_checkpointed=False
+        )
+    with pytest.raises(RuntimeError, match="inconsistent hub metadata"):
+        network.validate_completed_sidecar(
+            sidecar,
+            expected_filings=result["filings"],
+            expected_edges=result["edges"],
+            expected_scope="selected",
+            source_snapshot=snapshot,
+        )
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-journal"])
+def test_atomic_rebuild_refuses_populated_destination_auxiliary(tmp_path, suffix):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    Path(str(sidecar) + suffix).write_bytes(b"populated-old-sqlite-auxiliary")
+
+    with pytest.raises(RuntimeError, match="destination has populated SQLite auxiliary files"):
+        network.rebuild_sidecar(
+            source, sidecar, _all_filings(source), network.BuildConfig()
+        )
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_atomic_rebuild_rechecks_destination_auxiliary_immediately_before_replace(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    original_validate = network.validate_completed_sidecar
+
+    def validate_then_create_old_wal(*args, **kwargs):
+        original_validate(*args, **kwargs)
+        Path(str(sidecar) + "-wal").write_bytes(b"late-populated-old-wal")
+
+    monkeypatch.setattr(
+        network, "validate_completed_sidecar", validate_then_create_old_wal
+    )
+    with pytest.raises(RuntimeError, match="destination has populated SQLite auxiliary files"):
+        network.rebuild_sidecar(
+            source, sidecar, _all_filings(source), network.BuildConfig()
+        )
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_full_pagination_is_checked_against_independent_source_count(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    original_select = network.select_filings
+
+    def truncate_after_first_page(conn, **kwargs):
+        if kwargs.get("after_filing_id"):
+            return []
+        return original_select(conn, **kwargs)
+
+    monkeypatch.setattr(network, "select_filings", truncate_after_first_page)
+    with pytest.raises(RuntimeError, match="pagination was incomplete"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_full_build_rejects_invalid_selected_filing_instead_of_truncating(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute(
+            """INSERT INTO returns VALUES
+               ('F0','','Invalid EIN',2022,'','','','','','','','','','','','')"""
+        )
+        conn.execute(
+            "INSERT INTO canonical_by_ein_year VALUES ('',2022,'F0')"
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="blank/invalid filing_id or EIN"):
+        network.rebuild_full_sidecar(
+            source, sidecar, network.BuildConfig(), page_size=2
+        )
+    assert not sidecar.exists()
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_bounded_builds_verify_selected_filing_metadata_inside_snapshot(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    filings = _all_filings(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute(
+            "UPDATE returns SET org_name='Changed after selection' WHERE filing_id='F1'"
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="metadata changed before.*snapshot"):
+        network.rebuild_sidecar(
+            source, sidecar, filings, network.BuildConfig()
+        )
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+
+    current = _all_filings(source)
+    network.rebuild_sidecar(source, sidecar, current, network.BuildConfig())
+    selected = current[:1]
+    before = sidecar.read_bytes()
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute(
+            "UPDATE returns SET us_address_line1='Changed after selection' WHERE filing_id='F1'"
+        )
+        conn.commit()
+    with pytest.raises(RuntimeError, match="metadata changed before.*snapshot"):
+        network.incremental_sidecar(
+            source, sidecar, selected, network.BuildConfig()
+        )
+    assert sidecar.read_bytes() == before
 
 
 def test_runtime_network_returns_indexed_incoming_shared_neighbors_and_metadata(tmp_path):
@@ -604,3 +1164,251 @@ def test_source_lineage_allows_in_place_amendments_but_detects_replacement(tmp_p
     _create_source(replacement)
     replacement.replace(source)
     assert network.source_lineage_id(source) != original_lineage
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_cli_rejects_mixed_valid_and_invalid_ein_without_replacing_sidecar(
+    tmp_path, full
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    argv = [
+        "rebuild", "--db", str(source), "--sidecar", str(sidecar),
+        "--ein", "111111111", "--ein", "abc123", "--yes",
+    ]
+    if full:
+        argv.append("--full")
+
+    with pytest.raises(RuntimeError, match="Invalid --ein selector"):
+        network.main(argv)
+
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_selectors_reject_fabricated_eins_missing_filing_ids_and_reversed_years(
+    tmp_path,
+):
+    source = tmp_path / "source.db"
+    _create_source(source)
+    assert network.normalize_ein("12-3456789") == "123456789"
+    assert network.normalize_ein("abc123456789") == ""
+    assert network.normalize_ein("123") == ""
+
+    with closing(network.connect_source_readonly(source)) as conn:
+        with pytest.raises(RuntimeError, match="Invalid --filing-id selector"):
+            network.select_filings(conn, filing_ids=["F1", " "])
+        with pytest.raises(RuntimeError, match="were not found"):
+            network.select_filings(conn, filing_ids=["F1", "MISSING"])
+        with pytest.raises(RuntimeError, match="cannot be greater"):
+            network.select_filings(conn, min_tax_year=2024, max_tax_year=2023)
+
+
+def test_full_rebuild_refuses_zero_match_replacement(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+
+    with pytest.raises(RuntimeError, match="selected zero filings"):
+        network.main([
+            "rebuild", "--db", str(source), "--sidecar", str(sidecar),
+            "--full", "--ein", "999999999", "--yes",
+        ])
+
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_index_gates_reject_expression_leading_and_nocase_indexes():
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE lookup_probe(filing_id TEXT, payload TEXT);
+            CREATE INDEX ix_expression_first
+              ON lookup_probe(lower(payload), filing_id);
+            """
+        )
+        assert network._index_with_prefix(conn, "lookup_probe", ("filing_id",)) == ""
+        plan = [
+            str(row[3]).upper()
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM lookup_probe WHERE filing_id=?",
+                ("F1",),
+            )
+        ]
+        assert not any("SEARCH" in detail for detail in plan), plan
+
+        conn.executescript(
+            """
+            DROP INDEX ix_expression_first;
+            CREATE INDEX ix_nocase ON lookup_probe(filing_id COLLATE NOCASE);
+            """
+        )
+        assert network._index_with_prefix(conn, "lookup_probe", ("filing_id",)) == ""
+
+        conn.executescript(
+            """
+            DROP INDEX ix_nocase;
+            CREATE INDEX ix_binary ON lookup_probe(filing_id);
+            """
+        )
+        assert network._index_with_prefix(
+            conn, "lookup_probe", ("filing_id",)
+        ) == "ix_binary"
+        plan = [
+            str(row[3]).upper()
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM lookup_probe WHERE filing_id=?",
+                ("F1",),
+            )
+        ]
+        assert any("SEARCH" in detail for detail in plan), plan
+
+
+def test_unique_key_gate_rejects_expression_terms_and_nullable_unique_columns():
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE expression_key(grant_id INTEGER NOT NULL, payload TEXT);
+            CREATE UNIQUE INDEX ux_expression_key
+              ON expression_key(grant_id, lower(payload));
+            CREATE TABLE nullable_key(grant_id INTEGER UNIQUE);
+            CREATE TABLE exact_key(grant_id INTEGER PRIMARY KEY);
+            CREATE TABLE descending_integer_key(grant_id INTEGER PRIMARY KEY DESC);
+            """
+        )
+        assert network._unique_index_for_columns(
+            conn, "expression_key", ("grant_id",)
+        ) == ""
+        assert network._unique_index_for_columns(
+            conn, "nullable_key", ("grant_id",)
+        ) == ""
+        assert network._unique_index_for_columns(
+            conn, "exact_key", ("grant_id",)
+        ) == "PRIMARY KEY"
+        assert network._unique_index_for_columns(
+            conn, "descending_integer_key", ("grant_id",)
+        ) == ""
+
+
+def test_full_preflight_rejects_sqlite_coercive_grant_id_match(tmp_path):
+    source = tmp_path / "source.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.executescript(
+            """
+            DROP VIEW grant_recipient_resolved_plus_ai_v1;
+            DROP TABLE grants;
+            CREATE TABLE grants (
+              id TEXT NOT NULL UNIQUE,
+              filing_id TEXT NOT NULL
+            );
+            CREATE INDEX idx_grants_filing_id ON grants(filing_id);
+            INSERT INTO grants VALUES ('01','F1'),('2','F1');
+            """
+        )
+        conn.commit()
+    _prepare_full_source(source)
+
+    with closing(network.connect_source_readonly(source)) as conn:
+        with pytest.raises(RuntimeError, match="grant_id_mismatch"):
+            network.validate_full_source(conn, check_row_parity=True)
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_spoofed_scoreable_enhanced_view_requires_applied_artifact(
+    tmp_path, full
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    with closing(sqlite3.connect(source)) as conn:
+        conn.executescript(
+            """
+            DROP VIEW grant_recipient_resolved_plus_ai_v1;
+            CREATE VIEW grant_recipient_resolved_plus_ai_v1 AS
+            SELECT rr.*,
+                   rr.grant_id AS __base_grant_id,
+                   rr.filing_id AS __base_filing_id,
+                   rr.recipient_reported_ein AS __base_recipient_reported_ein,
+                   rr.recipient_reported_name AS __base_recipient_reported_name,
+                   rr.cash_amount AS __base_cash_amount,
+                   rr.noncash_amount AS __base_noncash_amount,
+                   rr.total_amount AS __base_total_amount,
+                   rr.purpose AS __base_purpose,
+                   rr.match_status AS __base_match_status,
+                   rr.warning_flags AS __base_warning_flags,
+                   rr.resolved_ein AS __base_resolved_ein,
+                   rr.resolved_org_name AS __base_resolved_org_name,
+                   rr.confidence AS __base_confidence,
+                   CASE WHEN rr.grant_id=2 THEN rr.grant_id END AS __applied_grant_id,
+                   CASE WHEN rr.grant_id=2 THEN 'SPOOF_SIG' END AS __applied_signature_hash,
+                   CASE WHEN rr.grant_id=2 THEN '666666666' END AS __applied_selected_ein,
+                   CASE WHEN rr.grant_id=2 THEN 'Spoofed AI Recipient' END AS __applied_selected_name,
+                   CASE WHEN rr.grant_id=2 THEN 0.99 END AS __applied_confidence,
+                   CASE WHEN rr.grant_id=2 THEN 'SELECT_CANDIDATE' END AS __applied_decision,
+                   CASE WHEN rr.grant_id=2 THEN 'model:spoofed' END AS __applied_model,
+                   CASE WHEN rr.grant_id=2 THEN '666666666'
+                        ELSE rr.resolved_ein END AS final_resolved_ein,
+                   CASE WHEN rr.grant_id=2 THEN 'Spoofed AI Recipient'
+                        ELSE rr.resolved_org_name END AS final_resolved_org_name,
+                   CASE WHEN rr.grant_id=2 THEN 'ai_assisted'
+                        ELSE 'deterministic' END AS final_match_source,
+                   CASE WHEN rr.grant_id=2 THEN 0.99
+                        ELSE rr.confidence END AS final_confidence
+            FROM grant_recipient_resolved AS rr;
+            """
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="not exactly backed"):
+        if full:
+            network.rebuild_full_sidecar(
+                source, sidecar, network.BuildConfig(), page_size=2
+            )
+        else:
+            network.rebuild_sidecar(
+                source, sidecar, _all_filings(source), network.BuildConfig()
+            )
+
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_bounded_sidecar_validator_rejects_unsafe_enhanced_grant(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    _prepare_full_source(source)
+    result = network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.execute(
+            """UPDATE risk_network_edge
+               SET confidence_basis='enhanced_grant:spoofed_source'
+               WHERE edge_type='grant_paid' AND is_scored=1"""
+        )
+        conn.commit()
+    with closing(network.connect_source_readonly(source)) as conn:
+        snapshot = network.begin_source_snapshot(
+            conn, source, require_checkpointed=False
+        )
+    with pytest.raises(RuntimeError, match="approved enhanced provenance"):
+        network.validate_completed_sidecar(
+            sidecar,
+            expected_filings=result["filings"],
+            expected_edges=result["edges"],
+            expected_scope="selected",
+            source_snapshot=snapshot,
+        )
