@@ -21,6 +21,11 @@ def write_csv(path: Path, headers, rows) -> None:
 
 
 class FacBulkTests(unittest.TestCase):
+    def test_migration_placeholder_is_not_a_uei(self):
+        self.assertIsNone(fac_bulk._clean_uei("GSA_MIGRATION"))
+        self.assertIsNone(fac_bulk._clean_uei("GSAMIGRATION"))
+        self.assertEqual(fac_bulk._clean_uei("abcdef123456"), "ABCDEF123456")
+
     def make_current_fixture(self, root: Path) -> Path:
         current = root / "current"
         report_id = "2024-12-GSAFAC-0000000001"
@@ -286,6 +291,32 @@ class FacBulkTests(unittest.TestCase):
             self.assertFalse(staging.exists())
             result = fac_bulk.lookup_fac_by_ein("123456789", db_path)
             self.assertEqual(result["status"], "ok")
+
+    def test_lookup_filters_migration_placeholder_from_existing_sidecar(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            current = self.make_current_fixture(root)
+            db_path = root / "fac.db"
+            fac_bulk.build_fac_database(
+                [current], db_path, source_as_of_date="2026-08-14"
+            )
+
+            # Simulate a completed sidecar built before the sentinel was
+            # rejected during import.
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    "UPDATE fac_reports SET auditee_uei='GSAMIGRATION' "
+                    "WHERE auditee_ein='123456789'"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            result = fac_bulk.lookup_fac_by_ein("123456789", db_path)
+            self.assertEqual(result["status"], "ok")
+            self.assertIsNone(result["reports"][0]["general"]["auditee_uei"])
+            self.assertEqual(result["ueis"], [])
 
     def test_partial_large_file_resumes_after_last_row_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp_dir:

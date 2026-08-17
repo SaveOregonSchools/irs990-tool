@@ -78,6 +78,57 @@ class RiskExternalTests(unittest.TestCase):
             self.assertEqual(result[source]["status"], "blocked")
             self.assertEqual(result["sources"][source]["status"], "blocked")
 
+    def test_fac_migration_placeholder_is_never_used_as_a_uei(self):
+        self.assertEqual(risk_external._clean_uei("GSA_MIGRATION"), "")
+        self.assertEqual(risk_external._clean_uei("GSAMIGRATION"), "")
+
+        fac = {
+            "reports": [
+                {
+                    "ein_match": "primary_ein",
+                    "general": {
+                        "auditee_ein": "123456789",
+                        "auditee_uei": "GSA_MIGRATION",
+                    },
+                },
+                {
+                    "ein_match": "primary_ein",
+                    "general": {
+                        "auditee_ein": "123456789",
+                        "auditee_uei": "GSAMIGRATION",
+                    },
+                },
+                {
+                    "ein_match": "primary_ein",
+                    "general": {
+                        "auditee_ein": "123456789",
+                        "auditee_uei": "ABCDEF123456",
+                    },
+                },
+            ],
+            "ueis": ["GSA_MIGRATION", "GSAMIGRATION"],
+        }
+        self.assertEqual(
+            risk_external._fac_primary_ueis(fac, "123456789"),
+            ["ABCDEF123456"],
+        )
+
+        opener = FakeOpener(lambda request: self.fail(
+            "migration placeholder must not trigger an external request"
+        ))
+        usaspending = risk_external._fetch_usaspending(
+            ["GSA_MIGRATION", "GSAMIGRATION"], opener=opener, timeout=1
+        )
+        sam = risk_external._fetch_sam(
+            ["GSA_MIGRATION", "GSAMIGRATION"],
+            "sam-key",
+            opener=opener,
+            timeout=1,
+        )
+        self.assertEqual(usaspending["status"], "blocked")
+        self.assertEqual(sam["status"], "blocked")
+        self.assertEqual(opener.calls, [])
+
     def test_local_mode_uses_offline_fac_without_http(self):
         opener = FakeOpener()
         original = risk_external._lookup_offline_fac

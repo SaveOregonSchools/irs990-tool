@@ -3513,36 +3513,73 @@ def _grant_path_rows(paths: List[Dict], subject_ein: str) -> str:
     if not paths:
         return ""
     rows = []
-    for path in paths[:12]:
+    displayed_paths = paths[:12]
+    return_count = sum(1 for path in paths if path.get("returns_to_subject"))
+    plausible_count = sum(
+        1
+        for path in paths
+        if path.get("returns_to_subject") and path.get("chronology_supported")
+    )
+    path_noun = "path" if len(paths) == 1 else "paths"
+    for path in displayed_paths:
         if path.get("returns_to_subject") and path.get("chronology_supported"):
             first_years = _year_values_text(path.get("qualifying_first_years"))
             second_years = _year_values_text(path.get("qualifying_second_years"))
-            circular = '<span class="badge risk-path-badge">Plausible return</span>'
+            assessment = '<span class="badge risk-path-badge">Plausible return — review lead</span>'
         elif path.get("returns_to_subject"):
             first_years = _year_values_text(path.get("first_years"))
             second_years = _year_values_text(path.get("second_years"))
             if path.get("second_max_year") and path.get("first_min_year") and path["second_max_year"] < path["first_min_year"]:
                 lead_text = "Reverse flow predates first hop"
             else:
-                lead_text = "No return within two years"
-            circular = f'<span class="relation-badge" style="--relation-color:#647084">{_h(lead_text)}</span>'
+                lead_text = "Return outside two-year window"
+            assessment = f'<span class="relation-badge" style="--relation-color:#647084">{_h(lead_text)}</span>'
         else:
             first_years = _year_values_text(path.get("first_years"))
             second_years = _year_values_text(path.get("second_years"))
-            circular = ""
+            assessment = '<span class="relation-badge" style="--relation-color:#647084">Context only — no return to filer</span>'
         rows.append(f"""
         <tr>
           <td>{_h(path.get('via_name'))}<div class="muted">{_h(path.get('via_ein'))}</div></td>
           <td>{_h(path.get('target_name'))}<div class="muted">{_h(path.get('target_ein'))}</div></td>
-          <td>{_h(first_years)}</td><td>{_h(second_years)}</td><td>{_money(path.get('amount'))}</td><td>{circular}</td>
+          <td>{_h(first_years)}</td><td>{_h(second_years)}</td><td>{_money(path.get('amount'))}</td><td>{assessment}</td>
         </tr>
         """)
+    if plausible_count:
+        return_verb = "returns" if plausible_count == 1 else "return"
+        marked_verb = "is" if plausible_count == 1 else "are"
+        lead_noun = "a review lead" if plausible_count == 1 else "review leads"
+        path_summary = (
+            f"{plausible_count} of {len(paths)} sampled {path_noun} {return_verb} to this filer in the same year "
+            f"or within the next two years and {marked_verb} marked as {lead_noun}."
+        )
+    elif return_count:
+        return_verb = "returns" if return_count == 1 else "return"
+        path_summary = (
+            f"{return_count} of {len(paths)} sampled {path_noun} {return_verb} to this filer, but none falls within "
+            "the two-year review window; none contributes to a grant-return review indicator."
+        )
+    else:
+        path_summary = (
+            f"0 of {len(paths)} sampled paths return to this filer; all are context only and do not "
+            "contribute to the Review Priority Score."
+        )
+    display_note = (
+        f" Showing {len(displayed_paths)} of {len(paths)} paths."
+        if len(displayed_paths) < len(paths)
+        else ""
+    )
     return f"""
     <details class="network-paths" open>
-      <summary><b>Potential two-step grant paths ({len(paths)})</b></summary>
-      <p class="panel-footnote">These are bounded topology leads, not proof that the same dollars were passed through. Compare dates and purposes.</p>
+      <summary><b>Two-step grant network sample ({len(paths)})</b></summary>
+      <div class="panel-help-row">
+        <p class="panel-footnote"><b>{_h(path_summary)}</b>{_h(display_note)} Read each row left to right: the filer reported grants to the intermediary, and that intermediary separately reported grants to the second recipient. These rows show reported relationships; they do not trace the same dollars or establish pass-through funding.</p>
+        <details class="metric-help"><summary aria-label="About two-step grant paths">i</summary>
+          <div class="metric-help-card">This bounded view follows trusted resolved grant records from the analyzed filer to up to eight of its largest direct recipients, then to up to four of each recipient’s largest reported recipients. Only a second hop back to the analyzed EIN in the same tax year or within the next two tax years is marked as a plausible return and can create a review indicator. All other rows are context only.</div>
+        </details>
+      </div>
       <div class="table-scroll"><table class="risk-table">
-        <thead><tr><th>First recipient / intermediary</th><th>Its recipient</th><th>First-hop years</th><th>Second-hop years</th><th>Second-hop amount</th><th>Lead</th></tr></thead>
+        <thead><tr><th>First recipient / intermediary</th><th>Its recipient</th><th>First-hop years</th><th>Second-hop years</th><th>Intermediary’s reported grants to second recipient</th><th>Assessment</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table></div>
     </details>
@@ -3800,40 +3837,166 @@ def _fac_audit_rows(reports: List[Dict]) -> str:
     return "".join(rows)
 
 
-def _fac_finding_rows(reports: List[Dict]) -> str:
-    rows = []
+_FAC_REQUIREMENT_LABELS = {
+    "A": "Activities allowed or unallowed",
+    "B": "Allowable costs/cost principles",
+    "C": "Cash management",
+    "D": "Reserved in current FAC; Davis-Bacon in historic reports",
+    "E": "Eligibility",
+    "F": "Equipment and real property management",
+    "G": "Matching, level of effort, earmarking",
+    "H": "Period of performance/availability",
+    "I": "Procurement and suspension/debarment",
+    "J": "Program income",
+    "K": "Reserved in current FAC; real-property acquisition/relocation in historic reports",
+    "L": "Reporting",
+    "M": "Subrecipient monitoring",
+    "N": "Special tests and provisions",
+    "P": "Other",
+}
+_FAC_MIGRATION_SENTINEL = "GSA_MIGRATION"
+
+
+def _fac_requirement_text(value: object) -> str:
+    raw = _text(value).strip()
+    if not raw:
+        return "Not specified"
+    upper = raw.upper()
+    if upper.replace("_", "") == _FAC_MIGRATION_SENTINEL.replace("_", ""):
+        return "Not available in the migrated FAC record"
+    compact = re.sub(r"\bAND\b", "", upper)
+    compact = re.sub(r"[\s,;/+&|\-]+", "", compact)
+    if compact and all(code in _FAC_REQUIREMENT_LABELS for code in compact):
+        codes = list(dict.fromkeys(compact))
+        return "; ".join(f"{code} — {_FAC_REQUIREMENT_LABELS[code]}" for code in codes)
+    return raw
+
+
+def _fac_detail_text(report: Dict, values: List[str], detail_kind: str) -> str:
+    supplied: List[str] = []
+    migration_placeholder = False
+    for value in values:
+        text_value = re.sub(r"\s+", " ", _text(value)).strip()
+        if not text_value:
+            continue
+        if text_value.upper().replace("_", "") == _FAC_MIGRATION_SENTINEL.replace("_", ""):
+            migration_placeholder = True
+            continue
+        if text_value not in supplied:
+            supplied.append(text_value)
+    if supplied:
+        return _excerpt(" ".join(supplied))
+    if migration_placeholder:
+        return (
+            "Not available in FAC data — the legacy Census text field was empty when GSA "
+            "migrated this report."
+        )
+
+    general = report.get("general") or {}
+    report_id = _text(general.get("report_id") or report.get("report_id"))
+    audit_year = int(_num(general.get("audit_year"))) if general.get("audit_year") else 0
+    if report_id.casefold().startswith("historic:") or (audit_year and audit_year <= 2015):
+        return "Not included in the FAC 1998–2015 bulk archive."
+
+    status_field = (
+        "findings_text_status"
+        if detail_kind == "narrative"
+        else "corrective_action_plans_status"
+    )
+    status = _text(report.get(status_field)).casefold()
+    if "error" in status or status in {"blocked", "unavailable"}:
+        return "Unavailable because the FAC detail request failed."
+    if status == "not_requested":
+        return "Not loaded in this bounded dashboard summary."
+    label = "narrative" if detail_kind == "narrative" else "corrective-action plan"
+    return f"No {label} was supplied in the FAC source."
+
+
+def _fac_finding_groups(reports: List[Dict]) -> List[Dict]:
+    groups: List[Dict] = []
     for report in reports:
-        general = report.get("general") or {}
         text_by_ref: Dict[str, List[str]] = defaultdict(list)
         action_by_ref: Dict[str, List[str]] = defaultdict(list)
         for item in report.get("findings_text") or []:
             text_by_ref[_text(item.get("finding_ref_number"))].append(_text(item.get("finding_text")))
         for item in report.get("corrective_action_plans") or []:
             action_by_ref[_text(item.get("finding_ref_number"))].append(_text(item.get("planned_action")))
+
+        report_groups: Dict[object, Dict] = {}
         for finding in report.get("findings") or []:
-            reference = _text(finding.get("reference_number"))
-            flags = [
-                label for field, label in [
-                    ("is_modified_opinion", "Modified opinion"),
-                    ("is_material_weakness", "Material weakness"),
-                    ("is_significant_deficiency", "Significant deficiency"),
-                    ("is_questioned_costs", "Questioned costs"),
-                    ("is_repeat_finding", "Repeat finding"),
-                    ("is_other_findings", "Other finding"),
-                ] if finding.get(field) is True
-            ]
-            narrative = " ".join(text_by_ref.get(reference) or [])
-            action = " ".join(action_by_ref.get(reference) or [])
-            rows.append(f"""
-            <tr>
-              <td>{_h(general.get('audit_year'))}</td>
-              <td>{_h(reference or finding.get('award_reference'))}</td>
-              <td>{_h(finding.get('type_requirement'))}</td>
-              <td>{_h(', '.join(flags) if flags else 'Finding reported')}</td>
-              <td>{_h(_excerpt(narrative) or 'Narrative not returned')}</td>
-              <td>{_h(_excerpt(action) or 'Corrective action not returned')}</td>
-            </tr>
-            """)
+            reference = _text(finding.get("reference_number")).strip()
+            award_reference = _text(finding.get("award_reference")).strip()
+            if reference:
+                key: object = ("reference", reference)
+            elif award_reference:
+                key = ("award", award_reference)
+            else:
+                key = (
+                    "content",
+                    _text(finding.get("type_requirement")),
+                    *(finding.get(field) for field in [
+                        "is_modified_opinion",
+                        "is_material_weakness",
+                        "is_significant_deficiency",
+                        "is_questioned_costs",
+                        "is_repeat_finding",
+                        "is_other_findings",
+                    ]),
+                )
+            group = report_groups.setdefault(key, {
+                "report": report,
+                "reference": reference or award_reference,
+                "source_count": 0,
+                "award_references": [],
+                "requirements": [],
+                "flags": [],
+                "narratives": text_by_ref.get(reference) or [],
+                "actions": action_by_ref.get(reference) or [],
+            })
+            group["source_count"] += 1
+            if award_reference and award_reference not in group["award_references"]:
+                group["award_references"].append(award_reference)
+            requirement = _fac_requirement_text(finding.get("type_requirement"))
+            if requirement not in group["requirements"]:
+                group["requirements"].append(requirement)
+            for field, label in [
+                ("is_modified_opinion", "Modified opinion"),
+                ("is_material_weakness", "Material weakness"),
+                ("is_significant_deficiency", "Significant deficiency"),
+                ("is_questioned_costs", "Questioned costs"),
+                ("is_repeat_finding", "Repeat finding"),
+                ("is_other_findings", "Other finding"),
+            ]:
+                if finding.get(field) is True and label not in group["flags"]:
+                    group["flags"].append(label)
+        groups.extend(report_groups.values())
+    return groups
+
+
+def _fac_finding_rows(reports: List[Dict]) -> str:
+    rows = []
+    for group in _fac_finding_groups(reports):
+        report = group["report"]
+        general = report.get("general") or {}
+        award_references = group["award_references"]
+        source_count = group["source_count"]
+        if award_references:
+            linked_label = "Linked award" if len(award_references) == 1 else f"{len(award_references)} linked awards"
+            linked_detail = f'<div class="muted">{_h(linked_label)}: {_h(", ".join(award_references))}</div>'
+        elif source_count > 1:
+            linked_detail = f'<div class="muted">{source_count} source records consolidated</div>'
+        else:
+            linked_detail = ""
+        rows.append(f"""
+        <tr>
+          <td>{_h(general.get('audit_year'))}</td>
+          <td>{_h(group.get('reference'))}{linked_detail}</td>
+          <td>{_h('; '.join(group['requirements']))}</td>
+          <td>{_h(', '.join(group['flags']) if group['flags'] else 'Finding reported')}</td>
+          <td>{_h(_fac_detail_text(report, group['narratives'], 'narrative'))}</td>
+          <td>{_h(_fac_detail_text(report, group['actions'], 'corrective_action'))}</td>
+        </tr>
+        """)
     return "".join(rows)
 
 
@@ -3980,6 +4143,7 @@ def _external_panel(external: Dict, mode: str) -> str:
     fac = external.get("fac") or {}
     reports = fac.get("reports") or []
     audit_rows = _fac_audit_rows(reports)
+    finding_count = len(_fac_finding_groups(reports))
     finding_rows = _fac_finding_rows(reports)
     award_rows = _fac_award_rows(reports)
     fac_details = ""
@@ -3988,7 +4152,15 @@ def _external_panel(external: Dict, mode: str) -> str:
         <h4>Federal Audit Clearinghouse</h4>
         <p class="panel-footnote">Single Audit applicability is based on federal awards <b>expended</b>, not grants received or Form 990 government-grant revenue. The threshold is $750,000 for fiscal years beginning before October 1, 2024, and $1,000,000 thereafter.</p>
         <div class="table-scroll"><table class="risk-table external-audit-table"><thead><tr><th>Audit year / period</th><th>Federal expenditures</th><th>Period threshold</th><th>Audit type</th><th>Selected issues</th><th>EIN match / report</th></tr></thead><tbody>{audit_rows}</tbody></table></div>
-        {f'<details open><summary><b>Audit findings ({sum(len(r.get("findings") or []) for r in reports)})</b></summary><div class="table-scroll"><table class="risk-table external-findings-table"><thead><tr><th>Year</th><th>Reference</th><th>Requirement</th><th>Flags</th><th>Finding narrative</th><th>Corrective action</th></tr></thead><tbody>{finding_rows}</tbody></table></div></details>' if finding_rows else '<p class="empty-note">No FAC finding rows were returned for these reports.</p>'}
+        {f'''<details open><summary><b>Audit findings ({finding_count})</b></summary>
+          <div class="panel-help-row">
+            <p class="panel-footnote">FAC requirement letters identify compliance areas and are expanded in the table. Repeated source rows for one finding are consolidated and their linked awards are shown.</p>
+            <details class="metric-help"><summary aria-label="About FAC requirement codes and missing text">i</summary>
+              <div class="metric-help-card">The Requirement field uses Federal Audit Clearinghouse compliance-area codes. “Not available in FAC data” means the legacy Census text field was empty when GSA migrated that report; it is not finding narrative. Some older details are intentionally omitted from this bounded summary or are unavailable in the historic bulk archive. See the <a href="https://www.fac.gov/data/download/current-dictionary/#findings-dictionary" target="_blank" rel="noopener">FAC findings dictionary</a> and <a href="https://www.fac.gov/data/migration/table-transforms/" target="_blank" rel="noopener">migration notes</a>.</div>
+            </details>
+          </div>
+          <div class="table-scroll"><table class="risk-table external-findings-table"><thead><tr><th>Year</th><th>Reference / linked awards</th><th>Requirement</th><th>Flags</th><th>Finding narrative</th><th>Corrective action</th></tr></thead><tbody>{finding_rows}</tbody></table></div>
+        </details>''' if finding_rows else '<p class="empty-note">No FAC finding rows were returned for these reports.</p>'}
         {f'<details><summary><b>Largest federal programs ({sum(len(r.get("federal_awards") or []) for r in reports)})</b></summary><div class="table-scroll"><table class="risk-table"><thead><tr><th>Year</th><th>Assistance listing</th><th>Program</th><th>Expended</th><th>Major</th><th>Opinion</th><th>Findings</th></tr></thead><tbody>{award_rows}</tbody></table></div></details>' if award_rows else ''}
         """
     elif fac.get("status") == "no_match":
@@ -4045,20 +4217,27 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       .risk-grid {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap:10px; margin-top:14px; }}
       .risk-summary-grid {{ grid-template-columns:repeat(5,minmax(135px,1fr)); }}
       .risk-metric {{ border:1px solid var(--border); background:#f7f9fc; padding:10px; }}
+      .risk-summary-grid .risk-metric {{ display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }}
       .risk-metric span {{ display:block; color:var(--muted); font-size:12px; }}
       .risk-metric strong {{ display:block; font-size:22px; margin-top:3px; }}
       .metric-label {{ display:flex; align-items:center; gap:6px; color:var(--muted); font-size:12px; }}
+      .risk-summary-grid .metric-label {{ justify-content:center; }}
       .metric-help {{ position:relative; display:inline-block; }}
       .metric-help summary, .info-link {{ display:inline-grid; place-items:center; width:17px; height:17px; box-sizing:border-box; border:1px solid #8793a3; border-radius:50%; color:#34495e; background:#fff; font:700 11px/1 sans-serif; cursor:pointer; text-decoration:none; list-style:none; }}
       .metric-help summary::-webkit-details-marker {{ display:none; }}
       .metric-help summary:focus-visible, .info-link:focus-visible {{ outline:2px solid #176b87; outline-offset:2px; }}
       .metric-help-card {{ position:absolute; z-index:20; top:23px; left:0; width:285px; padding:9px 10px; border:1px solid var(--border); border-radius:4px; background:#fff; color:var(--ink); box-shadow:0 4px 14px rgba(31,45,61,.16); font-size:12px; font-weight:400; line-height:1.4; }}
+      .risk-summary-grid .metric-help-card {{ text-align:left; }}
       .risk-panel {{ border:1px solid var(--border); background:#fff; padding:14px; margin:16px 0; }}
       .risk-panel h3 {{ margin:0 0 10px; }}
       .panel-title-row {{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; }}
       .panel-title-row h3 {{ margin:0 0 10px; }}
       .panel-title-row a {{ font-size:12px; }}
       .panel-footnote {{ color:var(--muted); font-size:12px; line-height:1.4; }}
+      .panel-help-row {{ display:flex; align-items:flex-start; gap:7px; margin:9px 0; }}
+      .panel-help-row .panel-footnote {{ flex:1 1 auto; margin:0; }}
+      .panel-help-row .metric-help {{ flex:0 0 auto; margin:0; }}
+      .panel-help-row .metric-help-card {{ left:auto; right:0; text-align:left; }}
       .risk-table {{ width:100%; border-collapse:collapse; font-size:13px; }}
       .risk-table th, .risk-table td {{ padding:6px 5px; border-bottom:1px solid #eee; text-align:left; white-space:normal; }}
       .risk-table tbody tr:nth-child(odd) {{ background:#f7f7f7; }}
@@ -4118,6 +4297,10 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       @media (max-width: 780px) {{
         .risk-summary-grid {{ grid-template-columns:repeat(2,minmax(135px,1fr)); }}
         .network-map {{ min-width:700px; }}
+      }}
+      @media (max-width: 460px) {{
+        .risk-summary-grid {{ grid-template-columns:1fr; }}
+        .metric-help-card {{ width:min(285px,calc(100vw - 48px)); }}
       }}
       {print_css}
     </style>

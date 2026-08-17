@@ -331,6 +331,11 @@ def _clean_ein(value: Any) -> str:
 
 def _clean_uei(value: Any) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", "" if value is None else str(value)).upper()
+    # GSA_MIGRATION is a FAC legacy-data annotation, not a UEI.  Stripping its
+    # underscore produces exactly 12 characters, so a length check alone would
+    # send a fabricated identifier to downstream federal APIs.
+    if cleaned == "GSAMIGRATION":
+        return ""
     return cleaned if len(cleaned) == 12 else ""
 
 

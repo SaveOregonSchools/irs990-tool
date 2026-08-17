@@ -370,6 +370,17 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("0–34 baseline", html)
         self.assertIn("35–69 moderate", html)
         self.assertIn("70–100 high", html)
+        self.assertIn(
+            ".risk-summary-grid .risk-metric { display:flex; flex-direction:column; "
+            "align-items:center; justify-content:center; text-align:center; }",
+            html,
+        )
+        self.assertIn(".risk-summary-grid .metric-label { justify-content:center; }", html)
+        self.assertIn(
+            ".panel-help-row .metric-help-card { left:auto; right:0; text-align:left; }",
+            html,
+        )
+        self.assertIn("@media (max-width: 460px)", html)
         self.assertIn("Screening result, not a fraud probability or determination", html)
         self.assertIn("Data Coverage &amp; Remaining Work", html)
         self.assertIn("Build public screening snapshots", html)
@@ -760,8 +771,152 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("Add second-level review", html)
         self.assertIn("Unsupported &lt;script&gt;alert(1)&lt;/script&gt; charge", html)
         self.assertNotIn("Unsupported <script>", html)
+        self.assertIn('aria-label="About FAC requirement codes and missing text"', html)
+        self.assertIn("https://www.fac.gov/data/download/current-dictionary/", html)
+        self.assertIn("https://www.fac.gov/data/migration/table-transforms/", html)
         self.assertIn("SAM exclusion record returned", html)
         self.assertIn("candidate-only", html.casefold())
+
+    def test_fac_finding_codes_migration_placeholders_and_duplicates_are_explained(self):
+        reports = [{
+            "report_id": "2018-06-CENSUS-1",
+            "general": {"report_id": "2018-06-CENSUS-1", "audit_year": 2018},
+            "findings_status": "ok",
+            "findings_text_status": "ok",
+            "corrective_action_plans_status": "ok",
+            "findings": [
+                {
+                    "reference_number": "2018-001",
+                    "award_reference": "AWARD-0001",
+                    "type_requirement": "L AND M, I/B",
+                    "is_significant_deficiency": True,
+                },
+                {
+                    "reference_number": "2018-001",
+                    "award_reference": "AWARD-0002",
+                    "type_requirement": "LMIB",
+                    "is_significant_deficiency": True,
+                },
+            ],
+            "findings_text": [{
+                "finding_ref_number": "2018-001",
+                "finding_text": "GSA_MIGRATION",
+            }],
+            "corrective_action_plans": [{
+                "finding_ref_number": "2018-001",
+                "planned_action": "GSA_MIGRATION",
+            }],
+        }]
+
+        rows = mod._fac_finding_rows(reports)
+        self.assertEqual(len(mod._fac_finding_groups(reports)), 1)
+        self.assertEqual(rows.count("2018-001"), 1)
+        self.assertIn("2 linked awards", rows)
+        self.assertIn("L — Reporting", rows)
+        self.assertIn("M — Subrecipient monitoring", rows)
+        self.assertIn("I — Procurement and suspension/debarment", rows)
+        self.assertIn("B — Allowable costs/cost principles", rows)
+        self.assertNotIn("GSA_MIGRATION", rows)
+        self.assertIn("legacy Census text field was empty", rows)
+        self.assertEqual(mod._fac_requirement_text("Custom compliance area"), "Custom compliance area")
+        for legacy_text in ("NONE", "NONCOMPLIANCE", "COMPLIANCE"):
+            self.assertEqual(mod._fac_requirement_text(legacy_text), legacy_text)
+
+    def test_fac_missing_detail_copy_distinguishes_summary_archive_error_and_source(self):
+        current = {"report_id": "FAC-1", "general": {"audit_year": 2024}}
+        self.assertEqual(
+            mod._fac_detail_text(
+                dict(current, findings_text_status="not_requested"), [], "narrative"
+            ),
+            "Not loaded in this bounded dashboard summary.",
+        )
+        self.assertEqual(
+            mod._fac_detail_text(
+                dict(current, findings_text_status="error"), [], "narrative"
+            ),
+            "Unavailable because the FAC detail request failed.",
+        )
+        self.assertEqual(
+            mod._fac_detail_text(
+                dict(current, findings_text_status="ok"), [], "narrative"
+            ),
+            "No narrative was supplied in the FAC source.",
+        )
+        historic = {
+            "report_id": "historic:2014:1",
+            "general": {"audit_year": 2014},
+            "corrective_action_plans_status": "not_requested",
+        }
+        self.assertEqual(
+            mod._fac_detail_text(historic, [], "corrective_action"),
+            "Not included in the FAC 1998–2015 bulk archive.",
+        )
+
+    def test_two_step_grant_paths_have_help_and_nonblank_assessments(self):
+        paths = [
+            {
+                "via_name": "Intermediary A",
+                "via_ein": "222222222",
+                "target_name": "Context Recipient",
+                "target_ein": "333333333",
+                "first_years": [2022],
+                "second_years": [2023],
+                "amount": 10_000,
+                "returns_to_subject": False,
+            },
+            {
+                "via_name": "Intermediary B",
+                "via_ein": "444444444",
+                "target_name": "Filer",
+                "target_ein": "111111111",
+                "first_years": [2022],
+                "second_years": [2023],
+                "qualifying_first_years": [2022],
+                "qualifying_second_years": [2023],
+                "amount": 20_000,
+                "returns_to_subject": True,
+                "chronology_supported": True,
+            },
+            {
+                "via_name": "Intermediary C",
+                "via_ein": "555555555",
+                "target_name": "Filer",
+                "target_ein": "111111111",
+                "first_years": [2024],
+                "second_years": [2020],
+                "first_min_year": 2024,
+                "second_max_year": 2020,
+                "amount": 30_000,
+                "returns_to_subject": True,
+                "chronology_supported": False,
+            },
+            {
+                "via_name": "Intermediary D",
+                "via_ein": "666666666",
+                "target_name": "Filer",
+                "target_ein": "111111111",
+                "first_years": [2020],
+                "second_years": [2024],
+                "first_min_year": 2020,
+                "second_max_year": 2024,
+                "amount": 40_000,
+                "returns_to_subject": True,
+                "chronology_supported": False,
+            },
+        ]
+
+        context_copies = [dict(paths[0], via_name=f"Context {index}") for index in range(10)]
+        html = mod._grant_path_rows(paths + context_copies, "111111111")
+        self.assertIn("Two-step grant network sample", html)
+        self.assertIn('aria-label="About two-step grant paths"', html)
+        self.assertIn("they do not trace the same dollars", html)
+        self.assertIn("Context only — no return to filer", html)
+        self.assertIn("Plausible return — review lead", html)
+        self.assertIn("Reverse flow predates first hop", html)
+        self.assertIn("Return outside two-year window", html)
+        self.assertIn("Showing 12 of 14 paths", html)
+        self.assertIn("<th>Assessment</th>", html)
+        self.assertNotIn("<th>Lead</th>", html)
 
     def test_fac_absence_with_large_990_grants_is_unscored_coverage_only(self):
         ngo_core_data.run = lambda form: (

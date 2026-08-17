@@ -684,6 +684,11 @@ def _clean_ein(value: Any) -> Optional[str]:
 
 def _clean_uei(value: Any) -> Optional[str]:
     cleaned = re.sub(r"[^A-Za-z0-9]", "", "" if value is None else str(value)).upper()
+    # FAC uses GSA_MIGRATION when a legacy Census UEI was unavailable.  After
+    # punctuation stripping that sentinel happens to look like a 12-character
+    # UEI, so reject it explicitly instead of creating a false identifier.
+    if cleaned == "GSAMIGRATION":
+        return None
     return cleaned if len(cleaned) == 12 else None
 
 
@@ -1909,6 +1914,10 @@ def lookup_fac_by_ein(
                 "is_public",
             ):
                 general[field] = _bool_value(general[field])
+            # Older sidecars may already contain the normalized migration
+            # sentinel.  Sanitize it on read so callers do not have to rebuild
+            # a large completed database before the safety fix takes effect.
+            general["auditee_uei"] = _clean_uei(general.get("auditee_uei"))
             reports.append(
                 {
                     "report_id": report_id,
@@ -1927,9 +1936,10 @@ def lookup_fac_by_ein(
 
         ueis = sorted(
             {
-                row["auditee_uei"]
+                _clean_uei(row["auditee_uei"])
                 for row in selected
-                if row["ein_match"] == "primary_ein" and row["auditee_uei"]
+                if row["ein_match"] == "primary_ein"
+                and _clean_uei(row["auditee_uei"])
             }
         )[:3]
         coverage = json.loads(metadata.get("coverage_json", "{}"))
