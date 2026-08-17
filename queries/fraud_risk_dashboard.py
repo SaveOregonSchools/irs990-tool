@@ -4,6 +4,7 @@ import math
 import re
 import sqlite3
 import textwrap
+import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import date
@@ -2182,12 +2183,19 @@ def _grant_paths(conn, ein: str, connections: Dict[str, Dict]) -> List[Dict]:
     resolved = spec["table"]
     ein_col = spec["ein"]
     name_col = spec["name"]
+
+    def _dated_first_hop_total(item: Dict) -> float:
+        year_amounts = (
+            (item.get("year_amounts_by_type") or {}).get("Grant paid") or {}
+        )
+        return sum(_num(amount) for amount in year_amounts.values())
+
     first_hops = sorted(
         (
             item for item in connections.values()
             if item.get("ein") and "Grant paid" in item.get("relationships", set())
         ),
-        key=lambda item: item["amount_by_type"].get("Grant paid", 0),
+        key=_dated_first_hop_total,
         reverse=True,
     )[:8]
     paths = []
@@ -2204,6 +2212,10 @@ def _grant_paths(conn, ein: str, connections: Dict[str, Dict]) -> List[Dict]:
         first_years = sorted(first_year_amounts)
         if not first_years:
             continue
+        first_raw_total_amount = _num(
+            (first.get("amount_by_type") or {}).get("Grant paid")
+        )
+        first_dated_total_amount = sum(first_year_amounts.values())
         sql = f"""
         SELECT {ein_col}, MAX({name_col}), SUM(COALESCE(total_amount,0)),
                COUNT(*), MIN(tax_year), MAX(tax_year)
@@ -2252,6 +2264,11 @@ def _grant_paths(conn, ein: str, connections: Dict[str, Dict]) -> List[Dict]:
             ]
             qualifying_first_years = sorted({pair[0] for pair in qualifying_pairs})
             qualifying_second_years = sorted({pair[1] for pair in qualifying_pairs})
+            qualifying_first_amount = sum(
+                first_year_amounts[year] for year in qualifying_first_years
+            )
+            dated_amount = sum(second_amounts.values())
+            dated_rows = sum(second_rows.values())
             qualifying_amount = sum(second_amounts[year] for year in qualifying_second_years)
             qualifying_rows = sum(second_rows.get(year, 0) for year in qualifying_second_years)
             returns_to_subject = second_key == ein
@@ -2261,8 +2278,25 @@ def _grant_paths(conn, ein: str, connections: Dict[str, Dict]) -> List[Dict]:
                 "via_name": first.get("name"),
                 "target_ein": second_key,
                 "target_name": _text(second_name) or f"EIN {second_ein}",
-                "amount": qualifying_amount if returns_to_subject and chronology_supported else _num(amount),
-                "rows": qualifying_rows if returns_to_subject and chronology_supported else int(count or 0),
+                "first_hop_amount": (
+                    qualifying_first_amount
+                    if returns_to_subject and chronology_supported
+                    else first_dated_total_amount
+                ),
+                "first_hop_dated_amount": first_dated_total_amount,
+                "first_hop_total_amount": first_raw_total_amount,
+                "amount": (
+                    qualifying_amount
+                    if returns_to_subject and chronology_supported
+                    else dated_amount
+                ),
+                "rows": (
+                    qualifying_rows
+                    if returns_to_subject and chronology_supported
+                    else dated_rows
+                ),
+                "dated_amount": dated_amount,
+                "dated_rows": dated_rows,
                 "total_amount": _num(amount),
                 "total_rows": int(count or 0),
                 "first_years": first_years,
@@ -2419,7 +2453,7 @@ def _network_indicators(network: Dict, latest_year) -> List[Dict]:
             "Network",
             "Chronologically plausible two-step grant return",
             latest_year,
-            f"The filer paid {top.get('via_name')} in {_year_values_text(top.get('qualifying_first_years'))}; that intermediary reported {_money(top.get('amount'))} back to the filer in {_year_values_text(top.get('qualifying_second_years'))} across {top.get('rows')} qualifying row(s).",
+            f"The filer paid {top.get('via_name')} {_money(top.get('first_hop_amount'))} in {_year_values_text(top.get('qualifying_first_years'))}; that intermediary reported {_money(top.get('amount'))} back to the filer in {_year_values_text(top.get('qualifying_second_years'))} across {top.get('rows')} qualifying row(s).",
             "The ordering makes this an actionable circular-funding lead, although it does not establish that the same dollars returned.",
             "Inspect every grant row in the path, purposes, dates, restrictions, and governing-person overlap before drawing a conclusion.",
         ))
@@ -3542,7 +3576,8 @@ def _grant_path_rows(paths: List[Dict], subject_ein: str) -> str:
         <tr>
           <td>{_h(path.get('via_name'))}<div class="muted">{_h(path.get('via_ein'))}</div></td>
           <td>{_h(path.get('target_name'))}<div class="muted">{_h(path.get('target_ein'))}</div></td>
-          <td>{_h(first_years)}</td><td>{_h(second_years)}</td><td>{_money(path.get('amount'))}</td><td>{assessment}</td>
+          <td>{_h(first_years)}</td><td>{_money(path.get('first_hop_amount'))}</td>
+          <td>{_h(second_years)}</td><td>{_money(path.get('amount'))}</td><td>{assessment}</td>
         </tr>
         """)
     if plausible_count:
@@ -3573,13 +3608,14 @@ def _grant_path_rows(paths: List[Dict], subject_ein: str) -> str:
     <details class="network-paths" open>
       <summary><b>Two-step grant network sample ({len(paths)})</b></summary>
       <div class="panel-help-row">
-        <p class="panel-footnote"><b>{_h(path_summary)}</b>{_h(display_note)} Read each row left to right: the filer reported grants to the intermediary, and that intermediary separately reported grants to the second recipient. These rows show reported relationships; they do not trace the same dollars or establish pass-through funding.</p>
+        <p class="panel-footnote"><b>{_h(path_summary)}</b>{_h(display_note)} Read each row left to right: the filer reported grants to the intermediary, and that intermediary separately reported grants to the second recipient. Each amount totals dated grant rows for the adjacent years shown; rows without a tax year are excluded. When an intermediary has multiple second recipients, its first-hop amount repeats on each row; do not sum that column. These rows show reported relationships; they do not trace the same dollars or establish pass-through funding.</p>
         <details class="metric-help"><summary aria-label="About two-step grant paths">i</summary>
-          <div class="metric-help-card">This bounded view follows trusted resolved grant records from the analyzed filer to up to eight of its largest direct recipients, then to up to four of each recipient’s largest reported recipients. Only a second hop back to the analyzed EIN in the same tax year or within the next two tax years is marked as a plausible return and can create a review indicator. All other rows are context only.</div>
+          <div class="metric-help-card">The first-hop sample ranks up to eight direct recipients by dated grant totals, then shows up to four recipients reported by each intermediary. The first amount is reported from the filer to the intermediary; the second is separately reported from the intermediary to its recipient. Both displayed amounts exclude rows without a tax year. For a plausible-return row, both amounts and year lists are limited to the qualifying same-year-through-next-two-year window. Only a second hop back to the analyzed EIN in that window can create a review indicator. All other rows are context only.</div>
         </details>
       </div>
-      <div class="table-scroll"><table class="risk-table">
-        <thead><tr><th>First recipient / intermediary</th><th>Its recipient</th><th>First-hop years</th><th>Second-hop years</th><th>Intermediary’s reported grants to second recipient</th><th>Assessment</th></tr></thead>
+      <div class="table-scroll grant-path-table-scroll" role="region" aria-label="Scrollable two-step grant paths" tabindex="0"><table class="risk-table grant-path-table">
+        <caption>Reported grant paths from the filer through an intermediary to a second recipient</caption>
+        <thead><tr><th scope="col">Intermediary paid by filer</th><th scope="col">Second recipient paid by intermediary</th><th scope="col">Years filer paid intermediary</th><th scope="col">Amount filer paid intermediary</th><th scope="col">Years intermediary paid second recipient</th><th scope="col">Amount intermediary paid second recipient</th><th scope="col">Assessment</th></tr></thead>
         <tbody>{''.join(rows)}</tbody>
       </table></div>
     </details>
@@ -3809,6 +3845,54 @@ def _excerpt(value, limit: int = 700) -> str:
     return text_value if len(text_value) <= limit else text_value[: limit - 1].rstrip() + "…"
 
 
+_FAC_PUBLIC_REPORT_ID_RE = re.compile(
+    r"^(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:CENSUS|GSAFAC)-\d{10}$"
+)
+# Official FAC dissemination route (the application redirects to its short-lived
+# object download): https://github.com/GSA-TTS/FAC/blob/main/backend/dissemination/urls.py
+_FAC_PUBLIC_REPORT_BASE_URL = "https://app.fac.gov/dissemination/report/pdf/"
+
+
+def _fac_public_report_url(report: Dict) -> str:
+    """Return only a validated public FAC report-PDF URL."""
+
+    general = report.get("general") if isinstance(report.get("general"), dict) else {}
+    if general.get("is_public") is not True:
+        return ""
+
+    outer_id = _text(report.get("report_id")).strip()
+    general_id = _text(general.get("report_id")).strip()
+    if outer_id and general_id and outer_id != general_id:
+        return ""
+    report_id = general_id or outer_id
+    if not _FAC_PUBLIC_REPORT_ID_RE.fullmatch(report_id):
+        return ""
+    if int(report_id[:4]) < 2016:
+        return ""
+    return _FAC_PUBLIC_REPORT_BASE_URL + urllib.parse.quote(report_id, safe="")
+
+
+def _fac_report_pdf_detail(report: Dict) -> str:
+    url = _fac_public_report_url(report)
+    if url:
+        return (
+            '<div class="muted"><a href="'
+            + _h(url)
+            + '" target="_blank" rel="noopener">View audit report PDF</a></div>'
+        )
+
+    general = report.get("general") if isinstance(report.get("general"), dict) else {}
+    report_id = _text(general.get("report_id") or report.get("report_id")).strip()
+    audit_year = int(_num(general.get("audit_year"))) if general.get("audit_year") else 0
+    if report_id.casefold().startswith("historic:") or (audit_year and audit_year <= 2015):
+        reason = "Official FAC PDF link unavailable for this 1998–2015 archive record."
+    elif general.get("is_public") is not True:
+        reason = "Public audit report PDF unavailable for this record."
+    else:
+        reason = "Official audit report PDF link unavailable."
+    return f'<div class="muted">{_h(reason)}</div>'
+
+
 def _fac_audit_rows(reports: List[Dict]) -> str:
     rows = []
     for report in reports:
@@ -3826,7 +3910,7 @@ def _fac_audit_rows(reports: List[Dict]) -> str:
         )
         rows.append(f"""
         <tr>
-          <td>{_h(general.get('audit_year'))}<div class="muted">{_h(period)}</div></td>
+          <td>{_h(general.get('audit_year'))}<div class="muted">{_h(period)}</div>{_fac_report_pdf_detail(report)}</td>
           <td>{_money(general.get('total_amount_expended'))}</td>
           <td>{_h(threshold_state)}</td>
           <td>{_h(general.get('audit_type'))}<div class="muted">Low-risk auditee: {_h('Yes' if general.get('is_low_risk_auditee') is True else 'No' if general.get('is_low_risk_auditee') is False else 'Unknown')}</div></td>
@@ -3989,7 +4073,7 @@ def _fac_finding_rows(reports: List[Dict]) -> str:
             linked_detail = ""
         rows.append(f"""
         <tr>
-          <td>{_h(general.get('audit_year'))}</td>
+          <td>{_h(general.get('audit_year'))}{_fac_report_pdf_detail(report)}</td>
           <td>{_h(group.get('reference'))}{linked_detail}</td>
           <td>{_h('; '.join(group['requirements']))}</td>
           <td>{_h(', '.join(group['flags']) if group['flags'] else 'Finding reported')}</td>
@@ -4202,6 +4286,12 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
         .risk-card { padding: 8px; margin-bottom: 7px; }
         .risk-card h3 { font-size: 12px; }
         .network-table, .external-audit-table, .external-findings-table { min-width:0 !important; font-size:8px; }
+        .grant-path-table { min-width:0 !important; table-layout:auto; font-size:7px; }
+        .grant-path-table th, .grant-path-table td { padding:3px 2px; }
+        .grant-path-table caption { font-size:7px; padding-bottom:4px; }
+        .grant-path-table th:nth-child(4), .grant-path-table td:nth-child(4),
+        .grant-path-table th:nth-child(6), .grant-path-table td:nth-child(6) { white-space:normal; }
+        .grant-path-table-scroll { overflow:visible !important; }
         .network-map { min-width:0 !important; }
         .network-map-wrap { overflow:visible !important; }
         .table-scroll { overflow:visible !important; }
@@ -4291,12 +4381,27 @@ def _render_report(report: Dict, print_mode: bool = False) -> str:
       .inline-analyze button {{ min-height:28px; padding:4px 8px; }}
       .network-paths {{ margin-top:14px; }}
       .network-paths summary {{ cursor:pointer; }}
+      .grant-path-table-scroll:focus-visible {{ outline:2px solid #176b87; outline-offset:2px; }}
+      .grant-path-table {{ min-width:1080px; table-layout:fixed; }}
+      .grant-path-table caption {{ caption-side:top; padding:0 0 7px; color:var(--muted); font-size:12px; text-align:left; }}
+      .grant-path-table th {{ vertical-align:bottom; }}
+      .grant-path-table td {{ vertical-align:top; }}
+      .grant-path-table th:nth-child(1), .grant-path-table td:nth-child(1),
+      .grant-path-table th:nth-child(2), .grant-path-table td:nth-child(2) {{ width:17%; }}
+      .grant-path-table th:nth-child(3), .grant-path-table td:nth-child(3) {{ width:11%; }}
+      .grant-path-table th:nth-child(4), .grant-path-table td:nth-child(4) {{ width:11%; }}
+      .grant-path-table th:nth-child(5), .grant-path-table td:nth-child(5) {{ width:13%; }}
+      .grant-path-table th:nth-child(6), .grant-path-table td:nth-child(6) {{ width:13%; }}
+      .grant-path-table th:nth-child(7), .grant-path-table td:nth-child(7) {{ width:18%; }}
+      .grant-path-table th:nth-child(4), .grant-path-table td:nth-child(4),
+      .grant-path-table th:nth-child(6), .grant-path-table td:nth-child(6) {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
       .risk-path-badge {{ background:#b42318; }}
       .improvement-list {{ margin:0; padding-left:18px; }}
       .improvement-list li {{ margin:7px 0; line-height:1.35; }}
       @media (max-width: 780px) {{
         .risk-summary-grid {{ grid-template-columns:repeat(2,minmax(135px,1fr)); }}
         .network-map {{ min-width:700px; }}
+        .grant-path-table {{ min-width:980px; font-size:12px; }}
       }}
       @media (max-width: 460px) {{
         .risk-summary-grid {{ grid-template-columns:1fr; }}

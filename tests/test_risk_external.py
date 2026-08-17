@@ -154,6 +154,28 @@ class RiskExternalTests(unittest.TestCase):
         self.assertEqual(result["fac"]["reports"][0]["general"]["audit_year"], 2012)
         self.assertEqual(result["fec"]["status"], "blocked")
 
+    def test_offline_fac_inspects_text_for_every_bounded_selected_report(self):
+        captured = {}
+
+        def lookup(ein, **kwargs):
+            captured["ein"] = ein
+            captured.update(kwargs)
+            return {"status": "ok", "reports": [], "ueis": []}
+
+        risk_external._lookup_offline_fac = lookup
+        result = risk_external._fetch_fac_offline("123456789")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(captured["ein"], "123456789")
+        self.assertEqual(
+            captured["max_reports"], risk_external._MAX_COMBINED_FAC_REPORTS
+        )
+        self.assertEqual(
+            captured["max_text_reports"], risk_external._MAX_COMBINED_FAC_REPORTS
+        )
+        # The live adapter keeps its separate two-report API request ceiling.
+        self.assertEqual(risk_external._MAX_FAC_TEXT_REPORTS, 2)
+
     def test_missing_keys_are_explicit_without_accidental_calls(self):
         opener = FakeOpener()
         result = risk_external.fetch_external_checks(

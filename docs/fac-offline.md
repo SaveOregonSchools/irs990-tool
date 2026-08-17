@@ -266,8 +266,11 @@ references. `fac_report_eins` provides a union of primary and additional EINs.
 - Public Tribal submissions may omit notes, finding text, and corrective
   action plans when the entity elected statutory suppression. The importer
   cannot reconstruct withheld content.
-- The bulk CSVs do not contain the audit report PDF. PDF acquisition and text
-  extraction are a separate future pipeline.
+- The bulk CSVs do not contain audit-report PDFs. The dashboard can link to the
+  official FAC-hosted PDF only when a 2016-or-newer report has a validated public
+  FAC identifier; it does not download, cache, or extract those PDFs. PDF links
+  for historic 1998-2015 records are omitted when no authoritative public
+  locator is present.
 - Current files are replacement snapshots, not change feeds. Refresh by
   downloading a consistent new set and running an atomic replacement build.
 - The importer performs exact EIN matching only. It does not infer identity

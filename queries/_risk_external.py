@@ -854,7 +854,15 @@ def _fetch_fac_offline(ein: str) -> dict[str, Any]:
     if _lookup_offline_fac is None:
         return _status("not_configured", "offline_module_unavailable")
     try:
-        result = _lookup_offline_fac(ein, max_reports=_MAX_COMBINED_FAC_REPORTS)
+        # The sidecar lookup is local SQLite work, not an API request. Inspect
+        # finding/CAP text for every selected report so an older migrated
+        # GSA_MIGRATION row is not mislabeled as an uninspected bounded result.
+        # Both the report count and per-report text rows remain bounded.
+        result = _lookup_offline_fac(
+            ein,
+            max_reports=_MAX_COMBINED_FAC_REPORTS,
+            max_text_reports=_MAX_COMBINED_FAC_REPORTS,
+        )
     except Exception:
         return {"status": "error", "error": "offline_lookup_failed", "reports": [], "ueis": []}
     return result if isinstance(result, dict) else {

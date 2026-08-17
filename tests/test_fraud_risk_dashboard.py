@@ -380,6 +380,9 @@ class FraudRiskDashboardTests(unittest.TestCase):
             ".panel-help-row .metric-help-card { left:auto; right:0; text-align:left; }",
             html,
         )
+        self.assertIn(".grant-path-table { min-width:1080px; table-layout:fixed; }", html)
+        self.assertIn(".grant-path-table { min-width:980px; font-size:12px; }", html)
+        self.assertIn(".grant-path-table-scroll:focus-visible", html)
         self.assertIn("@media (max-width: 460px)", html)
         self.assertIn("Screening result, not a fraud probability or determination", html)
         self.assertIn("Data Coverage &amp; Remaining Work", html)
@@ -822,6 +825,104 @@ class FraudRiskDashboardTests(unittest.TestCase):
         for legacy_text in ("NONE", "NONCOMPLIANCE", "COMPLIANCE"):
             self.assertEqual(mod._fac_requirement_text(legacy_text), legacy_text)
 
+    def test_fac_report_pdf_links_are_public_strict_and_fail_closed(self):
+        report_id = "2018-06-CENSUS-0000074498"
+        public_report = {
+            "report_id": report_id,
+            "general": {
+                "report_id": report_id,
+                "audit_year": 2018,
+                "is_public": True,
+            },
+            "findings": [{
+                "reference_number": "2018-001",
+                "type_requirement": "L",
+            }],
+        }
+        expected_url = (
+            "https://app.fac.gov/dissemination/report/pdf/"
+            "2018-06-CENSUS-0000074498"
+        )
+
+        self.assertEqual(mod._fac_public_report_url(public_report), expected_url)
+        for rows in (
+            mod._fac_audit_rows([public_report]),
+            mod._fac_finding_rows([public_report]),
+        ):
+            self.assertIn(f'href="{expected_url}"', rows)
+            self.assertIn('target="_blank" rel="noopener"', rows)
+            self.assertIn("View audit report PDF", rows)
+
+        rejected = [
+            dict(public_report, report_id="2018-06-CENSUS-0000000001"),
+            {
+                **public_report,
+                "general": {**public_report["general"], "is_public": False},
+            },
+            {
+                **public_report,
+                "general": {
+                    **public_report["general"],
+                    "report_id": report_id + "?download=1",
+                },
+                "report_id": report_id + "?download=1",
+            },
+            {
+                "report_id": "2015-06-CENSUS-0000074498",
+                "general": {
+                    "report_id": "2015-06-CENSUS-0000074498",
+                    "audit_year": 2015,
+                    "is_public": True,
+                },
+            },
+            {
+                "report_id": "historic:2014:74498",
+                "general": {
+                    "report_id": "historic:2014:74498",
+                    "audit_year": 2014,
+                    "is_public": True,
+                },
+            },
+        ]
+        for unsafe_report in rejected:
+            self.assertEqual(mod._fac_public_report_url(unsafe_report), "")
+            self.assertNotIn("href=", mod._fac_report_pdf_detail(unsafe_report))
+
+        historic_detail = mod._fac_report_pdf_detail(rejected[-1])
+        self.assertIn("1998–2015 archive record", historic_detail)
+        private_detail = mod._fac_report_pdf_detail(rejected[1])
+        self.assertIn("Public audit report PDF unavailable", private_detail)
+
+    def test_fac_2016_loaded_migration_text_is_not_called_uninspected(self):
+        report_id = "2016-06-CENSUS-0000074498"
+        report = {
+            "report_id": report_id,
+            "general": {
+                "report_id": report_id,
+                "audit_year": 2016,
+                "is_public": True,
+            },
+            "findings_text_status": "ok",
+            "corrective_action_plans_status": "ok",
+            "findings": [{
+                "reference_number": "2016-001",
+                "type_requirement": "B",
+            }],
+            "findings_text": [{
+                "finding_ref_number": "2016-001",
+                "finding_text": "GSA_MIGRATION",
+            }],
+            "corrective_action_plans": [{
+                "finding_ref_number": "2016-001",
+                "planned_action": "GSAMIGRATION",
+            }],
+        }
+
+        rows = mod._fac_finding_rows([report])
+        self.assertEqual(rows.count("legacy Census text field was empty"), 2)
+        self.assertNotIn("Not loaded in this bounded dashboard summary", rows)
+        self.assertNotIn("GSA_MIGRATION", rows)
+
     def test_fac_missing_detail_copy_distinguishes_summary_archive_error_and_source(self):
         current = {"report_id": "FAC-1", "general": {"audit_year": 2024}}
         self.assertEqual(
@@ -861,6 +962,7 @@ class FraudRiskDashboardTests(unittest.TestCase):
                 "target_ein": "333333333",
                 "first_years": [2022],
                 "second_years": [2023],
+                "first_hop_amount": 5_000,
                 "amount": 10_000,
                 "returns_to_subject": False,
             },
@@ -873,6 +975,7 @@ class FraudRiskDashboardTests(unittest.TestCase):
                 "second_years": [2023],
                 "qualifying_first_years": [2022],
                 "qualifying_second_years": [2023],
+                "first_hop_amount": 12_000,
                 "amount": 20_000,
                 "returns_to_subject": True,
                 "chronology_supported": True,
@@ -886,6 +989,7 @@ class FraudRiskDashboardTests(unittest.TestCase):
                 "second_years": [2020],
                 "first_min_year": 2024,
                 "second_max_year": 2020,
+                "first_hop_amount": 15_000,
                 "amount": 30_000,
                 "returns_to_subject": True,
                 "chronology_supported": False,
@@ -899,6 +1003,7 @@ class FraudRiskDashboardTests(unittest.TestCase):
                 "second_years": [2024],
                 "first_min_year": 2020,
                 "second_max_year": 2024,
+                "first_hop_amount": 20_000,
                 "amount": 40_000,
                 "returns_to_subject": True,
                 "chronology_supported": False,
@@ -915,8 +1020,124 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("Reverse flow predates first hop", html)
         self.assertIn("Return outside two-year window", html)
         self.assertIn("Showing 12 of 14 paths", html)
-        self.assertIn("<th>Assessment</th>", html)
+        self.assertIn("Each amount totals dated grant rows for the adjacent years shown", html)
+        self.assertIn("rows without a tax year are excluded", html)
+        self.assertIn(
+            "its first-hop amount repeats on each row; do not sum that column",
+            html,
+        )
+        self.assertIn("Intermediary paid by filer", html)
+        self.assertIn("Second recipient paid by intermediary", html)
+        self.assertIn("Amount filer paid intermediary", html)
+        self.assertIn("Amount intermediary paid second recipient", html)
+        self.assertIn('role="region" aria-label="Scrollable two-step grant paths" tabindex="0"', html)
+        self.assertIn("<caption>Reported grant paths from the filer", html)
+        self.assertEqual(html.count('scope="col"'), 7)
+        self.assertIn("<td>2022</td><td>$5,000</td>", html)
+        self.assertIn("<td>2023</td><td>$10,000</td>", html)
+        self.assertIn('<th scope="col">Assessment</th>', html)
         self.assertNotIn("<th>Lead</th>", html)
+
+    def test_grant_paths_exclude_undated_rows_and_repeat_first_hop_consistently(self):
+        self.conn.execute("DELETE FROM grant_recipient_resolved")
+        self.conn.executemany(
+            "INSERT INTO grant_recipient_resolved VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (20, "X1", "222222222", "Intermediary", 2025, "333333333", "Recipient A", 200_000, "333333333", "Recipient A", "resolved", 0.99, ""),
+                (21, "X2", "222222222", "Intermediary", None, "333333333", "Recipient A", 900_000, "333333333", "Recipient A", "resolved", 0.99, ""),
+                (22, "X3", "222222222", "Intermediary", 2026, "444444444", "Recipient B", 300_000, "444444444", "Recipient B", "resolved", 0.99, ""),
+            ],
+        )
+        connections = {
+            "222222222": {
+                "ein": "222222222",
+                "name": "Intermediary",
+                "relationships": {"Grant paid"},
+                "amount_by_type": {"Grant paid": 700_000},
+                "year_amounts_by_type": {"Grant paid": {2024: 500_000}},
+            },
+        }
+
+        paths = mod._grant_paths(self.conn, "111111111", connections)
+        self.assertEqual(len(paths), 2)
+        recipient_a = next(path for path in paths if path["target_ein"] == "333333333")
+        self.assertEqual(recipient_a["amount"], 200_000.0)
+        self.assertEqual(recipient_a["rows"], 1)
+        self.assertEqual(recipient_a["dated_amount"], 200_000.0)
+        self.assertEqual(recipient_a["dated_rows"], 1)
+        self.assertEqual(recipient_a["total_amount"], 1_100_000.0)
+        self.assertEqual(recipient_a["total_rows"], 2)
+        self.assertEqual(recipient_a["first_hop_amount"], 500_000.0)
+        self.assertEqual(recipient_a["first_hop_dated_amount"], 500_000.0)
+        self.assertEqual(recipient_a["first_hop_total_amount"], 700_000.0)
+        self.assertEqual({path["first_hop_amount"] for path in paths}, {500_000.0})
+
+        html = mod._grant_path_rows(paths, "111111111")
+        self.assertEqual(html.count("$500,000"), 2)
+        self.assertIn("$200,000", html)
+        self.assertNotIn("$1,100,000", html)
+
+    def test_grant_path_qualifying_amounts_do_not_double_count_multi_year_pairs(self):
+        self.conn.execute("DELETE FROM grant_recipient_resolved")
+        self.conn.executemany(
+            "INSERT INTO grant_recipient_resolved VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (30, "Y1", "222222222", "Intermediary", 2023, "111111111", "Filer", 50_000, "111111111", "Filer", "resolved", 0.99, ""),
+                (31, "Y2", "222222222", "Intermediary", 2024, "111111111", "Filer", 60_000, "111111111", "Filer", "resolved", 0.99, ""),
+            ],
+        )
+        connections = {
+            "222222222": {
+                "ein": "222222222",
+                "name": "Intermediary",
+                "relationships": {"Grant paid"},
+                "amount_by_type": {"Grant paid": 300_000},
+                "year_amounts_by_type": {
+                    "Grant paid": {2022: 100_000, 2023: 200_000}
+                },
+            },
+        }
+
+        path = mod._grant_paths(self.conn, "111111111", connections)[0]
+        self.assertTrue(path["chronology_supported"])
+        self.assertEqual(path["qualifying_first_years"], [2022, 2023])
+        self.assertEqual(path["qualifying_second_years"], [2023, 2024])
+        self.assertEqual(path["first_hop_amount"], 300_000.0)
+        self.assertEqual(path["amount"], 110_000.0)
+        self.assertEqual(path["rows"], 2)
+
+    def test_grant_path_first_hop_sample_ranks_dated_totals(self):
+        self.conn.execute("DELETE FROM grant_recipient_resolved")
+        connections = {}
+        second_hops = []
+        for index in range(9):
+            via_ein = f"2{index:08d}"
+            target_ein = f"3{index:08d}"
+            dated_amount = float(index + 1)
+            connections[via_ein] = {
+                "ein": via_ein,
+                "name": f"Intermediary {index}",
+                "relationships": {"Grant paid"},
+                "amount_by_type": {
+                    "Grant paid": 1_000_000 if index == 0 else dated_amount
+                },
+                "year_amounts_by_type": {"Grant paid": {2024: dated_amount}},
+            }
+            second_hops.append(
+                (100 + index, f"Z{index}", via_ein, f"Intermediary {index}", 2025,
+                 target_ein, f"Recipient {index}", 100, target_ein,
+                 f"Recipient {index}", "resolved", 0.99, "")
+            )
+        self.conn.executemany(
+            "INSERT INTO grant_recipient_resolved VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            second_hops,
+        )
+
+        paths = mod._grant_paths(self.conn, "111111111", connections)
+        selected = {path["via_ein"] for path in paths}
+        self.assertEqual(len(selected), 8)
+        self.assertNotIn("200000000", selected)
+        self.assertIn("200000001", selected)
 
     def test_fac_absence_with_large_990_grants_is_unscored_coverage_only(self):
         ngo_core_data.run = lambda form: (
@@ -1110,6 +1331,8 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertNotIn("Chronologically plausible two-step grant return", titles)
         return_path = next(path for path in network["paths"] if path.get("returns_to_subject"))
         self.assertFalse(return_path["chronology_supported"])
+        self.assertEqual(return_path["first_hop_amount"], 200_000.0)
+        self.assertEqual(return_path["first_hop_total_amount"], 200_000.0)
 
         self.conn.execute(
             "INSERT INTO grant_recipient_resolved VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1125,8 +1348,17 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertTrue(return_path["chronology_supported"])
         self.assertEqual(return_path["qualifying_first_years"], [2024])
         self.assertEqual(return_path["qualifying_second_years"], [2025])
+        self.assertEqual(return_path["first_hop_amount"], 120_000.0)
+        self.assertEqual(return_path["first_hop_total_amount"], 200_000.0)
         self.assertEqual(return_path["amount"], 110_000.0)
         self.assertEqual(return_path["rows"], 1)
+        circular = next(
+            item
+            for item in indicators
+            if item["title"] == "Chronologically plausible two-step grant return"
+        )
+        self.assertIn("paid Risky Foundation $120,000 in 2024", circular["evidence"])
+        self.assertIn("reported $110,000 back to the filer in 2025", circular["evidence"])
 
     def test_reviewed_enhanced_grant_layer_drives_dashboard_network(self):
         self.conn.executescript(
@@ -1505,6 +1737,11 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("min-width:0 !important", pdf)
         self.assertIn(".risk-summary-grid { grid-template-columns: repeat(5, 1fr); }", pdf)
         self.assertIn(".metric-help { display:none !important; }", pdf)
+        self.assertIn(
+            ".grant-path-table { min-width:0 !important; table-layout:auto; font-size:7px; }",
+            pdf,
+        )
+        self.assertIn(".grant-path-table-scroll { overflow:visible !important; }", pdf)
         self.assertIn("The score ranges from 0–100", pdf)
 
     def test_name_search_returns_selectable_matches(self):
