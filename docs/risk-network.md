@@ -64,15 +64,15 @@ collations), and the planner must report an indexed `SEARCH`. Grant-ID keys
 must be exact, non-null uniqueness guarantees; nullable unique indexes and the
 SQLite `INTEGER PRIMARY KEY DESC` non-rowid trap are rejected.
 
-For the repaired August 2026 archive, the user-authorized production build is
-running on `C:` with source `db\irs990-repaired-20260815-003434.db`, final
-sidecar `db\risk_network.db`, and SQLite sort scratch
-`db\_risk_network_tmp`. The latest plan estimated 25.9-56.1 GiB for the
-finished sidecar, but peak usage can be roughly two to three times the finished
-size during index/hub construction or replacement. Retain the conservative
-180 GiB free-space floor and recheck current `C:` capacity before any future
-full build; do not rely on an older free-space snapshot or launch a second
-builder while this one is running.
+For the repaired August 2026 archive, the production build completed on August
+16 and atomically published `db\risk_network.db` from
+`db\irs990-repaired-20260815-003434.db`. The accepted 69.60 GiB sidecar contains
+89,256,222 edges for 5,723,809 selected filings and 893,103 covered EINs. The
+actual size exceeded the preliminary 25.9-56.1 GiB estimate. Peak usage can be
+roughly two to three times the finished size during index/hub construction or
+replacement, so retain the conservative 180 GiB free-space floor and recheck
+current capacity before any future full build; do not rely on an older
+free-space snapshot or launch a second builder while one is running.
 
 The current paths, and the preflight to repeat before a future rebuild, are:
 
@@ -192,14 +192,12 @@ $env:IRS_DB_PATH = $networkSource
 $env:IRS_RISK_NETWORK_DB_PATH = $networkSidecar
 ```
 
-Before the first full build, audit and repair any replayed child rows in the
-source database. Historical reprocessing has been confirmed to duplicate whole
-filing child sets (grants and people rows), which can inflate amounts and edge
-counts. The dashboard quarantines focal grant years that fail its core-versus-
-detail reconciliation, but that does not clean other organizations or every
-child family. After a confirmed cleanup, rebuild deterministic recipient
-resolution, the applied/enhanced grant layer, and then this sidecar in that
-order.
+The August 2026 build was preceded by an audit and repair of replayed child rows
+in the source database. Historical reprocessing had duplicated whole filing
+child sets (grants and people rows), which can inflate amounts and edge counts.
+For a future full build from a newly repaired or replaced source, repeat the
+audit, rebuild deterministic recipient resolution and the applied/enhanced
+grant layer, and then rebuild this sidecar in that order.
 
 Stop IRS/grant import writers first;
 the builder holds one consistent read snapshot across the entire streamed

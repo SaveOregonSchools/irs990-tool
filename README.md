@@ -17,7 +17,10 @@ The repository includes three related systems:
 The database and XML collection are intentionally not stored in Git. You can
 build a database from XML or point the application at an existing `irs990.db`.
 SQLite database files are portable between Windows and Linux when copied from a
-clean, consistent snapshot.
+clean, consistent snapshot. The precomputed `risk_network.db` is the exception:
+its freshness safeguard includes the main database's resolved path and
+filesystem identity, so rebuild that sidecar after moving the main database to
+another machine or filesystem.
 
 ## Capabilities
 

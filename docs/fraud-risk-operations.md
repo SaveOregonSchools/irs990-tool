@@ -9,16 +9,16 @@ PowerShell.
 > finding. Name matches, network links, and external records are investigative
 > leads. Verify identity, dates, source records, and context before escalation.
 
-## Deployment state on August 15, 2026
+## Deployment state after acceptance testing on August 21, 2026
 
 | Operation | State in this workspace |
 |---|---|
 | Full IRS/OFAC/HHS screening download and atomic sidecar build | **Run.** `db\screening_data.db` exists (about 1.82 GiB). |
-| Full risk-network planning command | **Run read-only.** The latest plan estimated 5,723,809 filings, a 92,650,326 source-row ceiling, and a 25.9-56.1 GiB finished sidecar. |
+| Full risk-network planning command | **Completed.** The full plan selected 5,723,809 filings and estimated a 92,650,326 source-row ceiling. |
 | FAC current/historical bulk download and sidecar build | **Run and verified.** `db\fac_audits.db` is 24.32 GiB, source-as-of August 14, 2026, and covers 19,153,987 accepted source rows and 1,135,938 reports from 1998–2026. |
 | Production child-row replay audit/repair and post-repair grant rebuild | **Completed and verified.** The repaired main database is `db\irs990-repaired-20260815-003434.db`; its matching grant workspace and enhanced applied layer are complete. |
-| Full risk-network build | **Running on `C:`.** It reads `db\irs990-repaired-20260815-003434.db`, stages a `.building-*` database beside the `db\risk_network.db` target, and uses `db\_risk_network_tmp` for SQLite scratch. `db\risk_network.db` is not published until final validation and atomic replacement succeed. |
-| Personal API registration and secret installation | **Not performed.** Shared `DEMO_KEY` values are configured for FAC/FEC development but can exhaust their shared quota; no SAM key is installed. Secret values were not printed. |
+| Full risk-network build | **Completed and verified.** The 69.60 GiB `db\risk_network.db` was published on August 16, 2026 after full validation. It contains 89,256,222 edges for 5,723,809 selected filings and 893,103 covered EINs, with exact lineage to `db\irs990-repaired-20260815-003434.db`. |
+| Personal API registration and secret installation | **Completed and acceptance-tested locally.** Personal non-demo FAC/FEC, SAM, and LDA credentials load from the ignored `.env`; secret values were not printed or committed. |
 
 ## Credentials and no-key coverage
 
@@ -48,13 +48,14 @@ Keep `.env` local and never commit it. Populate only the credentials obtained
 for this installation; retain the conservative SAM defaults:
 
 ```dotenv
-IRS_DB_PATH=db/irs990.db
+IRS_DB_PATH=db/irs990-repaired-20260815-003434.db
+IRS_GRANT_WORK_DB_PATH=db/grant_matching_work-repaired-20260815-003434.db
 FAC_API_KEY=replace_with_personal_data_gov_key
 FEC_API_KEY=replace_with_the_same_personal_data_gov_key
 SAM_API_KEY=replace_with_personal_sam_key
 SAM_MAX_UEIS=1
 SAM_REQUEST_BUDGET=3
-LDA_API_KEY=
+LDA_API_KEY=replace_with_personal_lda_key_or_leave_blank
 FAC_DB_PATH=db/fac_audits.db
 IRS_SCREENING_DB_PATH=db/screening_data.db
 IRS_SCREENING_CACHE_DIR=downloads/screening
@@ -82,11 +83,12 @@ Local, no-network smoke checks:
 
 ```powershell
 .\.venv\Scripts\python.exe -c "from queries._risk_screening import lookup_irs_status; r=lookup_irs_status('000587764'); print(r.get('available'), len(r.get('records') or r.get('results') or []), r.get('error'))"
-.\.venv\Scripts\python.exe -c "from queries._risk_network import available, risk_network_path; print(risk_network_path(), available())"
+.\.venv\Scripts\python.exe -c "import common; from queries._risk_network import available, risk_network_path; print(risk_network_path(), available())"
 ```
 
-The second command should remain `False` until the full network sidecar exists
-and matches the current physical identity and size/mtime of `IRS_DB_PATH`.
+The second command must return `True` for this completed deployment. `False`
+means the sidecar is missing, incomplete, or stale for the configured physical
+identity and size/mtime of `IRS_DB_PATH`.
 
 ## Refresh public sidecars
 
@@ -152,7 +154,7 @@ bounded lookup with a real target EIN:
 See [fac-offline.md](fac-offline.md) for source dictionaries, checksums, and
 download-only/manual alternatives.
 
-## Required maintenance before the first full network build
+## Completed August 2026 repair/build procedure
 
 Production history has confirmed replayed whole child-row sets for filings,
 including grants and people. This can inflate amounts and relationship edges.
@@ -162,7 +164,9 @@ does not cover every repeated child family. The loader now deletes every known
 repeated child family transactionally when replacing a filing, preventing the
 same future replay behavior.
 
-Use this order; do not build the global network from the known-dirty children:
+This deployment used the following order. Repeat it before a future full build
+from any newly repaired or replaced source; do not build the global network
+from known-dirty children:
 
 1. **Stop writers.** Stop Flask, guided imports, XML loaders, grant jobs, DB
    Browser writes, and any other process holding either SQLite database.
@@ -332,11 +336,10 @@ Use this order; do not build the global network from the known-dirty children:
 
 ## Full risk-network build
 
-The user-authorized production build is running on `C:`. It uses the repaired
-versioned source, stages its same-directory temporary database beside the final
-sidecar, and keeps SQLite sort scratch under `db`. Do not launch a second
-builder while this run is active. These are the current paths and the capacity
-preflight to repeat before a future rebuild:
+The accepted production build completed on `C:` and atomically published
+`db\risk_network.db` from the repaired versioned source. Its final size is
+69.60 GiB. The following paths and capacity preflight are retained for a future
+full rebuild; never launch a second builder while one is active:
 
 ```powershell
 $networkSource = (Resolve-Path 'db\irs990-repaired-20260815-003434.db').Path
@@ -351,9 +354,11 @@ if ($networkDrive.Free -lt 180GB) {
 }
 ```
 
-The latest plan estimated a **25.9-56.1 GiB** finished sidecar. Budget a
-conservative **two to three times final size** for the `.building-*` database,
-old sidecar during replacement, rollback/index work, and SQLite sort scratch.
+The preliminary plan estimated a **25.9-56.1 GiB** finished sidecar, but the
+accepted build finished at **69.60 GiB**. Use the observed size for future
+planning and budget a conservative **two to three times final size** for the
+`.building-*` database, old sidecar during replacement, rollback/index work,
+and SQLite sort scratch.
 Retain a conservative **180 GiB free-space floor** and recheck current `C:`
 capacity rather than relying on an older snapshot. Keep process-local
 `TEMP`/`TMP` on `$networkScratch` while the builder runs so index-sort scratch
@@ -393,7 +398,7 @@ finally {
 }
 ```
 
-After completion, restart Flask, rerun the local `available()` smoke check, and
-confirm the dashboard reports complete indexed-network coverage and current
-source lineage. Any later replacement or in-place size/mtime change to the main
-database intentionally marks the sidecar stale until it is rebuilt.
+The accepted build passed the local `available()` smoke check and dashboard
+acceptance testing. After any future rebuild, repeat both checks. Any later
+replacement, relocation, or in-place size/mtime change to the main database
+intentionally marks the sidecar stale until it is rebuilt.

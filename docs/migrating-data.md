@@ -34,9 +34,15 @@ They do not need to be rewritten when the archive moves.
    in progress.
 2. Copy the XML archive while preserving its directory hierarchy and filename
    case. Linux filesystems are normally case-sensitive.
-3. Copy the main database and, if desired, the existing source-inventory and
-   grant-work sidecars. Do not copy stale `-wal` or `-shm` files independently.
-4. Set `IRS_DB_PATH` and `IRS_XML_ROOT` for the destination paths.
+3. Copy the main database and the application sidecars needed on the destination:
+   the grant-work database, FAC audit database, screening database, source
+   inventory, and OLMS database. Do not copy stale `-wal` or `-shm` files
+   independently. Do not treat a copied `risk_network.db` as portable; its
+   source-lineage check includes the main database's resolved path and
+   filesystem identity, so rebuild it on the destination after the main copy.
+4. Set `IRS_DB_PATH`, `IRS_GRANT_WORK_DB_PATH`, `FAC_DB_PATH`,
+   `IRS_SCREENING_DB_PATH`, `IRS_RISK_NETWORK_DB_PATH`, and any applicable XML
+   or OLMS paths for the destination.
 5. Keep the old source inventory as a rollback copy. Build a new sidecar under a
    temporary name instead of overwriting the only known-good inventory.
 6. Review the scan summary and CSV reports, then spot-check filing downloads in
@@ -48,9 +54,36 @@ Example Linux settings:
 
 ```dotenv
 IRS_DB_PATH=/var/lib/irs990-tool/db/irs990.db
+IRS_GRANT_WORK_DB_PATH=/var/lib/irs990-tool/db/grant_matching_work.db
+FAC_DB_PATH=/var/lib/irs990-tool/db/fac_audits.db
+IRS_SCREENING_DB_PATH=/var/lib/irs990-tool/db/screening_data.db
+IRS_RISK_NETWORK_DB_PATH=/var/lib/irs990-tool/db/risk_network.db
 IRS_XML_ROOT=/srv/irs990-data/xml
 IRS_XML_INVENTORY_PATH=/var/lib/irs990-tool/db/irs990_sources.new.db
+OLMS_DB_PATH=/var/lib/irs990-tool/db/olms.db
 ```
+
+After copying the main database to a different machine or filesystem, rebuild
+the lineage-bound risk-network sidecar there. Plan for at least 180 GiB free on
+the destination filesystem during a full build:
+
+```bash
+mkdir -p /var/lib/irs990-tool/db/_risk_network_tmp
+export TMPDIR=/var/lib/irs990-tool/db/_risk_network_tmp
+export SQLITE_TMPDIR=/var/lib/irs990-tool/db/_risk_network_tmp
+python build_risk_network.py plan \
+  --db /var/lib/irs990-tool/db/irs990.db \
+  --sidecar /var/lib/irs990-tool/db/risk_network.db \
+  --full
+python build_risk_network.py rebuild \
+  --db /var/lib/irs990-tool/db/irs990.db \
+  --sidecar /var/lib/irs990-tool/db/risk_network.db \
+  --full --yes
+```
+
+Copying the Windows-built `risk_network.db` and editing its metadata is not a
+supported migration shortcut. Leave the dashboard network panel unavailable
+until the destination rebuild passes its own source-lineage validation.
 
 Build the replacement inventory:
 
