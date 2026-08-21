@@ -17,7 +17,8 @@ PowerShell.
 | Full risk-network planning command | **Completed.** The full plan selected 5,723,809 filings and estimated a 92,650,326 source-row ceiling. |
 | FAC current/historical bulk download and sidecar build | **Run and verified.** `db\fac_audits.db` is 24.32 GiB, source-as-of August 14, 2026, and covers 19,153,987 accepted source rows and 1,135,938 reports from 1998–2026. |
 | Production child-row replay audit/repair and post-repair grant rebuild | **Completed and verified.** The repaired main database is `db\irs990-repaired-20260815-003434.db`; its matching grant workspace and enhanced applied layer are complete. |
-| Full risk-network build | **Completed and verified.** The 69.60 GiB `db\risk_network.db` was published on August 16, 2026 after full validation. It contains 89,256,222 edges for 5,723,809 selected filings and 893,103 covered EINs, with exact lineage to `db\irs990-repaired-20260815-003434.db`. |
+| Full risk-network build | **Completed and verified.** The 69.60 GiB `db\risk_network.db` was published on August 16, 2026 after full validation. It contains 89,256,222 edges for 5,723,809 selected filings and 893,103 covered EINs, with exact portable lineage to `db\irs990-repaired-20260815-003434.db`. |
+| Portable risk-network identity migration | **Completed and verified on August 21, 2026.** The metadata-only in-place migration preserved 89,256,222 edges, 5,723,809 filing-state rows, 12,305,988 node rows, and 15 source-status rows. The ignored audit receipt is `exports\risk-network-portability-production-20260821.json`; the runtime accepts the pair through `portable_v1`. |
 | Personal API registration and secret installation | **Completed and acceptance-tested locally.** Personal non-demo FAC/FEC, SAM, and LDA credentials load from the ignored `.env`; secret values were not printed or committed. |
 
 ## Credentials and no-key coverage
@@ -87,8 +88,9 @@ Local, no-network smoke checks:
 ```
 
 The second command must return `True` for this completed deployment. `False`
-means the sidecar is missing, incomplete, or stale for the configured physical
-identity and size/mtime of `IRS_DB_PATH`.
+means the sidecar is missing, incomplete, has a populated SQLite auxiliary, or
+is stale for the configured main database's portable UUID/revision and
+checkpointed file snapshot.
 
 ## Refresh public sidecars
 
@@ -400,5 +402,9 @@ finally {
 
 The accepted build passed the local `available()` smoke check and dashboard
 acceptance testing. After any future rebuild, repeat both checks. Any later
-replacement, relocation, or in-place size/mtime change to the main database
-intentionally marks the sidecar stale until it is rebuilt.
+replacement or source-data change to the main database intentionally marks the
+sidecar stale until it is fully rebuilt. Relocating an exact checkpointed
+main/sidecar pair does not: the authoritative identity is portable and does not
+contain a path, drive letter, device number, inode, or modification time. See
+[Moving an Existing Installation](migrating-data.md) for copy,
+hash-verification, and legacy in-place migration steps.

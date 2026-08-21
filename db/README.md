@@ -17,6 +17,7 @@ Related local databases may include:
 | `irs990.db` | Main application database and final enhanced grant results. |
 | `irs990_sources.db` | Regenerable original-XML inventory used for filing downloads. |
 | `grant_matching_work.db` | Bulky enhanced grant-matching workspace. |
+| `risk_network.db` | Precomputed fraud/risk relationship edges bound to the main database's portable identity. |
 | `olms.db` | Rebuildable OLMS labor-organization research sidecar. |
 
 All are ignored by Git.
@@ -87,6 +88,13 @@ sqlite3 db/irs990.db ".backup db/irs990_backup_YYYYMMDD.db"
 A closed, checkpointed database can also be copied directly. Do not treat
 `-wal` or `-shm` files as standalone backups, and do not copy an actively
 changing database without SQLite's backup mechanism.
+
+Copy `risk_network.db` together with the exact checkpointed main database it
+describes. Current pairs remain valid across Windows/Linux and path/filesystem
+changes because their authoritative identity is stored inside the databases;
+verify full-file hashes after transfer. Upgrade an older physical-lineage pair
+with `migrate_risk_network_portability.py` before moving it, and never edit its
+lineage metadata by hand.
 
 Keep these local and out of Git:
 

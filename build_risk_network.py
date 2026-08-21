@@ -24,9 +24,19 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
+from risk_source_identity import (
+    PortableSourceStamp,
+    RiskSourceIdentityError,
+    parse_portable_metadata,
+    portable_source_stamp,
+    read_risk_source_identity,
+    validate_portable_source,
+)
+
 
 SCHEMA_VERSION = "1"
 DEFAULT_SIDECAR_NAME = "risk_network.db"
+DEFAULT_MAIN_DB_PATH = Path(__file__).resolve().parent / "db" / "irs990.db"
 MAX_INCREMENTAL_FILINGS = 100_000
 ENHANCED_GRANT_VIEW = "grant_recipient_resolved_plus_ai_v1"
 DETERMINISTIC_GRANT_TABLE = "grant_recipient_resolved"
@@ -243,9 +253,17 @@ class AuxiliaryFileState:
 
 @dataclass(frozen=True)
 class SourceSnapshot:
+    """Portable source stamp plus local guards for one build process.
+
+    ``lineage_id`` and the filesystem timestamps deliberately remain local
+    publication guards only.  They are never written as authoritative sidecar
+    lineage for a portable build.
+    """
+
     lineage_id: str
     file_size: int
     file_mtime_ns: int
+    portable_stamp: PortableSourceStamp
     data_version: int
     journal_mode: str
     wal: AuxiliaryFileState
@@ -1747,9 +1765,6 @@ def write_meta(conn: sqlite3.Connection, source_path: Path, mode: str,
         "build_scope": build_scope,
         "built_at": utc_now(),
         "source_file_name": source_path.name,
-        "source_lineage_id": source_snapshot.lineage_id,
-        "source_file_size": str(source_snapshot.file_size),
-        "source_file_mtime_ns": str(source_snapshot.file_mtime_ns),
         "source_data_version_at_snapshot": str(source_snapshot.data_version),
         "source_journal_mode": source_snapshot.journal_mode,
         "source_wal_size_at_snapshot": str(source_snapshot.wal.size),
@@ -1768,6 +1783,7 @@ def write_meta(conn: sqlite3.Connection, source_path: Path, mode: str,
         "covered_min_tax_year": "" if coverage[1] is None else str(coverage[1]),
         "covered_max_tax_year": "" if coverage[2] is None else str(coverage[2]),
     }
+    values.update(source_snapshot.portable_stamp.metadata())
     if full_preflight is not None:
         values.update({
             "full_source_preflight": "complete",
@@ -1779,6 +1795,13 @@ def write_meta(conn: sqlite3.Connection, source_path: Path, mode: str,
             "source_filing_index_count": str(len(full_preflight.filing_indexes)),
             "source_selected_filing_count": str(full_preflight.expected_filing_count),
         })
+    # A new build is authoritative only through portable identity metadata.
+    # Remove physical legacy keys when an incremental refresh upgrades an old
+    # sidecar in place.
+    conn.execute(
+        "DELETE FROM risk_network_build_meta "
+        "WHERE key IN ('source_lineage_id','source_file_mtime_ns')"
+    )
     conn.executemany(
         "INSERT OR REPLACE INTO risk_network_build_meta(key,value) VALUES (?,?)",
         sorted(values.items()),
@@ -1824,10 +1847,8 @@ def validate_completed_sidecar(
             "build_scope": expected_scope,
             "selected_filing_count": str(expected_filings),
             "edge_count_written": str(expected_edges),
-            "source_lineage_id": source_snapshot.lineage_id,
-            "source_file_size": str(source_snapshot.file_size),
-            "source_file_mtime_ns": str(source_snapshot.file_mtime_ns),
         }
+        expected_meta.update(source_snapshot.portable_stamp.metadata())
         mismatched_meta = [
             f"{key}={meta.get(key)!r} (expected {value!r})"
             for key, value in expected_meta.items()
@@ -2084,7 +2105,7 @@ def begin_source_snapshot(
     before = _source_path_state(source_path)
     if require_checkpointed and before[3].populated:
         raise RuntimeError(
-            "Full risk-network build requires a checkpointed source database; "
+            "Risk-network publication requires a checkpointed source database; "
             f"non-empty WAL remains ({before[3].size:,} bytes). Stop writers and run "
             "PRAGMA wal_checkpoint(TRUNCATE) before retrying."
         )
@@ -2099,6 +2120,14 @@ def begin_source_snapshot(
     conn.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
     data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
     journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0] or "").lower()
+    try:
+        identity = read_risk_source_identity(conn, required=True)
+    except RiskSourceIdentityError as exc:
+        raise RuntimeError(
+            f"Source database is not prepared for portable risk-network builds: {exc}"
+        ) from exc
+    assert identity is not None
+    source_stamp = portable_source_stamp(source_path, identity)
     after = _source_path_state(source_path)
     if before != after:
         raise RuntimeError(
@@ -2108,6 +2137,7 @@ def begin_source_snapshot(
         lineage_id=after[0],
         file_size=after[1],
         file_mtime_ns=after[2],
+        portable_stamp=source_stamp,
         data_version=data_version,
         journal_mode=journal_mode,
         wal=after[3],
@@ -2140,7 +2170,7 @@ def assert_source_snapshot_unchanged(
         )
     if require_checkpointed and current[3].populated:
         raise RuntimeError(
-            "Source WAL became non-empty during the full risk-network build; the temporary sidecar will not be published."
+            "Source WAL became non-empty during the risk-network build; the sidecar will not be published."
         )
 
 
@@ -2158,6 +2188,27 @@ def assert_source_path_matches_snapshot(source_path: Path, snapshot: SourceSnaps
     if current != expected:
         raise RuntimeError(
             "Source database changed after sidecar validation; refusing atomic publication."
+        )
+
+
+def assert_source_portable_stamp_matches_snapshot(
+    source_path: Path, snapshot: SourceSnapshot
+) -> None:
+    """Re-read portable identity immediately before atomic publication."""
+
+    try:
+        current = validate_portable_source(
+            snapshot.portable_stamp.metadata(), source_path
+        )
+    except (RiskSourceIdentityError, OSError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            "Source portable identity changed after sidecar validation; "
+            "refusing atomic publication."
+        ) from exc
+    if current != snapshot.portable_stamp:  # defensive: validator is exact
+        raise RuntimeError(
+            "Source portable identity changed after sidecar validation; "
+            "refusing atomic publication."
         )
 
 
@@ -2195,7 +2246,7 @@ def rebuild_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence[Fil
     try:
         with closing(connect_source_readonly(source_path)) as source, closing(connect_sidecar(temp_path)) as output:
             snapshot = begin_source_snapshot(
-                source, source_path, require_checkpointed=False
+                source, source_path, require_checkpointed=True
             )
             verify_selected_filings_in_snapshot(
                 source, filings, canonical_only=config.canonical_only
@@ -2221,7 +2272,7 @@ def rebuild_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence[Fil
             output.execute("ANALYZE")
             output.commit()
             assert_source_snapshot_unchanged(
-                source, source_path, snapshot, require_checkpointed=False
+                source, source_path, snapshot, require_checkpointed=True
             )
         if snapshot is None:
             raise RuntimeError("Risk-network source snapshot was not established.")
@@ -2232,6 +2283,11 @@ def rebuild_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence[Fil
             expected_scope="selected",
             source_snapshot=snapshot,
         )
+        assert_source_path_matches_snapshot(source_path, snapshot)
+        assert_source_portable_stamp_matches_snapshot(source_path, snapshot)
+        # Bracket the portable SQLite reads with physical/auxiliary checks so a
+        # writer cannot leave a new WAL or journal between validation and
+        # publication without being detected.
         assert_source_path_matches_snapshot(source_path, snapshot)
         assert_destination_auxiliaries_clear(sidecar_path)
         os.replace(temp_path, sidecar_path)
@@ -2365,6 +2421,10 @@ def rebuild_full_sidecar(
             full_preflight=full_preflight,
         )
         assert_source_path_matches_snapshot(source_path, snapshot)
+        assert_source_portable_stamp_matches_snapshot(source_path, snapshot)
+        # Recheck the main file and its auxiliaries after the portable identity
+        # query, immediately before replacing the destination.
+        assert_source_path_matches_snapshot(source_path, snapshot)
         assert_destination_auxiliaries_clear(sidecar_path)
         os.replace(temp_path, sidecar_path)
         return {"filings": full_preflight.expected_filing_count, "edges": edge_count}
@@ -2382,12 +2442,11 @@ def incremental_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence
     sidecar_path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect_source_readonly(source_path)) as source, closing(connect_sidecar(sidecar_path)) as output:
         snapshot = begin_source_snapshot(
-            source, source_path, require_checkpointed=False
+            source, source_path, require_checkpointed=True
         )
         verify_selected_filings_in_snapshot(
             source, filings, canonical_only=config.canonical_only
         )
-        current_lineage = snapshot.lineage_id
         previous_scope = ""
         try:
             previous_meta = {
@@ -2401,9 +2460,40 @@ def incremental_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence
                 raise RuntimeError(
                     "Risk-network sidecar schema is incompatible; run a full rebuild before incremental refresh."
                 )
-            if previous_meta.get("source_lineage_id") != current_lineage:
+            try:
+                previous_portable = parse_portable_metadata(previous_meta)
+            except RiskSourceIdentityError as exc:
                 raise RuntimeError(
-                    "Risk-network sidecar belongs to a different source database; run a full rebuild."
+                    "Risk-network sidecar has incomplete or invalid portable source "
+                    f"metadata; run a full rebuild: {exc}"
+                ) from exc
+            if previous_portable is not None:
+                if (
+                    previous_portable.database_id
+                    != snapshot.portable_stamp.database_id
+                ):
+                    raise RuntimeError(
+                        "Risk-network sidecar belongs to a different source database; "
+                        "run a full rebuild before refreshing incrementally."
+                    )
+                if previous_portable != snapshot.portable_stamp:
+                    raise RuntimeError(
+                        "Risk-network source snapshot changed after the prior build; "
+                        "run a full rebuild before refreshing incrementally."
+                    )
+            elif any(
+                previous_meta.get(key) != expected
+                for key, expected in {
+                    "source_lineage_id": snapshot.lineage_id,
+                    "source_file_size": str(snapshot.file_size),
+                    "source_file_mtime_ns": str(snapshot.file_mtime_ns),
+                }.items()
+            ):
+                # A wholly legacy sidecar can be upgraded in place, but only
+                # while its complete physical snapshot still matches.
+                raise RuntimeError(
+                    "Legacy risk-network source snapshot changed after the prior build; "
+                    "run a full rebuild before refreshing incrementally."
                 )
         previous_scope = previous_meta.get("build_scope", "")
         initialize_sidecar(output)
@@ -2457,7 +2547,7 @@ def incremental_sidecar(source_path: Path, sidecar_path: Path, filings: Sequence
             build_scope=build_scope, source_snapshot=snapshot,
         )
         assert_source_snapshot_unchanged(
-            source, source_path, snapshot, require_checkpointed=False
+            source, source_path, snapshot, require_checkpointed=True
         )
         output.commit()
         return {
@@ -2478,7 +2568,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     for command in ("plan", "rebuild", "incremental"):
         p = sub.add_parser(command)
-        p.add_argument("--db", default=os.environ.get("IRS_DB_PATH", r"C:\Projects\irs990-tool\db\irs990.db"))
+        p.add_argument(
+            "--db",
+            default=os.environ.get("IRS_DB_PATH", str(DEFAULT_MAIN_DB_PATH)),
+        )
         p.add_argument("--sidecar", default=os.environ.get("IRS_RISK_NETWORK_DB_PATH", ""))
         p.add_argument("--ein", action="append", default=[], help="Repeatable organization EIN selector")
         p.add_argument("--filing-id", action="append", default=[], help="Repeatable exact filing ID selector")
@@ -2592,11 +2685,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("Completed: " + ", ".join(f"{key}={value:,}" for key, value in result.items()))
         return 0
     with closing(connect_source_readonly(source_path)) as source:
+        bounded_plan_snapshot = None
+        if args.command == "plan":
+            bounded_plan_snapshot = begin_source_snapshot(
+                source, source_path, require_checkpointed=True
+            )
         filings = select_filings(
             source, eins=args.ein, filing_ids=args.filing_id,
             min_tax_year=args.min_tax_year, max_tax_year=args.max_tax_year,
             max_filings=int(args.max_filings), canonical_only=config.canonical_only,
         )
+        if bounded_plan_snapshot is not None:
+            assert_source_snapshot_unchanged(
+                source,
+                source_path,
+                bounded_plan_snapshot,
+                require_checkpointed=True,
+            )
     years = [f.tax_year for f in filings if f.tax_year is not None]
     print(f"Source (read-only): {source_path}")
     print(f"Destination:        {sidecar_path}")

@@ -1,10 +1,16 @@
 import argparse
 import sqlite3
+from collections import Counter
 from pathlib import Path
 
 import pytest
 
 import grant_ai_assist_v1 as grant_ai
+import resolve_grant_recipients as grant_resolver
+from risk_source_identity import (
+    ensure_risk_source_identity,
+    read_risk_source_identity,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -174,6 +180,16 @@ def _visible_layer(path: Path):
             "FROM grant_recipient_resolved_plus_ai_v1 ORDER BY grant_id"
         ).fetchall()
         return applied, view_rows
+    finally:
+        conn.close()
+
+
+def _seed_source_identity(path: Path):
+    conn = sqlite3.connect(path)
+    try:
+        identity = ensure_risk_source_identity(conn)
+        conn.commit()
+        return identity
     finally:
         conn.close()
 
@@ -432,6 +448,7 @@ def test_apply_full_refresh_rolls_back_visible_swap_on_view_failure(tmp_path, mo
     _build_main(main)
     _build_work(work)
     before = _visible_layer(main)
+    identity_before = _seed_source_identity(main)
 
     def fail_view_creation(_conn):
         raise RuntimeError("forced final-view failure")
@@ -441,6 +458,14 @@ def test_apply_full_refresh_rolls_back_visible_swap_on_view_failure(tmp_path, mo
         grant_ai.cmd_apply_decisions(_args(main, work))
 
     assert _visible_layer(main) == before
+    conn = sqlite3.connect(main)
+    try:
+        identity_after = read_risk_source_identity(conn, required=True)
+        assert identity_after is not None
+        assert identity_after.database_id == identity_before.database_id
+        assert identity_after.revision_id == identity_before.revision_id
+    finally:
+        conn.close()
 
 
 def test_apply_full_refresh_atomically_installs_staged_layer(tmp_path):
@@ -448,11 +473,16 @@ def test_apply_full_refresh_atomically_installs_staged_layer(tmp_path):
     work = tmp_path / "work.db"
     _build_main(main)
     _build_work(work)
+    identity_before = _seed_source_identity(main)
 
     grant_ai.cmd_apply_decisions(_args(main, work))
 
     conn = sqlite3.connect(main)
     try:
+        identity_after = read_risk_source_identity(conn, required=True)
+        assert identity_after is not None
+        assert identity_after.database_id == identity_before.database_id
+        assert identity_after.revision_id != identity_before.revision_id
         assert conn.execute(
             "SELECT grant_id,signature_hash,selected_ein,selected_name,ai_confidence,"
             "ai_decision,model FROM grant_recipient_ai_applied"
@@ -478,5 +508,88 @@ def test_apply_full_refresh_atomically_installs_staged_layer(tmp_path):
             if columns:
                 leading_columns.add(columns[0][2])
         assert {"selected_ein", "signature_hash"}.issubset(leading_columns)
+    finally:
+        conn.close()
+
+
+def test_deterministic_resolver_preserves_database_id_and_rotates_revision(
+    tmp_path, monkeypatch
+):
+    main = tmp_path / "resolver-main.db"
+    sqlite3.connect(main).close()
+    identity_before = _seed_source_identity(main)
+
+    monkeypatch.setattr(grant_resolver, "build_org_index", lambda _conn: object())
+    monkeypatch.setattr(
+        grant_resolver,
+        "process",
+        lambda _conn, _index, _args: Counter(),
+    )
+
+    assert grant_resolver.main(["--db", str(main), "--full-refresh"]) == 0
+
+    conn = sqlite3.connect(main)
+    try:
+        identity_after = read_risk_source_identity(conn, required=True)
+        assert identity_after is not None
+        assert identity_after.database_id == identity_before.database_id
+        assert identity_after.revision_id != identity_before.revision_id
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (grant_resolver.RESOLVED_TABLE,),
+        ).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def test_name_backfill_rotates_revision_with_visible_source_updates(
+    tmp_path, monkeypatch
+):
+    main = tmp_path / "backfill-main.db"
+    _build_main(main)
+    conn = sqlite3.connect(main)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE org_identity (
+              identity_id INTEGER PRIMARY KEY,
+              ein TEXT,
+              display_name TEXT,
+              source TEXT,
+              source_rank INTEGER,
+              tax_year INTEGER
+            );
+            INSERT INTO org_identity VALUES
+              (1, '111111111', 'Backfilled Recipient', 'returns_org_name', 1, 2024);
+            UPDATE grant_recipient_resolved
+               SET resolved_ein='111111111', resolved_org_name=NULL
+             WHERE grant_id=1;
+            """
+        )
+        identity_before = ensure_risk_source_identity(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+    opened = []
+    real_connect = grant_ai.connect
+
+    def tracked_connect(*args, **kwargs):
+        opened.append(real_connect(*args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(grant_ai, "connect", tracked_connect)
+    grant_ai.cmd_backfill_ein_names(argparse.Namespace(db=str(main), dry_run=False))
+    opened[-1].close()
+
+    conn = sqlite3.connect(main)
+    try:
+        identity_after = read_risk_source_identity(conn, required=True)
+        assert identity_after is not None
+        assert identity_after.database_id == identity_before.database_id
+        assert identity_after.revision_id != identity_before.revision_id
+        assert conn.execute(
+            "SELECT resolved_org_name FROM grant_recipient_resolved WHERE grant_id=1"
+        ).fetchone()[0] == "Backfilled Recipient"
     finally:
         conn.close()

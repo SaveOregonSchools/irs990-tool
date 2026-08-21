@@ -92,6 +92,36 @@ replace an existing file unless `--overwrite` is supplied.
 
 Append mode still rebuilds `canonical_by_ein_year`, views, and indexes after loading. A newly added filing may become the canonical filing for an EIN/tax year.
 
+### Risk-network source identity
+
+Every newly built main database contains an `app_dataset_identity` singleton
+with a stable database UUID and a rotating risk-source revision UUID. These
+values are data identity, not a local filename: an exact checkpointed copy keeps
+the same identity on Windows, Linux, another volume, or another filesystem.
+
+Append mode preserves the database UUID and rotates the risk-source revision
+before its first source-data commit. The deterministic grant resolver does the
+same. The applied enhanced-grant publisher rotates inside its atomic visible
+cutover, and a clean rebuild receives a new database UUID. These changes
+immediately mark an older network sidecar stale until the source is fully
+rebuilt into the network. A bounded incremental refresh cannot advance a global
+source revision safely because it cannot prove that every changed filing was
+selected. A failed atomic cutover rolls its revision change back with its data
+changes; multi-commit import/resolver workflows remain conservatively stale if
+they stop after an intermediate commit.
+
+Direct SQLite edits and third-party writers cannot rotate this application
+revision automatically. Before any such write that can affect returns,
+canonical filings, grants, contractors, people, addresses, Schedule R
+relationships, or the enhanced grant layer, run the explicit
+`mark-risk-source-changed` operation in
+`migrate_risk_network_portability.py`. If an untracked write has already
+occurred, run it immediately afterward while the application remains stopped.
+The runtime also compares the checkpointed main-file size and SQLite header as a
+conservative defense, but those values are not a substitute for the revision
+protocol. Then perform a full network rebuild. Stop writers and
+checkpoint/truncate WAL before copying or building either database.
+
 ---
 
 ## Duplicate prevention in append mode

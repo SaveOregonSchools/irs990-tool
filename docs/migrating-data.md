@@ -36,10 +36,12 @@ They do not need to be rewritten when the archive moves.
    case. Linux filesystems are normally case-sensitive.
 3. Copy the main database and the application sidecars needed on the destination:
    the grant-work database, FAC audit database, screening database, source
-   inventory, and OLMS database. Do not copy stale `-wal` or `-shm` files
-   independently. Do not treat a copied `risk_network.db` as portable; its
-   source-lineage check includes the main database's resolved path and
-   filesystem identity, so rebuild it on the destination after the main copy.
+   inventory, OLMS database, and risk-network database. Copy `risk_network.db`
+   together with the exact checkpointed main database it describes. Current
+   builds validate a portable database UUID, risk-source revision, file size,
+   and SQLite-header digest, so a path, drive, filesystem, or operating-system
+   change alone does not invalidate the pair. Do not copy stale `-wal`, `-shm`,
+   or rollback-journal files independently.
 4. Set `IRS_DB_PATH`, `IRS_GRANT_WORK_DB_PATH`, `FAC_DB_PATH`,
    `IRS_SCREENING_DB_PATH`, `IRS_RISK_NETWORK_DB_PATH`, and any applicable XML
    or OLMS paths for the destination.
@@ -63,9 +65,42 @@ IRS_XML_INVENTORY_PATH=/var/lib/irs990-tool/db/irs990_sources.new.db
 OLMS_DB_PATH=/var/lib/irs990-tool/db/olms.db
 ```
 
-After copying the main database to a different machine or filesystem, rebuild
-the lineage-bound risk-network sidecar there. Plan for at least 180 GiB free on
-the destination filesystem during a full build:
+Before the first move of a legacy risk-network sidecar, upgrade its physical
+lineage metadata in place while the accepted main/sidecar pair is still on the
+source machine. The migration is metadata-only; it does not rewrite network
+edges. Run its read-only plan, review the paths and invariants, and then run the
+confirmed apply command shown below:
+
+```powershell
+.\.venv\Scripts\python.exe migrate_risk_network_portability.py plan `
+  --db db\irs990.db --sidecar db\risk_network.db
+.\.venv\Scripts\python.exe migrate_risk_network_portability.py apply `
+  --db db\irs990.db --sidecar db\risk_network.db --yes
+```
+
+Do not edit identity or sidecar metadata by hand. The migration records the
+adopted legacy preimage, installs the portable identity, refreshes compatibility
+metadata, checks that network table counts did not change, and writes an ignored
+receipt for audit/recovery. It is resumable if interrupted between its guarded
+main-database and sidecar phases.
+
+Run this migration before any newly instrumented append, resolver, applied-layer,
+or manual main-database writer. Such a write changes the legacy file stamp and
+can make safe adoption of the old sidecar impossible, requiring a full rebuild.
+
+After checkpointing, hash the main and risk-network files on the source and
+verify those hashes after transfer. Then run this read-only destination check:
+
+```bash
+python -c "from queries._risk_network import available,risk_network_path; print(risk_network_path(), available())"
+```
+
+It must print `True`. A copied portable pair remains valid even though Windows
+and Linux report different paths, device numbers, inodes, and modification
+times. If it prints `False`, keep the network panel unavailable and diagnose a
+partial copy, nonempty SQLite auxiliary, identity/revision mismatch, or stale
+sidecar. Never make it pass by changing metadata. Rebuild only when the files
+are not the exact validated pair or the main database has changed:
 
 ```bash
 mkdir -p /var/lib/irs990-tool/db/_risk_network_tmp
@@ -81,9 +116,8 @@ python build_risk_network.py rebuild \
   --full --yes
 ```
 
-Copying the Windows-built `risk_network.db` and editing its metadata is not a
-supported migration shortcut. Leave the dashboard network panel unavailable
-until the destination rebuild passes its own source-lineage validation.
+Plan for at least 180 GiB free on the destination filesystem during that full
+rebuild.
 
 Build the replacement inventory:
 
@@ -124,6 +158,9 @@ the application and switching back is only a configuration change.
   Dive.
 - The application and any background jobs use the same `IRS_DB_PATH`,
   `IRS_XML_ROOT`, and `IRS_XML_INVENTORY_PATH` settings.
+- The main/risk-network file hashes match the source-machine transfer manifest,
+  no populated `-wal` or rollback-journal file is present, and the risk-network
+  `available()` smoke check returns `True`.
 
 See the [Database Build Guide](database-build.md) for scanner classifications,
 conflict analysis, and quarantine procedures.
