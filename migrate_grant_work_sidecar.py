@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
-DEFAULT_PROJECT_DIR = os.getenv("IRS_PROJECT_DIR", r"C:\projects\irs990-tool")
-DEFAULT_DB = os.getenv("IRS_DB_PATH", str(Path(DEFAULT_PROJECT_DIR) / "db" / "irs990.db"))
+DEFAULT_PROJECT_DIR = os.getenv("IRS_PROJECT_DIR", str(Path(__file__).resolve().parent))
+DEFAULT_DB = os.getenv(
+    "IRS_DB_PATH", str(Path(DEFAULT_PROJECT_DIR) / "db" / "irs990.db")
+)
 DEFAULT_WORK_DB_NAME = "grant_matching_work.db"
 WORK_SCHEMA = "grant_work"
 

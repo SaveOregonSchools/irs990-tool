@@ -35,16 +35,16 @@ SQLite does not have to maintain several large indexes during every insert.
 Examples
 --------
 Dry run to CSV:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --dry-run --csv-out grant_matches.csv
+  python resolve_grant_recipients.py --db db/irs990.db --dry-run --csv-out grant_matches.csv
 
 Write/update database table, processing only rows not already resolved:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db
+  python resolve_grant_recipients.py --db db/irs990.db
 
 Rebuild the resolved table from scratch:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --full-refresh
+  python resolve_grant_recipients.py --db db/irs990.db --full-refresh
 
 Enable fuzzy fallback conservatively:
-  python resolve_grant_recipients_v2_1_fast.py --db C:\Projects\irs990-tool\db\irs990.db --enable-fuzzy --fuzzy-threshold 0.92
+  python resolve_grant_recipients.py --db db/irs990.db --enable-fuzzy --fuzzy-threshold 0.92
 """
 
 from __future__ import annotations
@@ -61,6 +61,8 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+from risk_source_identity import rotate_risk_source_revision
 
 DEFAULT_DB = str(Path(__file__).resolve().parent / "db" / "irs990.db")
 RESOLVED_TABLE = "grant_recipient_resolved"
@@ -864,6 +866,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         defer_indexes = args.full_refresh and not args.no_defer_indexes
         if not args.dry_run:
+            # This revision change is intentionally in the caller's transaction.
+            # The resolver's first schema/data commit makes it durable before any
+            # partially refreshed rows could be exposed to an old network sidecar.
+            rotate_risk_source_revision(conn)
             if args.full_refresh:
                 if defer_indexes:
                     print(f"Full refresh requested; recreating {RESOLVED_TABLE} without secondary indexes for fast bulk load...", flush=True)

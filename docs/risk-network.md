@@ -6,6 +6,13 @@ sidecar contains one filing-year evidence edge per source record, including
 grant cash/noncash amounts, contractor compensation, Schedule R relationships,
 people roles/compensation, and exact filed addresses.
 
+New builds bind the sidecar to portable identity stored inside the main
+database: a stable database UUID, rotating risk-source revision UUID, main-file
+size, and SHA-256 of the SQLite header. Neither an absolute path nor a Windows
+volume/file identifier is part of the persisted authoritative identity. An
+exact checkpointed main/sidecar pair can therefore move together to Linux or a
+different filesystem without a rebuild.
+
 Canonical filings are used by default so amended or superseded submissions do
 not double-count a tax year. `--include-noncanonical` is available for a
 provenance audit that intentionally needs every submitted return.
@@ -30,7 +37,8 @@ py build_risk_network.py rebuild --db db\irs990.db `
   --sidecar db\risk_network_review.db --ein 123456789 --yes
 ```
 
-Refresh an explicit, capped subset after importing filings:
+Recompute an explicit, capped subset against the same unchanged source
+snapshot (for example, while reviewing scoring/build-configuration changes):
 
 ```powershell
 py build_risk_network.py incremental --db db\irs990.db `
@@ -39,7 +47,12 @@ py build_risk_network.py incremental --db db\irs990.db `
 
 Incremental mode refuses an unbounded invocation and refuses selections above
 `--max-filings` (hard maximum 100,000). It replaces only the selected filing
-IDs in the sidecar and recomputes hub metadata for affected nodes.
+IDs in the sidecar and recomputes hub metadata for affected nodes. It requires
+the sidecar's complete portable source stamp to equal the current main database
+stamp. A new revision, header digest, or file size is not accepted: without a
+durable changed-filing ledger, a bounded update cannot prove that it covered
+every source change. After an append, resolver refresh, applied-layer publish,
+manual source change, or other revision advance, run a full rebuild.
 
 Selectors are fail-closed. EINs must be exactly nine digits (plain or
 `NN-NNNNNNN`), filing IDs must be nonblank canonical values with no whitespace
@@ -159,14 +172,16 @@ finally {
 }
 ```
 
-The full rebuild is a large, hours-long operation. It records the source file
-identity/stat, SQLite `data_version`, journal mode, empty-WAL checkpoint
-condition, enhanced grant counts, independent selected-filing count, and
-source-index preflight. Any source stat, WAL/journal, or data-version drift
-observed during the held snapshot prevents publication and leaves an existing
-destination untouched. Bounded rebuilds and incremental refreshes also verify
-that the caller-selected filing metadata is still exact inside their held
-source snapshot.
+The full rebuild is a large, hours-long operation. It records the portable
+source identity/snapshot, SQLite `data_version`, journal mode, empty-WAL
+checkpoint condition, enhanced grant counts, independent selected-filing count,
+and source-index preflight. Path, filesystem identity, and modification time are
+used only as same-process drift guards while a build is running; they are not
+persisted as authoritative lineage. Any source stat, identity/revision,
+WAL/journal, or data-version drift observed during the held snapshot prevents
+publication and leaves an existing destination untouched. Bounded rebuilds and
+incremental refreshes also verify that the caller-selected filing metadata is
+still exact inside their held source snapshot.
 
 Enhanced grant edges are scored only for the explicit normalized provenance
 allowlist (`deterministic` with a safe resolver status,
@@ -205,6 +220,49 @@ build, and concurrent writers could otherwise cause the source WAL to grow for
 hours. The Flask/runtime access helper in
 `queries/_risk_network.py` opens the finished sidecar in SQLite `mode=ro` with
 `query_only=ON`.
+
+## Portability and source-change lifecycle
+
+The runtime prefers the complete portable identity contract. If even one
+portable key is present but the set is incomplete or inconsistent, it fails
+closed; it never falls back to weaker legacy checks. A wholly legacy sidecar
+remains readable only on its original physical source file so it can be upgraded
+in place with `migrate_risk_network_portability.py`.
+
+If an older main database has no portable identity and no accepted legacy
+sidecar to adopt, initialize it explicitly before its first portable build:
+
+```powershell
+.\.venv\Scripts\python.exe migrate_risk_network_portability.py `
+  initialize-risk-source-identity --db db\irs990.db --yes
+```
+
+Do not use that standalone initializer when a usable legacy sidecar exists;
+run the paired `plan`/`apply` migration instead so its legacy lineage can be
+proved and adopted before the main file changes.
+
+For a machine move, stop writers, checkpoint/truncate the main database WAL,
+verify there is no populated rollback journal, and copy the main database and
+`risk_network.db` as one accepted pair. Hash both complete files before and
+after transfer. Different absolute paths, drive letters, device/inode values,
+or file modification times do not matter. A different database/revision UUID,
+fast file-size/header stamp, or populated auxiliary makes the runtime
+unavailable. The runtime check deliberately does not hash 47+ GiB on every
+dashboard request, so a full-file transfer-hash mismatch also invalidates the
+pair even if the fast stamp happens to match.
+
+Supported main-database builders and grant-layer publishers rotate the
+risk-source revision when they change network inputs. Direct SQL and external
+tools cannot do this automatically. Use the migration utility's explicit
+`mark-risk-source-changed` command before such a write when possible, or
+immediately afterward while the application remains stopped, and then run a
+full rebuild. Never edit the UUID, revision, header digest, size, or snapshot
+hash in either database to rebind mismatched files.
+
+```powershell
+.\.venv\Scripts\python.exe migrate_risk_network_portability.py `
+  mark-risk-source-changed --db db\irs990.db --yes
+```
 
 `network_for_ein()` provides the bounded dashboard read shape: outgoing
 evidence, indexed direct incoming EIN relationships, and shared

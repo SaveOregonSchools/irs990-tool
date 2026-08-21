@@ -92,14 +92,14 @@ should be handled by deterministic rules before any local model call.
 
 Expected project layout
 -----------------------
-  C:\projects\irs990-tool\
+  <repository-root>/
     grant_ai_assist_v1.py
-    resolve_grant_recipients_v2_1_fast.py
-    db\irs990.db
-    eo-bmf\eo1.csv
-    eo-bmf\eo2.csv
-    eo-bmf\eo3.csv
-    eo-bmf\eo4.csv
+    resolve_grant_recipients.py
+    db/irs990.db
+    eo-bmf/eo1.csv
+    eo-bmf/eo2.csv
+    eo-bmf/eo3.csv
+    eo-bmf/eo4.csv
 
 Common current commands
 -----------------------
@@ -120,7 +120,7 @@ Apply v1.24 address/name remaining at a lower 0.70 name-score threshold:
     --high-address-geo-min-name-score 0.70
 
 Check remaining AI queue:
-  sqlite3 C:\projects\irs990-tool\db\irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);
+  sqlite3 db/irs990.db "SELECT COUNT(*) AS signatures_left_for_ai_review, COALESCE(SUM(s.grant_count),0) AS grants_represented, ROUND(COALESCE(SUM(s.total_amount),0),2) AS total_amount FROM grant_recipient_signature s WHERE EXISTS (SELECT 1 FROM grant_recipient_ai_candidate c WHERE c.signature_hash = s.signature_hash) AND NOT EXISTS (SELECT 1 FROM grant_recipient_ai_decision d WHERE d.signature_hash = s.signature_hash);
 
 Export adjudication packets in 10,000-signature JSONL batches for Linux AI worker:
   python grant_ai_assist_v1.py export-adjudication-batches ^
@@ -164,7 +164,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-DEFAULT_PROJECT_DIR = os.getenv("IRS_PROJECT_DIR", r"C:\projects\irs990-tool")
+from risk_source_identity import rotate_risk_source_revision
+
+DEFAULT_PROJECT_DIR = os.getenv("IRS_PROJECT_DIR", str(Path(__file__).resolve().parent))
 DEFAULT_DB = os.getenv("IRS_DB_PATH", str(Path(DEFAULT_PROJECT_DIR) / "db" / "irs990.db"))
 DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:12b")
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
@@ -6511,6 +6513,11 @@ def cmd_backfill_ein_names(args: argparse.Namespace) -> None:
         print("Dry run only; no rows updated.", flush=True)
         return
 
+    # Keep the revision change in the same transaction as all backfill writes.
+    # Even a no-row run refreshes the visible final view when the applied table
+    # exists, so every non-dry publication invalidates the prior snapshot first.
+    rotate_risk_source_revision(conn)
+
     if resolved_count:
         conn.execute(
             f"""
@@ -8099,6 +8106,10 @@ def _install_staged_applied_layer(
                 "Applied-layer install count changed unexpectedly before cutover: "
                 f"loaded {loaded_count:,}, current expected {expected_count:,}."
             )
+        # Rotate only at the atomic visible-layer cutover. Hidden staging work
+        # is not queried by the network builder, and a failed cutover rolls this
+        # revision change back together with the table/view swap.
+        rotate_risk_source_revision(conn)
         conn.execute(f"DROP VIEW IF EXISTS {FINAL_VIEW}")
         conn.execute(f"DROP TABLE IF EXISTS {APPLIED_TABLE}")
         conn.execute(f"ALTER TABLE {APPLIED_STAGING_TABLE} RENAME TO {APPLIED_TABLE}")

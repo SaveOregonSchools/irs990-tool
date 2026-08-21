@@ -12,10 +12,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import quote
 
+from risk_source_identity import (
+    RiskSourceIdentityError,
+    parse_portable_metadata,
+    validate_portable_source,
+)
+
 
 DEFAULT_NAME = "risk_network.db"
 EXPECTED_SCHEMA_VERSION = "1"
-DEFAULT_MAIN_DB_PATH = r"C:\Projects\irs990-tool\db\irs990.db"
+DEFAULT_MAIN_DB_PATH = Path(__file__).resolve().parents[1] / "db" / "irs990.db"
 
 
 def _normalize_ein(value: Any) -> str:
@@ -75,8 +81,10 @@ def _source_lineage_id(source_path: Path) -> str:
     ).hexdigest()
 
 
-def _validate_source_freshness(meta: Mapping[str, str], source_path: Path) -> None:
-    """Raise when the sidecar does not describe the current source file exactly."""
+def _validate_legacy_source_freshness(
+    meta: Mapping[str, str], source_path: Path
+) -> None:
+    """Validate a wholly legacy sidecar against its original physical file."""
 
     required = {
         "source_lineage_id",
@@ -104,7 +112,57 @@ def _validate_source_freshness(meta: Mapping[str, str], source_path: Path) -> No
         )
 
 
+def _validate_database_auxiliaries_clear(database_path: Path, label: str) -> None:
+    populated = []
+    for auxiliary_label, suffix in (("WAL", "-wal"), ("rollback journal", "-journal")):
+        path = Path(str(database_path.expanduser().resolve()) + suffix)
+        try:
+            size = int(path.stat().st_size)
+        except FileNotFoundError:
+            size = 0
+        if size > 0:
+            populated.append(f"{auxiliary_label}={size:,} bytes")
+    if populated:
+        raise RuntimeError(
+            f"Risk-network {label} has populated SQLite auxiliary files "
+            f"({', '.join(populated)}); checkpoint or recover it before use."
+        )
+
+
+def _validate_source_auxiliaries_clear(source_path: Path) -> None:
+    _validate_database_auxiliaries_clear(source_path, "source database")
+
+
+def _validate_sidecar_auxiliaries_clear(sidecar_path: Path) -> None:
+    _validate_database_auxiliaries_clear(sidecar_path, "sidecar database")
+
+
+def _validate_source_freshness(meta: Mapping[str, str], source_path: Path) -> None:
+    """Validate portable metadata first, with a complete legacy fallback."""
+
+    _validate_source_auxiliaries_clear(source_path)
+    try:
+        portable = parse_portable_metadata(meta)
+    except RiskSourceIdentityError as exc:
+        raise RuntimeError(
+            f"Risk-network sidecar has invalid portable source metadata: {exc}"
+        ) from exc
+    if portable is not None:
+        try:
+            validate_portable_source(meta, source_path)
+        except (RiskSourceIdentityError, OSError, sqlite3.Error) as exc:
+            raise RuntimeError(
+                f"Risk-network sidecar is stale for the current portable source database: {exc}"
+            ) from exc
+    else:
+        _validate_legacy_source_freshness(meta, source_path)
+    # Close the race where a writer creates a WAL while identity/stat metadata
+    # is being read. Any populated auxiliary invalidates the portable copy.
+    _validate_source_auxiliaries_clear(source_path)
+
+
 def connect_readonly(path: Path) -> sqlite3.Connection:
+    _validate_sidecar_auxiliaries_clear(path)
     uri = "file:" + quote(path.resolve().as_posix(), safe="/:") + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
@@ -133,7 +191,9 @@ def available(main_db_path: Optional[str] = None,
             ):
                 return False
             _validate_source_freshness(meta, source_path)
-            return True
+        _validate_source_freshness(meta, source_path)
+        _validate_sidecar_auxiliaries_clear(path)
+        return True
     except (sqlite3.Error, RuntimeError, OSError):
         return False
 
@@ -158,6 +218,7 @@ def edges_for_ein(path: Path, ein: str, *, min_tax_year: Optional[int] = None,
             "SELECT * FROM risk_network_edge WHERE " + " AND ".join(clauses)
             + " ORDER BY tax_year DESC, edge_type, amount DESC LIMIT ?", params
         ).fetchall()
+    _validate_sidecar_auxiliaries_clear(path)
     return [dict(row) for row in rows]
 
 
@@ -185,6 +246,7 @@ def build_metadata(
     environ: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Return sidecar build and source-coverage metadata without opening it RW."""
+    source_path = _main_database_path(main_db_path, environ)
     with closing(connect_readonly(path)) as conn:
         meta = {
             row["key"]: row["value"]
@@ -193,7 +255,7 @@ def build_metadata(
         if meta.get("schema_version") != EXPECTED_SCHEMA_VERSION or meta.get("build_status") != "complete":
             raise RuntimeError("Risk-network sidecar is incomplete or schema-incompatible.")
         _validate_source_freshness(
-            meta, _main_database_path(main_db_path, environ)
+            meta, source_path
         )
         sources = [
             dict(row) for row in conn.execute(
@@ -201,6 +263,8 @@ def build_metadata(
                    FROM risk_network_source_status ORDER BY source_name"""
             )
         ]
+    _validate_source_freshness(meta, source_path)
+    _validate_sidecar_auxiliaries_clear(path)
     return {"meta": meta, "sources": sources}
 
 
@@ -249,6 +313,7 @@ def network_for_ein(
         year_params.append(int(max_tax_year))
     year_sql = (" AND " + " AND ".join(year_clauses)) if year_clauses else ""
     scored_sql = "" if include_unscored else " AND is_scored=1"
+    source_path = _main_database_path(main_db_path, environ)
 
     with closing(connect_readonly(path)) as conn:
         meta = {
@@ -258,7 +323,7 @@ def network_for_ein(
         if meta.get("schema_version") != EXPECTED_SCHEMA_VERSION or meta.get("build_status") != "complete":
             raise RuntimeError("Risk-network sidecar is incomplete or schema-incompatible.")
         _validate_source_freshness(
-            meta, _main_database_path(main_db_path, environ)
+            meta, source_path
         )
         sources = [
             dict(row) for row in conn.execute(
@@ -367,6 +432,9 @@ def network_for_ein(
             """,
             focal_params,
         ).fetchall()
+
+    _validate_source_freshness(meta, source_path)
+    _validate_sidecar_auxiliaries_clear(path)
 
     return {
         "ein": normalized,

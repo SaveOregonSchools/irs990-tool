@@ -17,10 +17,12 @@ The repository includes three related systems:
 The database and XML collection are intentionally not stored in Git. You can
 build a database from XML or point the application at an existing `irs990.db`.
 SQLite database files are portable between Windows and Linux when copied from a
-clean, consistent snapshot. The precomputed `risk_network.db` is the exception:
-its freshness safeguard includes the main database's resolved path and
-filesystem identity, so rebuild that sidecar after moving the main database to
-another machine or filesystem.
+clean, consistent snapshot. A current `risk_network.db` is portable when it is
+copied together with the exact checkpointed main database it was built from.
+Their shared database UUID, risk-source revision, file size, and SQLite-header
+digest replace machine-specific path and filesystem identity as the freshness
+contract. Older physical-lineage sidecars must first be upgraded with
+`migrate_risk_network_portability.py`; do not edit their metadata by hand.
 
 ## Capabilities
 

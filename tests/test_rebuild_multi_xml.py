@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import rebuild_irs990_slim_clean as rebuild
+from risk_source_identity import read_risk_source_identity
 
 
 _SINGLETON_ROW_KEYS = (
@@ -171,6 +172,31 @@ def test_multirow_child_inventory_matches_autoincrement_filing_tables():
     assert len(rebuild.MULTIROW_CHILD_TABLES) == 19
     assert len(set(rebuild.MULTIROW_CHILD_TABLES)) == 19
     assert set(rebuild.MULTIROW_CHILD_TABLES) == discovered
+
+
+def test_fresh_build_identities_are_distinct_and_append_rotates_without_committing():
+    first_conn = sqlite3.connect(":memory:")
+    second_conn = sqlite3.connect(":memory:")
+    try:
+        first = rebuild.prepare_risk_source_identity(first_conn, append_only=False)
+        second = rebuild.prepare_risk_source_identity(second_conn, append_only=False)
+        assert first.database_id != second.database_id
+        assert first.revision_id != second.revision_id
+
+        first_conn.commit()
+        appended = rebuild.prepare_risk_source_identity(first_conn, append_only=True)
+        assert appended.database_id == first.database_id
+        assert appended.revision_id != first.revision_id
+        assert first_conn.in_transaction is True
+
+        first_conn.rollback()
+        restored = read_risk_source_identity(first_conn, required=True)
+        assert restored is not None
+        assert restored.database_id == first.database_id
+        assert restored.revision_id == first.revision_id
+    finally:
+        first_conn.close()
+        second_conn.close()
 
 
 def test_reprocess_replaces_every_child_but_fresh_load_does_not_delete(tmp_path, monkeypatch):

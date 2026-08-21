@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import rebuild_irs990_slim_clean as rebuild
+from risk_source_identity import read_risk_source_identity
 
 
 SCAN_ID = "fixture-scan"
@@ -448,6 +449,8 @@ def test_manifest_clean_rebuild_publishes_only_validated_database(tmp_path: Path
     conn = sqlite3.connect(destination)
     try:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        identity = read_risk_source_identity(conn, required=True)
+        assert identity is not None
         assert conn.execute("SELECT filing_id,source_file FROM returns").fetchone() == (
             "1200_public",
             str(source.resolve()),

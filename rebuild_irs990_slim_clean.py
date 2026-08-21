@@ -31,6 +31,11 @@ from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping
 import xml.etree.ElementTree as ET
 
 from common import DB_PATH, configured_xml_root
+from risk_source_identity import (
+    RiskSourceIdentity,
+    ensure_risk_source_identity,
+    rotate_risk_source_revision,
+)
 
 
 DEFAULT_SOURCE_MANIFEST = Path(__file__).resolve().parent / 'db' / 'irs990_sources.db'
@@ -1301,6 +1306,23 @@ def db_connect(db_path: Path) -> sqlite3.Connection:
     conn.execute('PRAGMA mmap_size=268435456;')
     conn.execute('PRAGMA foreign_keys=OFF;')
     return conn
+
+
+def prepare_risk_source_identity(
+    conn: sqlite3.Connection, *, append_only: bool
+) -> RiskSourceIdentity:
+    """Initialize a fresh source or invalidate an existing append target.
+
+    The shared identity helpers deliberately do not commit.  For append runs,
+    the new revision therefore commits with (or immediately before, where an
+    existing schema helper commits) the first database changes.  An interrupted
+    run can never publish source rows while retaining the prior network revision.
+    """
+
+    identity = ensure_risk_source_identity(conn)
+    if append_only:
+        identity = rotate_risk_source_revision(conn)
+    return identity
 
 
 def exec_all(conn: sqlite3.Connection, statements: Sequence[str], label: str) -> None:
@@ -3035,6 +3057,9 @@ def build_database(
     try:
         if manifest_selection is not None:
             conn.execute('PRAGMA synchronous=NORMAL;')
+        prepare_risk_source_identity(
+            conn, append_only=bool(args.append or args.keep_db)
+        )
         print('[schema] creating/updating slim schema...')
         build_schema(conn)
         ensure_schema_columns(conn)

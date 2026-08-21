@@ -1,5 +1,7 @@
 import os
+import shutil
 import sqlite3
+import uuid
 from contextlib import closing
 from pathlib import Path
 
@@ -7,6 +9,13 @@ import pytest
 
 import build_risk_network as network
 from queries import _risk_network
+from risk_source_identity import (
+    PORTABLE_META_KEYS,
+    ensure_risk_source_identity,
+    portable_source_stamp_from_values,
+    read_risk_source_identity,
+    rotate_risk_source_revision,
+)
 
 
 def _create_source(path: Path) -> None:
@@ -102,6 +111,7 @@ def _create_source(path: Path) -> None:
           (1,'F1','444444444','Investment LP','N','Investment',25,10,12,3);
         """
     )
+    ensure_risk_source_identity(conn)
     conn.commit()
     conn.close()
 
@@ -242,6 +252,20 @@ def _all_filings(source: Path):
         return network.select_filings(conn, max_filings=10)
 
 
+def _sidecar_meta(sidecar: Path):
+    with closing(sqlite3.connect(sidecar)) as conn:
+        return dict(conn.execute("SELECT key,value FROM risk_network_build_meta"))
+
+
+def _replace_portable_stamp(sidecar: Path, stamp) -> None:
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.executemany(
+            "INSERT OR REPLACE INTO risk_network_build_meta(key,value) VALUES (?,?)",
+            stamp.metadata().items(),
+        )
+        conn.commit()
+
+
 def test_rebuild_writes_provenance_year_amounts_indexes_and_hubs(tmp_path):
     source = tmp_path / "source.db"
     sidecar = tmp_path / "risk.db"
@@ -347,7 +371,7 @@ def test_po_box_addresses_are_candidate_only_not_scored_identity_edges(tmp_path)
     assert all('"po_box":true' in row[2] for row in rows)
 
 
-def test_incremental_replaces_only_selected_filings_and_recalculates_old_hub(tmp_path):
+def test_incremental_repairs_selected_filings_within_the_same_source_snapshot(tmp_path):
     source = tmp_path / "source.db"
     sidecar = tmp_path / "risk.db"
     _create_source(source)
@@ -355,9 +379,18 @@ def test_incremental_replaces_only_selected_filings_and_recalculates_old_hub(tmp
                                  contractor_hub_threshold=1, batch_size=2)
     network.rebuild_sidecar(source, sidecar, _all_filings(source), config)
 
-    with closing(sqlite3.connect(source)) as conn:
-        conn.execute("UPDATE officers SET person_name='John Smith', comp_from_org=150 WHERE filing_id='F1'")
-        conn.execute("UPDATE irs990_contractor_compensation_grp SET compensation_amt=900 WHERE filing_id='F1'")
+    # Incremental mode is a same-snapshot repair operation. Corrupt only the
+    # selected sidecar rows while leaving the source identity/stamp unchanged.
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.execute(
+            """UPDATE risk_network_edge
+                  SET target_key='person:JOHN SMITH',target_name='John Smith',amount=150
+                WHERE filing_id='F1' AND target_key='person:JANE DOE'"""
+        )
+        conn.execute(
+            """UPDATE risk_network_edge SET amount=900
+                WHERE filing_id='F1' AND target_key='contractor:ACME AUDIT LLC'"""
+        )
         conn.commit()
     with closing(network.connect_source_readonly(source)) as conn:
         selected = network.select_filings(conn, eins=["111111111"], max_filings=10)
@@ -370,13 +403,16 @@ def test_incremental_replaces_only_selected_filings_and_recalculates_old_hub(tmp
     ).fetchone()[0] == 1
     assert conn.execute(
         "SELECT distinct_org_count,is_hub FROM risk_network_node_stats WHERE target_key='person:JANE DOE'"
-    ).fetchone() == (1, 0)
+    ).fetchone() == (2, 1)
     assert conn.execute(
-        "SELECT amount FROM risk_network_edge WHERE filing_id='F1' AND target_key='person:JOHN SMITH'"
-    ).fetchone()[0] == 175
+        "SELECT amount FROM risk_network_edge WHERE filing_id='F1' AND target_key='person:JANE DOE'"
+    ).fetchone()[0] == 125
+    assert conn.execute(
+        "SELECT COUNT(*) FROM risk_network_edge WHERE filing_id='F1' AND target_key='person:JOHN SMITH'"
+    ).fetchone()[0] == 0
     assert conn.execute(
         "SELECT amount FROM risk_network_edge WHERE filing_id='F1' AND target_key='contractor:ACME AUDIT LLC'"
-    ).fetchone()[0] == 900
+    ).fetchone()[0] == 500
     conn.close()
 
 
@@ -423,7 +459,13 @@ def test_incremental_removes_superseded_canonical_filing_edges(tmp_path):
               PRIMARY KEY(ein,tax_year)
             ) WITHOUT ROWID;
             INSERT INTO canonical_by_ein_year VALUES
-              ('111111111',2023,'F1'),('222222222',2024,'F2'),('333333333',2024,'F3');
+              ('111111111',2023,'F1A'),('222222222',2024,'F2'),('333333333',2024,'F3');
+            INSERT INTO returns
+            SELECT 'F1A',ein,org_name,tax_year,period_end,'2024-06-01',
+                   '99 New St',us_address_line2,city,state,zip,
+                   foreign_address_line1,foreign_city,foreign_province,
+                   foreign_country,foreign_postal_code
+              FROM returns WHERE filing_id='F1';
             """
         )
         conn.commit()
@@ -431,17 +473,16 @@ def test_incremental_removes_superseded_canonical_filing_edges(tmp_path):
     config = network.BuildConfig(batch_size=2)
     network.rebuild_full_sidecar(source, sidecar, config, page_size=2)
 
-    with closing(sqlite3.connect(source)) as conn:
+    # Simulate a stale canonical row/edge in the sidecar without changing the
+    # source snapshot. The current canonical filing remains F1A.
+    with closing(sqlite3.connect(sidecar)) as conn:
         conn.execute(
-            """INSERT INTO returns
-               SELECT 'F1A',ein,org_name,tax_year,period_end,'2024-06-01',
-                      '99 New St',us_address_line2,city,state,zip,
-                      foreign_address_line1,foreign_city,foreign_province,
-                      foreign_country,foreign_postal_code
-               FROM returns WHERE filing_id='F1'"""
+            """INSERT INTO risk_network_filing_state
+               SELECT 'F1',source_ein,tax_year,period_end,return_ts,built_at
+                 FROM risk_network_filing_state WHERE filing_id='F1A'"""
         )
         conn.execute(
-            "UPDATE canonical_by_ein_year SET filing_id='F1A' WHERE ein='111111111' AND tax_year=2023"
+            "UPDATE risk_network_edge SET filing_id='F1' WHERE filing_id='F1A'"
         )
         conn.commit()
     with closing(network.connect_source_readonly(source)) as conn:
@@ -883,6 +924,75 @@ def test_atomic_rebuild_rechecks_destination_auxiliary_immediately_before_replac
     assert not list(tmp_path.glob("risk.db.building-*.db"))
 
 
+def test_atomic_rebuild_rereads_portable_stamp_when_physical_stat_is_preserved(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    original_guard = network.assert_source_path_matches_snapshot
+    guard_calls = 0
+
+    def first_physical_guard_then_mutate(path, snapshot):
+        nonlocal guard_calls
+        original_guard(path, snapshot)
+        guard_calls += 1
+        if guard_calls != 1:
+            return
+        original_stat = path.stat()
+        with closing(sqlite3.connect(path)) as conn:
+            rotate_risk_source_revision(conn)
+            conn.commit()
+        changed_stat = path.stat()
+        assert changed_stat.st_size == original_stat.st_size
+        os.utime(
+            path,
+            ns=(changed_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        assert path.stat().st_size == original_stat.st_size
+        assert path.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    monkeypatch.setattr(
+        network,
+        "assert_source_path_matches_snapshot",
+        first_physical_guard_then_mutate,
+    )
+    with pytest.raises(RuntimeError, match="portable identity changed"):
+        network.rebuild_sidecar(
+            source, sidecar, _all_filings(source), network.BuildConfig()
+        )
+    assert guard_calls == 1
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
+def test_atomic_rebuild_rechecks_source_auxiliary_after_portable_identity_query(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    sidecar.write_bytes(b"existing-sidecar-must-survive")
+    original_portable_guard = network.assert_source_portable_stamp_matches_snapshot
+
+    def validate_then_create_source_wal(path, snapshot):
+        original_portable_guard(path, snapshot)
+        Path(str(path) + "-wal").write_bytes(b"late-source-wal")
+
+    monkeypatch.setattr(
+        network,
+        "assert_source_portable_stamp_matches_snapshot",
+        validate_then_create_source_wal,
+    )
+    with pytest.raises(RuntimeError, match="changed after sidecar validation"):
+        network.rebuild_sidecar(
+            source, sidecar, _all_filings(source), network.BuildConfig()
+        )
+    assert sidecar.read_bytes() == b"existing-sidecar-must-survive"
+    assert not list(tmp_path.glob("risk.db.building-*.db"))
+
+
 def test_full_pagination_is_checked_against_independent_source_count(
     tmp_path, monkeypatch
 ):
@@ -1006,6 +1116,443 @@ def test_runtime_network_returns_indexed_incoming_shared_neighbors_and_metadata(
     assert metadata["meta"]["schema_version"] == network.SCHEMA_VERSION
 
 
+def test_new_build_writes_only_portable_authoritative_source_metadata(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+
+    meta = _sidecar_meta(sidecar)
+    assert PORTABLE_META_KEYS <= set(meta)
+    assert int(meta["source_file_size"]) == source.stat().st_size
+    assert "source_lineage_id" not in meta
+    assert "source_file_mtime_ns" not in meta
+    assert _risk_network.available(
+        main_db_path=str(source),
+        environ={"IRS_RISK_NETWORK_DB_PATH": str(sidecar)},
+    ) is True
+
+
+def test_portable_sidecar_accepts_exact_pair_copied_to_new_path_and_mtime(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    moved = tmp_path / "linux-layout"
+    moved.mkdir()
+    moved_source = moved / "renamed-main.db"
+    moved_sidecar = moved / "renamed-risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+
+    shutil.copyfile(source, moved_source)
+    shutil.copyfile(sidecar, moved_sidecar)
+    moved_stat = moved_source.stat()
+    os.utime(
+        moved_source,
+        ns=(moved_stat.st_atime_ns, moved_stat.st_mtime_ns + 2_000_000_000),
+    )
+    assert network.source_lineage_id(moved_source) != network.source_lineage_id(source)
+
+    env = {
+        "IRS_DB_PATH": str(moved_source),
+        "IRS_RISK_NETWORK_DB_PATH": str(moved_sidecar),
+    }
+    assert _risk_network.available(environ=env) is True
+    assert _risk_network.build_metadata(moved_sidecar, environ=env)["meta"][
+        "source_identity_scheme"
+    ] == "portable_v1"
+    assert _risk_network.network_for_ein(
+        moved_sidecar, "111111111", environ=env
+    )["coverage"]["covered"] is True
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["database_id", "revision", "header", "size"],
+)
+def test_portable_runtime_rejects_source_stamp_mismatch(tmp_path, mismatch):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    meta = _sidecar_meta(sidecar)
+
+    if mismatch == "database_id":
+        with closing(sqlite3.connect(source)) as conn:
+            conn.execute(
+                "UPDATE app_dataset_identity SET database_id=? "
+                "WHERE identity_name='risk_network_source'",
+                (str(uuid.uuid4()),),
+            )
+            conn.commit()
+    elif mismatch == "revision":
+        with closing(sqlite3.connect(source)) as conn:
+            rotate_risk_source_revision(conn)
+            conn.commit()
+    else:
+        header = meta["source_header_sha256"]
+        size = int(meta["source_file_size"])
+        if mismatch == "header":
+            header = "0" * 64 if header != "0" * 64 else "1" * 64
+        else:
+            size += 4096
+        forged = portable_source_stamp_from_values(
+            meta["source_database_id"],
+            meta["source_risk_revision"],
+            size,
+            header,
+        )
+        _replace_portable_stamp(sidecar, forged)
+
+    env = {
+        "IRS_DB_PATH": str(source),
+        "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+    }
+    assert _risk_network.available(environ=env) is False
+    with pytest.raises(RuntimeError, match="stale"):
+        _risk_network.build_metadata(sidecar, environ=env)
+
+
+def test_partial_portable_metadata_fails_closed_instead_of_using_legacy(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.execute(
+            "DELETE FROM risk_network_build_meta WHERE key='source_snapshot_id'"
+        )
+        conn.commit()
+
+    env = {
+        "IRS_DB_PATH": str(source),
+        "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+    }
+    assert _risk_network.available(environ=env) is False
+    with pytest.raises(RuntimeError, match="invalid portable source metadata"):
+        _risk_network.build_metadata(sidecar, environ=env)
+    with pytest.raises(RuntimeError, match="incomplete or invalid portable"):
+        network.incremental_sidecar(
+            source,
+            sidecar,
+            _all_filings(source)[:1],
+            network.BuildConfig(),
+        )
+
+
+def test_wholly_legacy_metadata_remains_compatible_on_original_source(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    source_stat = source.stat()
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.executemany(
+            "DELETE FROM risk_network_build_meta WHERE key=?",
+            [(key,) for key in PORTABLE_META_KEYS],
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO risk_network_build_meta(key,value) VALUES (?,?)",
+            (
+                ("source_lineage_id", network.source_lineage_id(source)),
+                ("source_file_size", str(source_stat.st_size)),
+                ("source_file_mtime_ns", str(source_stat.st_mtime_ns)),
+            ),
+        )
+        conn.commit()
+
+    env = {
+        "IRS_DB_PATH": str(source),
+        "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+    }
+    assert _risk_network.available(environ=env) is True
+    assert _risk_network.build_metadata(sidecar, environ=env)["meta"][
+        "source_lineage_id"
+    ] == network.source_lineage_id(source)
+
+
+def test_incremental_safely_upgrades_matching_legacy_metadata(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    config = network.BuildConfig()
+    network.rebuild_sidecar(source, sidecar, _all_filings(source), config)
+    source_stat = source.stat()
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.executemany(
+            "DELETE FROM risk_network_build_meta WHERE key=?",
+            [(key,) for key in PORTABLE_META_KEYS],
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO risk_network_build_meta(key,value) VALUES (?,?)",
+            (
+                ("source_lineage_id", network.source_lineage_id(source)),
+                ("source_file_size", str(source_stat.st_size)),
+                ("source_file_mtime_ns", str(source_stat.st_mtime_ns)),
+            ),
+        )
+        conn.commit()
+    with closing(sqlite3.connect(source)) as conn:
+        identity = read_risk_source_identity(conn, required=True)
+    assert identity is not None
+    with closing(network.connect_source_readonly(source)) as conn:
+        selected = network.select_filings(
+            conn, eins=["111111111"], max_filings=10
+        )
+
+    network.incremental_sidecar(source, sidecar, selected, config)
+
+    meta = _sidecar_meta(sidecar)
+    assert PORTABLE_META_KEYS <= set(meta)
+    assert meta["source_database_id"] == identity.database_id
+    assert meta["source_risk_revision"] == identity.revision_id
+    assert "source_lineage_id" not in meta
+    assert "source_file_mtime_ns" not in meta
+
+
+@pytest.mark.parametrize("mismatch", ["lineage", "size", "mtime"])
+def test_incremental_rejects_any_legacy_snapshot_mismatch(tmp_path, mismatch):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    config = network.BuildConfig()
+    network.rebuild_sidecar(source, sidecar, _all_filings(source), config)
+    source_stat = source.stat()
+    legacy = {
+        "source_lineage_id": network.source_lineage_id(source),
+        "source_file_size": str(source_stat.st_size),
+        "source_file_mtime_ns": str(source_stat.st_mtime_ns),
+    }
+    if mismatch == "lineage":
+        legacy["source_lineage_id"] = "not-the-current-physical-lineage"
+    elif mismatch == "size":
+        legacy["source_file_size"] = str(source_stat.st_size + 1)
+    else:
+        legacy["source_file_mtime_ns"] = str(source_stat.st_mtime_ns + 1)
+    with closing(sqlite3.connect(sidecar)) as conn:
+        conn.executemany(
+            "DELETE FROM risk_network_build_meta WHERE key=?",
+            [(key,) for key in PORTABLE_META_KEYS],
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO risk_network_build_meta(key,value) VALUES (?,?)",
+            legacy.items(),
+        )
+        conn.commit()
+    before = _sidecar_meta(sidecar)
+
+    with pytest.raises(RuntimeError, match="Legacy risk-network source snapshot changed"):
+        network.incremental_sidecar(
+            source, sidecar, _all_filings(source)[:1], config
+        )
+    assert _sidecar_meta(sidecar) == before
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-journal"])
+def test_runtime_rejects_any_populated_source_auxiliary(tmp_path, suffix):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    Path(str(source) + suffix).write_bytes(b"populated-source-auxiliary")
+    env = {
+        "IRS_DB_PATH": str(source),
+        "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+    }
+
+    assert _risk_network.available(environ=env) is False
+    with pytest.raises(RuntimeError, match="populated SQLite auxiliary"):
+        _risk_network.build_metadata(sidecar, environ=env)
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-journal"])
+def test_runtime_rejects_any_populated_sidecar_auxiliary(tmp_path, suffix):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    Path(str(sidecar) + suffix).write_bytes(b"populated-sidecar-auxiliary")
+    env = {
+        "IRS_DB_PATH": str(source),
+        "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+    }
+
+    assert _risk_network.available(environ=env) is False
+    with pytest.raises(RuntimeError, match="sidecar database has populated SQLite auxiliary"):
+        _risk_network.build_metadata(sidecar, environ=env)
+    with pytest.raises(RuntimeError, match="sidecar database has populated SQLite auxiliary"):
+        _risk_network.network_for_ein(sidecar, "111111111", environ=env)
+
+
+@pytest.mark.parametrize("reader", ["build_metadata", "network_for_ein"])
+def test_runtime_revalidates_main_freshness_after_sidecar_queries(
+    tmp_path, monkeypatch, reader
+):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    network.rebuild_sidecar(
+        source, sidecar, _all_filings(source), network.BuildConfig()
+    )
+    original_validate = _risk_network._validate_source_freshness
+    validation_calls = 0
+
+    def validate_then_mutate(meta, source_path):
+        nonlocal validation_calls
+        validation_calls += 1
+        original_validate(meta, source_path)
+        if validation_calls == 1:
+            with closing(sqlite3.connect(source_path)) as conn:
+                rotate_risk_source_revision(conn)
+                conn.commit()
+
+    monkeypatch.setattr(
+        _risk_network, "_validate_source_freshness", validate_then_mutate
+    )
+    with pytest.raises(RuntimeError, match="stale"):
+        if reader == "build_metadata":
+            _risk_network.build_metadata(sidecar, main_db_path=str(source))
+        else:
+            _risk_network.network_for_ein(
+                sidecar, "111111111", main_db_path=str(source)
+            )
+    assert validation_calls == 2
+
+
+def test_runtime_and_every_bounded_publication_reject_populated_source_wal(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    bounded_sidecar = tmp_path / "bounded-risk.db"
+    _create_source(source)
+    config = network.BuildConfig()
+    network.rebuild_sidecar(source, sidecar, _all_filings(source), config)
+    previous_sidecar = sidecar.read_bytes()
+    bounded_sidecar.write_bytes(b"existing-bounded-sidecar")
+
+    with closing(sqlite3.connect(source)) as writer:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+        rotate_risk_source_revision(writer)
+        writer.execute("UPDATE returns SET org_name='In WAL' WHERE filing_id='F1'")
+        writer.commit()
+        assert Path(str(source) + "-wal").stat().st_size > 0
+        filings = _all_filings(source)
+        env = {
+            "IRS_DB_PATH": str(source),
+            "IRS_RISK_NETWORK_DB_PATH": str(sidecar),
+        }
+
+        assert _risk_network.available(environ=env) is False
+        with pytest.raises(RuntimeError, match="populated SQLite auxiliary"):
+            _risk_network.build_metadata(sidecar, environ=env)
+        with pytest.raises(RuntimeError, match="requires a checkpointed source database"):
+            network.main([
+                "plan", "--db", str(source), "--sidecar", str(bounded_sidecar),
+                "--ein", "111111111",
+            ])
+        with pytest.raises(RuntimeError, match="requires a checkpointed source database"):
+            network.rebuild_sidecar(source, bounded_sidecar, filings, config)
+        with pytest.raises(RuntimeError, match="requires a checkpointed source database"):
+            network.incremental_sidecar(source, sidecar, filings[:1], config)
+
+    assert bounded_sidecar.read_bytes() == b"existing-bounded-sidecar"
+    assert sidecar.read_bytes() == previous_sidecar
+
+
+def test_bounded_plan_requires_portable_source_readiness(tmp_path):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    with closing(sqlite3.connect(source)) as conn:
+        conn.execute("DROP TABLE app_dataset_identity")
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="not prepared for portable risk-network builds"):
+        network.main([
+            "plan", "--db", str(source), "--sidecar", str(sidecar),
+            "--ein", "111111111",
+        ])
+    assert not sidecar.exists()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["database_id", "revision", "header", "size"],
+)
+def test_incremental_rejects_every_portable_stamp_mismatch(tmp_path, mismatch):
+    source = tmp_path / "source.db"
+    sidecar = tmp_path / "risk.db"
+    _create_source(source)
+    config = network.BuildConfig()
+    network.rebuild_sidecar(source, sidecar, _all_filings(source), config)
+    current = _sidecar_meta(sidecar)
+    if mismatch == "database_id":
+        with closing(sqlite3.connect(source)) as conn:
+            conn.execute(
+                "UPDATE app_dataset_identity SET database_id=? "
+                "WHERE identity_name='risk_network_source'",
+                (str(uuid.uuid4()),),
+            )
+            conn.commit()
+    elif mismatch == "revision":
+        with closing(sqlite3.connect(source)) as conn:
+            rotate_risk_source_revision(conn)
+            conn.commit()
+    else:
+        header = current["source_header_sha256"]
+        size = int(current["source_file_size"])
+        if mismatch == "header":
+            header = "0" * 64 if header != "0" * 64 else "1" * 64
+        else:
+            size += 4096
+        _replace_portable_stamp(
+            sidecar,
+            portable_source_stamp_from_values(
+                current["source_database_id"],
+                current["source_risk_revision"],
+                size,
+                header,
+            ),
+        )
+    before = _sidecar_meta(sidecar)
+    with closing(network.connect_source_readonly(source)) as conn:
+        selected = network.select_filings(
+            conn, eins=["111111111"], max_filings=10
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="different source database|source snapshot changed",
+    ):
+        network.incremental_sidecar(source, sidecar, selected, config)
+    assert _sidecar_meta(sidecar) == before
+
+
+def test_risk_network_defaults_are_repo_relative(monkeypatch):
+    monkeypatch.delenv("IRS_DB_PATH", raising=False)
+    args = network.build_parser().parse_args(["plan", "--ein", "111111111"])
+
+    assert Path(args.db) == network.DEFAULT_MAIN_DB_PATH
+    assert network.DEFAULT_MAIN_DB_PATH == (
+        Path(network.__file__).resolve().parent / "db" / "irs990.db"
+    )
+    assert _risk_network._main_database_path(environ={}) == (
+        Path(_risk_network.__file__).resolve().parents[1] / "db" / "irs990.db"
+    )
+
+
 def test_builder_refuses_source_as_sidecar_at_every_write_boundary(tmp_path):
     source = tmp_path / "source.db"
     _create_source(source)
@@ -1073,9 +1620,14 @@ def test_runtime_rejects_same_path_atomic_source_replacement(tmp_path):
     }
 
     assert _risk_network.available(environ=runtime_env) is True
-    assert _risk_network.build_metadata(sidecar, environ=runtime_env)["meta"][
-        "source_lineage_id"
-    ] == network.source_lineage_id(source)
+    with closing(sqlite3.connect(source)) as conn:
+        identity = read_risk_source_identity(conn, required=True)
+    assert identity is not None
+    metadata = _risk_network.build_metadata(sidecar, environ=runtime_env)["meta"]
+    assert metadata["source_database_id"] == identity.database_id
+    assert metadata["source_risk_revision"] == identity.revision_id
+    assert "source_lineage_id" not in metadata
+    assert "source_file_mtime_ns" not in metadata
     assert _risk_network.network_for_ein(
         sidecar, "111111111", environ=runtime_env
     )["coverage"]["covered"] is True
@@ -1104,6 +1656,7 @@ def test_runtime_rejects_in_place_source_stat_change(tmp_path):
     original_stat = source.stat()
 
     with closing(sqlite3.connect(source)) as conn:
+        rotate_risk_source_revision(conn)
         conn.execute(
             "UPDATE returns SET org_name='Changed After Network Build' "
             "WHERE filing_id='F1'"
