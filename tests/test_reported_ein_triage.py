@@ -119,6 +119,35 @@ def fixture_rows(conn):
 
 
 class ReportedEinTriageTests(unittest.TestCase):
+    def test_rule_row_constructor_normalizes_every_nonselection_decision(self):
+        conn = build_conn()
+        try:
+            insert_candidate(conn)
+            sig, candidates = fixture_rows(conn)
+            for decision in ("NO_MATCH", "AMBIGUOUS", "HUMAN_REVIEW"):
+                with self.subTest(decision=decision):
+                    row = gai.reported_ein_rule_decision_row(
+                        sig,
+                        candidates,
+                        decision=decision,
+                        selected_ein=TARGET_EIN,
+                        selected_name="Learning Policy Institute",
+                        confidence=0,
+                        confidence_label="none",
+                        reason_codes=["test_review_evidence"],
+                        explanation=f"Review filing EIN {TARGET_EIN}.",
+                        needs_human_review=True,
+                        auto_accept=True,
+                    )
+                    self.assertEqual(row[2:5], ("", "", ""))
+                    self.assertEqual(row[10], 0)
+                    evidence = json.loads(row[17])["reported_ein_triage"]["review_identity_evidence"]
+                    self.assertEqual(evidence["candidate_id"], "C1")
+                    self.assertEqual(evidence["ein"], TARGET_EIN)
+                    self.assertEqual(evidence["display_name"], "Learning Policy Institute")
+        finally:
+            conn.close()
+
     def test_new_list_style_recipient_patterns_are_nonadjudicable(self):
         cases = {
             "VARIOUS-AVAILABLE UPON REQUEST": "available_upon_request_placeholder",
@@ -199,9 +228,49 @@ class ReportedEinTriageTests(unittest.TestCase):
 
             self.assertEqual(reason, "reported_ein_known_name_disagrees_human_review_no_ai")
             self.assertEqual(row[1], "HUMAN_REVIEW")
-            self.assertEqual(row[3], TARGET_EIN)
+            self.assertEqual(row[2:5], ("", "", ""))
             self.assertEqual(row[10], 0)
             self.assertEqual(row[13], "rule:reported_ein_no_ai_review")
+            input_obj = json.loads(row[17])
+            self.assertEqual(input_obj["grant_recipient_signature"]["reported_ein"], TARGET_EIN)
+            self.assertEqual(
+                input_obj["reported_ein_triage"]["review_identity_evidence"],
+                {
+                    "candidate_id": "C1",
+                    "ein": TARGET_EIN,
+                    "display_name": "Learning Policy Institute",
+                },
+            )
+            self.assertEqual(json.loads(row[18])["candidate_id"], "")
+        finally:
+            conn.close()
+
+    def test_invalid_reported_ein_nonselection_actions_never_retain_recipient_identity(self):
+        conn = build_conn()
+        try:
+            conn.execute("UPDATE sig_fixture SET reported_ein='000000000'")
+            sig, candidates = fixture_rows(conn)
+
+            for action, expected_decision in (("human_review", "HUMAN_REVIEW"), ("no_match", "NO_MATCH")):
+                with self.subTest(action=action):
+                    row, reason = gai.reported_ein_triage_decision_row(
+                        conn,
+                        sig,
+                        candidates,
+                        invalid_ein_action=action,
+                    )
+                    self.assertIn("reported_ein_placeholder_value", reason)
+                    self.assertEqual(row[1], expected_decision)
+                    self.assertEqual(row[2:5], ("", "", ""))
+                    self.assertEqual(row[10], 0)
+                    self.assertEqual(row[13], "rule:invalid_reported_ein_no_ai")
+                    input_obj = json.loads(row[17])
+                    self.assertEqual(input_obj["grant_recipient_signature"]["reported_ein"], "000000000")
+                    self.assertEqual(
+                        input_obj["reported_ein_triage"]["review_identity_evidence"]["display_name"],
+                        "Institute for Education Policy",
+                    )
+                    self.assertEqual(json.loads(row[18])["candidate_id"], "")
         finally:
             conn.close()
 

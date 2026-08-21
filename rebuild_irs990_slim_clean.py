@@ -16,13 +16,43 @@ Patched version:
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass
+import hashlib
+from itertools import groupby, islice
 import os
 import sqlite3
+import stat
 import sys
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import tempfile
+from concurrent.futures import Executor, ProcessPoolExecutor
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 import xml.etree.ElementTree as ET
+
+from common import DB_PATH, configured_xml_root
+
+
+DEFAULT_SOURCE_MANIFEST = Path(__file__).resolve().parent / 'db' / 'irs990_sources.db'
+MANIFEST_PATH_FORMAT = 'relative_posix_v1'
+MANIFEST_DUPLICATE_STATUSES = {
+    'unique',
+    'primary_duplicate_group',
+    'exact_duplicate',
+    'object_id_conflict',
+}
+HASH_CHUNK_SIZE = 1024 * 1024
+PROCESS_BATCH_PREFETCH_MULTIPLIER = 2
+
+
+class ManifestSelectionError(RuntimeError):
+    """The source inventory cannot safely define a clean-rebuild input set."""
+
+
+@dataclass
+class ManifestSelection:
+    files: Optional[List[str]]
+    stats: Dict[str, int]
 
 
 def local(tag: str) -> str:
@@ -906,6 +936,33 @@ CREATE TABLE IF NOT EXISTS irs990_schedule_r_unrelated_org_txbl_partnership_grp 
 ]
 
 
+# Every table in this inventory represents a repeated XML child group.  Keep it
+# centralized so replacing one filing cannot leave stale or duplicate children.
+# Singleton tables use filing_id as their primary key and are already handled by
+# INSERT OR REPLACE.
+MULTIROW_CHILD_TABLES: Tuple[str, ...] = (
+    'irs990_schedule_c_supplemental_info',
+    'grants',
+    'irs990_contractor_compensation_grp',
+    'officers',
+    'highest_comp_employees',
+    'former_key_people',
+    'irs990_ez_officer_director_trustee_empl_grp',
+    'irs990_schedule_j_rltd_org_officer_trst_key_empl_grp',
+    'irs990_pf_officer_dir_trst_key_empl_info_grp',
+    'irs990_schedule_l_bus_tr_involve_interested_prsn_grp',
+    'irs990_schedule_l_disqualified_person_ex_bnft_tr_grp',
+    'irs990_schedule_l_grnt_asst_bnft_interested_prsn_grp',
+    'irs990_schedule_l_loans_btwn_org_interested_prsn_grp',
+    'irs990_schedule_r_id_related_tax_exempt_org_grp',
+    'irs990_schedule_r_id_related_org_txbl_corp_tr_grp',
+    'irs990_schedule_r_id_related_org_txbl_partnership_grp',
+    'irs990_schedule_r_id_disregarded_entities_grp',
+    'irs990_schedule_r_transactions_related_org_grp',
+    'irs990_schedule_r_unrelated_org_txbl_partnership_grp',
+)
+
+
 VIEWS = [
 """
 CREATE VIEW grants_compat_v1 AS
@@ -1372,6 +1429,30 @@ def generic_group_rows(root: ET.Element, tag_key: str, cols: Sequence[str]) -> L
     return rows
 
 
+def should_keep_grant_row(group: ET.Element, row: Mapping[str, Any]) -> bool:
+    """Reject an IRS Schedule I placeholder that contains only a zero cash amount.
+
+    Some filings emit an otherwise-empty ``RecipientTable`` with
+    ``CashGrantAmt=0``.  It is not a recipient record.  An explicit zero remains
+    meaningful when the row also has recipient, purpose, address, noncash, or
+    other grant data, and a populated row with no amount must retain ``None``.
+    """
+    ignored = {'filing_id', 'filer_ein', 'filer_name'}
+    populated = {
+        key: value
+        for key, value in row.items()
+        if key not in ignored and value not in (None, '')
+    }
+    if not populated:
+        return False
+    if local(group.tag).lower() != 'recipienttable':
+        return True
+    return not (
+        set(populated) == {'cash_grant_amt'}
+        and norm_num(populated['cash_grant_amt']) == 0
+    )
+
+
 def header_extract(root: ET.Element, p: Path) -> Optional[Dict[str, Any]]:
     rtype = first_text_paths(root, HEADER_PATHS["return_type"])
     tax_year = norm_int(first_text_paths(root, HEADER_PATHS["tax_year"]))
@@ -1553,7 +1634,7 @@ def extract_file(file_path: str) -> Dict[str, Any]:
             'valuation_method_used_desc': descendants_text_first(g, ['ValuationMethodUsedDesc']),
             'purpose_of_grant_txt': descendants_text_first(g, ['PurposeOfGrantTxt', 'GrantOrContributionPurposeTxt']),
         }
-        if any(v not in (None, '') for k, v in row.items() if k not in {'filing_id', 'filer_ein', 'filer_name'}):
+        if should_keep_grant_row(g, row):
             grants.append(row)
 
     contractors = []
@@ -1766,6 +1847,18 @@ def ensure_schema_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _filing_exists(conn: sqlite3.Connection, filing_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM returns WHERE filing_id = ? LIMIT 1",
+        (filing_id,),
+    ).fetchone() is not None
+
+
+def _delete_multirow_children(conn: sqlite3.Connection, filing_id: str) -> None:
+    for table in MULTIROW_CHILD_TABLES:
+        conn.execute(f'DELETE FROM "{table}" WHERE filing_id = ?', (filing_id,))
+
+
 def existing_filing_keys(conn: sqlite3.Connection) -> Tuple[set, set]:
     filing_ids = set()
     object_ids = set()
@@ -1806,6 +1899,371 @@ def select_xml_files(xml_dirs: Sequence[Path], append_only: bool, conn: sqlite3.
     return selected, stats
 
 
+def _manifest_relative_path(value: Any) -> str:
+    """Return a portable inventory path and reject absolute/traversal input."""
+    text = str(value or '').strip().replace('\\', '/')
+    pure = PurePosixPath(text)
+    if not text or pure.is_absolute() or (pure.parts and pure.parts[0].endswith(':')):
+        raise ManifestSelectionError(f'manifest path must be relative: {value!r}')
+    parts = [part for part in pure.parts if part not in {'', '.'}]
+    if not parts or any(part == '..' for part in parts):
+        raise ManifestSelectionError(f'invalid manifest relative path: {value!r}')
+    return PurePosixPath(*parts).as_posix()
+
+
+def _manifest_path_key(value: Any, *, normalize_old: bool = False) -> str:
+    text = str(value or '').strip().replace('\\', '/').casefold().strip('/')
+    if normalize_old:
+        text = text.replace('_old/', '/')
+    return text
+
+
+def _loaded_path_matches(loaded_source: Any, relative_path: Any, *, normalize_old: bool = False) -> bool:
+    loaded = _manifest_path_key(loaded_source, normalize_old=normalize_old)
+    relative = _manifest_path_key(relative_path, normalize_old=normalize_old)
+    return bool(loaded and relative and (loaded == relative or loaded.endswith('/' + relative)))
+
+
+def _manifest_groups(cursor: sqlite3.Cursor) -> Iterator[Tuple[str, List[sqlite3.Row]]]:
+    for object_id, rows in groupby(cursor, key=lambda row: str(row['object_id'] or '')):
+        yield object_id, list(rows)
+
+
+def _require_manifest_schema(conn: sqlite3.Connection, manifest_path: Path) -> Tuple[str, str]:
+    required = {
+        'source_files': {
+            'source_file_id', 'scan_id', 'source_file', 'relative_path', 'filing_id', 'object_id',
+            'size_bytes', 'mtime_ns', 'sha256', 'duplicate_status', 'keep_source_file',
+            'quarantine_status', 'quarantine_file',
+        },
+        'loaded_filings': {
+            'filing_id', 'object_id', 'source_file', 'imported_at',
+        },
+        'scan_meta': {'key', 'value'},
+    }
+    for table, columns in required.items():
+        found = conn.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not found:
+            raise ManifestSelectionError(f'manifest is missing required table {table}: {manifest_path}')
+        actual = {str(row['name']) for row in conn.execute(f"PRAGMA table_info('{table}')")}
+        missing = sorted(columns - actual)
+        if missing:
+            raise ManifestSelectionError(
+                f"manifest table {table} is missing required column(s): {', '.join(missing)}"
+            )
+    meta = {
+        str(row['key']): str(row['value'] or '')
+        for row in conn.execute("SELECT key,value FROM scan_meta")
+    }
+    if meta.get('path_format') != MANIFEST_PATH_FORMAT:
+        raise ManifestSelectionError(
+            f"manifest path_format must be {MANIFEST_PATH_FORMAT!r}; rescan the XML archive"
+        )
+    scan_id = meta.get('last_scan_id', '').strip()
+    scanned_at = meta.get('last_scanned_at', '').strip()
+    if not scan_id or not scanned_at:
+        raise ManifestSelectionError('manifest lacks completed-scan metadata; rescan the XML archive')
+    return scan_id, scanned_at
+
+
+def _choose_manifest_source(
+    object_id: str,
+    source_rows: Sequence[sqlite3.Row],
+    loaded_row: sqlite3.Row,
+) -> Tuple[sqlite3.Row, str]:
+    if not object_id:
+        raise ManifestSelectionError('manifest contains a blank object_id')
+    statuses = {str(row['duplicate_status'] or '').strip() for row in source_rows}
+    unknown = sorted(statuses - MANIFEST_DUPLICATE_STATUSES)
+    if unknown:
+        raise ManifestSelectionError(
+            f"object {object_id} has unresolved duplicate status(es): {', '.join(unknown)}"
+        )
+    for row in source_rows:
+        filing_id = str(row['filing_id'] or '').strip()
+        if not filing_id or object_id_from_filing_id(filing_id) != object_id:
+            raise ManifestSelectionError(
+                f"object {object_id} has inconsistent manifest filing_id {filing_id!r}"
+            )
+
+    if 'object_id_conflict' in statuses:
+        loaded_source = str(loaded_row['source_file'] or '').strip()
+        if not loaded_source:
+            raise ManifestSelectionError(
+                f'object_id_conflict {object_id} has no loaded source path to preserve'
+            )
+        matches = [
+            row for row in source_rows
+            if _loaded_path_matches(loaded_source, row['relative_path'])
+        ]
+        strategy = 'loaded_path'
+        if not matches:
+            matches = [
+                row for row in source_rows
+                if _loaded_path_matches(loaded_source, row['relative_path'], normalize_old=True)
+            ]
+            strategy = 'loaded_path_normalized_old'
+        if len(matches) != 1:
+            raise ManifestSelectionError(
+                f'object_id_conflict {object_id} is unresolved/ambiguous: '
+                f'loaded source matched {len(matches)} manifest paths'
+            )
+        selected = matches[0]
+        if str(selected['filing_id'] or '') != str(loaded_row['filing_id'] or ''):
+            raise ManifestSelectionError(
+                f"object_id_conflict {object_id} selected filing_id "
+                f"{selected['filing_id']!r}, not loaded filing_id {loaded_row['filing_id']!r}"
+            )
+        return selected, strategy
+
+    if len(source_rows) == 1:
+        selected = source_rows[0]
+        if statuses != {'unique'}:
+            raise ManifestSelectionError(
+                f'object {object_id} has a stale one-row duplicate classification: '
+                f"{selected['duplicate_status']!r}"
+            )
+        return selected, 'unique'
+
+    if not statuses.issubset({'primary_duplicate_group', 'exact_duplicate'}):
+        raise ManifestSelectionError(
+            f'object {object_id} has an ambiguous multi-file classification: {sorted(statuses)}'
+        )
+    hashes = {str(row['sha256'] or '').strip() for row in source_rows}
+    if '' in hashes or len(hashes) != 1:
+        raise ManifestSelectionError(
+            f'object {object_id} has multiple or unhashed byte variants without conflict resolution'
+        )
+    primary = [row for row in source_rows if row['duplicate_status'] == 'primary_duplicate_group']
+    if len(primary) != 1:
+        raise ManifestSelectionError(
+            f'object {object_id} must have exactly one primary duplicate source; found {len(primary)}'
+        )
+    primary_relative = _manifest_relative_path(primary[0]['relative_path'])
+    if any(not str(row['keep_source_file'] or '').strip() for row in source_rows):
+        raise ManifestSelectionError(
+            f'object {object_id} has incomplete keep_source_file metadata'
+        )
+    keep_paths = {
+        _manifest_relative_path(row['keep_source_file'])
+        for row in source_rows
+        if str(row['keep_source_file'] or '').strip()
+    }
+    if keep_paths != {primary_relative}:
+        raise ManifestSelectionError(
+            f'object {object_id} has inconsistent keep_source_file metadata'
+        )
+    return primary[0], 'exact_duplicate_primary'
+
+
+def _resolve_manifest_source(root: Path, object_id: str, row: sqlite3.Row) -> Path:
+    relative = _manifest_relative_path(row['relative_path'])
+    candidate = root.joinpath(*PurePosixPath(relative).parts).resolve()
+    if candidate == root or root not in candidate.parents:
+        raise ManifestSelectionError(
+            f'object {object_id} manifest path resolves outside XML root: {relative}'
+        )
+    if candidate.suffix.casefold() != '.xml':
+        raise ManifestSelectionError(f'object {object_id} selected a non-XML path: {relative}')
+    quarantine_status = str(row['quarantine_status'] or '').strip()
+    quarantine_file = str(row['quarantine_file'] or '').strip()
+    if quarantine_status or quarantine_file:
+        raise ManifestSelectionError(
+            f'object {object_id} selected a quarantined path: {relative} '
+            f'(status={quarantine_status or "recorded"})'
+        )
+    try:
+        current_stat = candidate.stat()
+    except FileNotFoundError:
+        raise ManifestSelectionError(
+            f'object {object_id} selected source is missing: {candidate}'
+        ) from None
+    except OSError as exc:
+        raise ManifestSelectionError(
+            f'object {object_id} selected source cannot be read: {candidate}: {exc}'
+        ) from exc
+    if not stat.S_ISREG(current_stat.st_mode):
+        raise ManifestSelectionError(
+            f'object {object_id} selected source is not a regular file: {candidate}'
+        )
+    actual_size = current_stat.st_size
+    expected_size = int(row['size_bytes'])
+    if actual_size != expected_size:
+        raise ManifestSelectionError(
+            f'object {object_id} selected source size differs from manifest: '
+            f'{candidate} ({actual_size} != {expected_size}); rescan the archive'
+        )
+    expected_mtime_ns = int(row['mtime_ns'])
+    if current_stat.st_mtime_ns != expected_mtime_ns:
+        raise ManifestSelectionError(
+            f'object {object_id} selected source mtime differs from manifest: '
+            f'{candidate} ({current_stat.st_mtime_ns} != {expected_mtime_ns}); rescan the archive'
+        )
+    expected_sha256 = str(row['sha256'] or '').strip().casefold()
+    if expected_sha256:
+        digest = hashlib.sha256()
+        try:
+            with candidate.open('rb') as source:
+                for chunk in iter(lambda: source.read(HASH_CHUNK_SIZE), b''):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise ManifestSelectionError(
+                f'object {object_id} selected source cannot be hashed: {candidate}: {exc}'
+            ) from exc
+        actual_sha256 = digest.hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ManifestSelectionError(
+                f'object {object_id} selected source SHA-256 differs from manifest: '
+                f'{candidate}; rescan or restore the archive'
+            )
+    return candidate
+
+
+def select_manifest_xml_files(
+    manifest_path: Path,
+    xml_root: Path,
+    *,
+    expected_count: Optional[int] = None,
+    collect_files: bool = True,
+    progress_every: int = 100_000,
+) -> ManifestSelection:
+    """Validate and select exactly one loaded source file per manifest object.
+
+    Both SQLite inputs are read-only.  The complete merge/path validation runs
+    before a caller can delete or connect to a clean-rebuild destination.
+    """
+    manifest_path = manifest_path.expanduser().resolve()
+    root = xml_root.expanduser().resolve()
+    if not manifest_path.is_file():
+        raise ManifestSelectionError(f'source manifest not found: {manifest_path}')
+    if not root.is_dir():
+        raise ManifestSelectionError(f'XML root not found or not a directory: {root}')
+    if expected_count is not None and int(expected_count) < 1:
+        raise ManifestSelectionError('--expected-selection-count must be a positive integer')
+
+    uri = f"file:{manifest_path.as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA query_only=ON')
+    conn.execute('PRAGMA trusted_schema=OFF')
+    try:
+        scan_id, scanned_at = _require_manifest_schema(conn, manifest_path)
+        source_cursor = conn.execute(
+            """
+            SELECT source_file_id,scan_id,source_file,relative_path,filing_id,object_id,size_bytes,mtime_ns,
+                   sha256,duplicate_status,keep_source_file,quarantine_status,quarantine_file
+            FROM source_files INDEXED BY idx_source_object
+            ORDER BY object_id
+            """
+        )
+        loaded_cursor = conn.execute(
+            """
+            SELECT filing_id,object_id,source_file,imported_at
+            FROM loaded_filings INDEXED BY idx_loaded_object
+            ORDER BY object_id
+            """
+        )
+        source_groups = iter(_manifest_groups(source_cursor))
+        loaded_groups = iter(_manifest_groups(loaded_cursor))
+        loaded_current = next(loaded_groups, None)
+        files: Optional[List[str]] = [] if collect_files else None
+        stats = {
+            'manifest_source_rows': 0,
+            'loaded_objects': 0,
+            'loaded_filings': 0,
+            'selected_objects': 0,
+            'selected_filings': 0,
+            'files_validated': 0,
+            'unique': 0,
+            'exact_duplicate_primary': 0,
+            'object_id_conflict_loaded_path': 0,
+            'object_id_conflict_loaded_path_normalized_old': 0,
+        }
+        for object_id, source_rows in source_groups:
+            stats['manifest_source_rows'] += len(source_rows)
+            if loaded_current is None:
+                raise ManifestSelectionError(
+                    f'manifest object {object_id} has no corresponding loaded_filings row'
+                )
+            loaded_object_id, loaded_rows = loaded_current
+            if loaded_object_id < object_id:
+                raise ManifestSelectionError(
+                    f'loaded object {loaded_object_id} has no corresponding source_files row'
+                )
+            if loaded_object_id > object_id:
+                raise ManifestSelectionError(
+                    f'manifest object {object_id} has no corresponding loaded_filings row'
+                )
+            if len(loaded_rows) != 1:
+                raise ManifestSelectionError(
+                    f'object {object_id} has {len(loaded_rows)} loaded_filings rows; expected exactly one'
+                )
+            loaded_row = loaded_rows[0]
+            if str(loaded_row['imported_at'] or '') != scanned_at:
+                raise ManifestSelectionError(
+                    f'object {object_id} loaded_filings row is not from the completed manifest scan'
+                )
+            if any(str(row['scan_id'] or '') != scan_id for row in source_rows):
+                raise ManifestSelectionError(
+                    f'object {object_id} source row is not from the completed manifest scan'
+                )
+            for row in source_rows:
+                if _manifest_relative_path(row['source_file']) != _manifest_relative_path(row['relative_path']):
+                    raise ManifestSelectionError(
+                        f'object {object_id} has inconsistent portable source paths'
+                    )
+            selected, strategy = _choose_manifest_source(object_id, source_rows, loaded_row)
+            candidate = _resolve_manifest_source(root, object_id, selected)
+            if files is not None:
+                files.append(str(candidate))
+            stats['loaded_objects'] += 1
+            stats['loaded_filings'] += len(loaded_rows)
+            stats['selected_objects'] += 1
+            stats['selected_filings'] += 1
+            stats['files_validated'] += 1
+            if strategy == 'unique':
+                stats['unique'] += 1
+            elif strategy == 'exact_duplicate_primary':
+                stats['exact_duplicate_primary'] += 1
+            elif strategy == 'loaded_path':
+                stats['object_id_conflict_loaded_path'] += 1
+            else:
+                stats['object_id_conflict_loaded_path_normalized_old'] += 1
+            if progress_every > 0 and stats['selected_objects'] % int(progress_every) == 0:
+                print(
+                    f"[manifest] validated {stats['selected_objects']:,} objects/files...",
+                    flush=True,
+                )
+            loaded_current = next(loaded_groups, None)
+
+        if loaded_current is not None:
+            raise ManifestSelectionError(
+                f'loaded object {loaded_current[0]} has no corresponding source_files row'
+            )
+        if not stats['selected_objects']:
+            raise ManifestSelectionError('manifest selection is empty')
+        if not (
+            stats['selected_objects']
+            == stats['selected_filings']
+            == stats['loaded_objects']
+            == stats['loaded_filings']
+            == stats['files_validated']
+        ):
+            raise ManifestSelectionError(f'manifest selection count mismatch: {stats}')
+        if expected_count is not None and stats['selected_objects'] != int(expected_count):
+            raise ManifestSelectionError(
+                f"manifest selected {stats['selected_objects']:,} objects/filings; "
+                f'expected {int(expected_count):,}'
+            )
+        return ManifestSelection(files=files, stats=stats)
+    except sqlite3.Error as exc:
+        raise ManifestSelectionError(f'cannot read source manifest {manifest_path}: {exc}') from exc
+    finally:
+        conn.close()
+
+
 def build_views_indexes(conn: sqlite3.Connection) -> None:
     for v in ['grants_compat_v1', 'vw_contractors', 'sched_r_related_orgs_expanded']:
         conn.execute(f'DROP VIEW IF EXISTS {v}')
@@ -1833,14 +2291,89 @@ def rebuild_canonical(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, chunksize: int, commit_every: int, append_only: bool = False) -> None:
+def _apply_ordered_batch(function: Callable[[Any], Any], values: Sequence[Any]) -> List[Any]:
+    """Worker entry point kept at module scope so Windows spawn can pickle it."""
+    return [function(value) for value in values]
+
+
+def bounded_ordered_executor_map(
+    executor: Executor,
+    function: Callable[[Any], Any],
+    values: Iterable[Any],
+    *,
+    chunksize: int,
+    max_pending_batches: int,
+) -> Iterator[Any]:
+    """Map lazily with a fixed batch window while preserving input order.
+
+    ``Executor.map`` eagerly collects its input on Python versions without the
+    newer ``buffersize`` argument.  A multi-million-file rebuild must work on
+    those versions too, so this feeder submits only a bounded deque of explicit
+    batches.  Pending work is cancelled if a worker/result or the consumer
+    raises.  Already-running process work cannot be cancelled, but is bounded by
+    the configured window.
+    """
+    batch_size = int(chunksize)
+    pending_limit = int(max_pending_batches)
+    if batch_size < 1:
+        raise ValueError('chunksize must be at least 1')
+    if pending_limit < 1:
+        raise ValueError('max_pending_batches must be at least 1')
+
+    iterator = iter(values)
+    pending: Deque[Any] = deque()
+
+    def submit_next() -> bool:
+        batch = list(islice(iterator, batch_size))
+        if not batch:
+            return False
+        pending.append(executor.submit(_apply_ordered_batch, function, batch))
+        return True
+
+    try:
+        while len(pending) < pending_limit and submit_next():
+            pass
+        while pending:
+            future = pending.popleft()
+            batch_results = future.result()
+            for result in batch_results:
+                yield result
+            submit_next()
+    finally:
+        while pending:
+            pending.popleft().cancel()
+        close_iterator = getattr(iterator, 'close', None)
+        if callable(close_iterator):
+            close_iterator()
+
+
+def load_data(
+    conn: sqlite3.Connection,
+    xml_dirs: Sequence[Path],
+    workers: int,
+    chunksize: int,
+    commit_every: int,
+    append_only: bool = False,
+    selected_files: Optional[Sequence[str]] = None,
+    selected_file_stats: Optional[Dict[str, int]] = None,
+    strict_errors: bool = False,
+) -> int:
     err_log = xml_dirs[0].parent / 'rebuild_irs990_slim_errors.log'
     processed = 0
 
     def ins(sql, vals):
         conn.execute(sql, vals)
 
-    files_iter, file_stats = select_xml_files(xml_dirs, append_only, conn)
+    if selected_files is None:
+        files_iter, file_stats = select_xml_files(xml_dirs, append_only, conn)
+    else:
+        files_iter = selected_files
+        file_stats = selected_file_stats or {
+            'total': len(selected_files),
+            'selected': len(selected_files),
+            'skipped_existing': 0,
+            'skipped_duplicate_input': 0,
+        }
     print(
         f"[load] XML roots: {len(xml_dirs):,}; files found: {file_stats['total']:,}; "
         f"selected: {file_stats['selected']:,}; "
@@ -1849,15 +2382,9 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
     )
     if not files_iter:
         print('[load] no new XML files to load')
-        return
+        return 0
 
-    def handle(row):
-        nonlocal processed
-        if 'error' in row:
-            with open(err_log, 'a', encoding='utf-8') as ef:
-                ef.write(row['error'] + '\n')
-            return
-
+    def persist(row):
         h = row['header']
         ins("""INSERT OR REPLACE INTO returns (
             filing_id, source_file, ein, return_type, tax_year, period_end, schema_version, return_ts, amended_return_ind,
@@ -1885,7 +2412,6 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
         ins_singleton('irs990_ez_root', IRS990EZ_COLS)
         ins_singleton('irs990_pf_root', IRS990PF_COLS)
         ins_singleton('irs990_schedule_c_root', SCHEDC_COLS)
-        conn.execute("DELETE FROM irs990_schedule_c_supplemental_info WHERE filing_id = ?", [h['filing_id']])
         for r in row['irs990_schedule_c_supplemental_info']:
             ins("""INSERT INTO irs990_schedule_c_supplemental_info (
                 filing_id,form_and_line_reference_desc,explanation_txt
@@ -1930,6 +2456,31 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
                 placeholders = ','.join('?' for _ in cols)
                 conn.execute(f"INSERT INTO {t} ({','.join(cols)}) VALUES ({placeholders})", [r.get(k) for k in cols])
 
+    def handle(row):
+        nonlocal processed
+        if 'error' in row:
+            if strict_errors:
+                raise RuntimeError(f"manifest-selected XML extraction failed: {row['error']}")
+            with open(err_log, 'a', encoding='utf-8') as ef:
+                ef.write(row['error'] + '\n')
+            return
+
+        filing_id = row['header']['filing_id']
+        if _filing_exists(conn, filing_id):
+            savepoint = 'replace_existing_filing'
+            conn.execute(f'SAVEPOINT {savepoint}')
+            try:
+                _delete_multirow_children(conn, filing_id)
+                persist(row)
+            except BaseException:
+                conn.execute(f'ROLLBACK TO {savepoint}')
+                conn.execute(f'RELEASE {savepoint}')
+                raise
+            else:
+                conn.execute(f'RELEASE {savepoint}')
+        else:
+            persist(row)
+
         processed += 1
         if processed % commit_every == 0:
             conn.commit()
@@ -1940,11 +2491,24 @@ def load_data(conn: sqlite3.Connection, xml_dirs: Sequence[Path], workers: int, 
             handle(extract_file(fp))
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
-            for row in ex.map(extract_file, files_iter, chunksize=chunksize):
-                handle(row)
+            mapped = bounded_ordered_executor_map(
+                ex,
+                extract_file,
+                files_iter,
+                chunksize=chunksize,
+                max_pending_batches=max(
+                    1, int(workers) * PROCESS_BATCH_PREFETCH_MULTIPLIER
+                ),
+            )
+            try:
+                for row in mapped:
+                    handle(row)
+            finally:
+                mapped.close()
 
     conn.commit()
     print(f'[load] done: {processed:,} files')
+    return processed
 
 
 # ---------------------------------------------------------------------------
@@ -2406,12 +2970,130 @@ def validate(conn: sqlite3.Connection) -> None:
             print(f'[validate] {label}: ERROR: {e}')
 
 
+def validate_manifest_load(
+    conn: sqlite3.Connection,
+    selection: ManifestSelection,
+    processed: int,
+) -> None:
+    expected = int(selection.stats['selected_objects'])
+    conn.create_function('manifest_object_id', 1, object_id_from_filing_id, deterministic=True)
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS return_count,
+               COUNT(DISTINCT filing_id) AS filing_count,
+               COUNT(DISTINCT source_file) AS source_count,
+               COUNT(DISTINCT manifest_object_id(filing_id)) AS object_count
+        FROM returns
+        """
+    ).fetchone()
+    actual = {
+        'processed': int(processed),
+        'returns': int(row[0]),
+        'filings': int(row[1]),
+        'sources': int(row[2]),
+        'objects': int(row[3]),
+    }
+    mismatched = {key: value for key, value in actual.items() if value != expected}
+    if mismatched:
+        raise RuntimeError(
+            f'manifest load coverage mismatch; expected {expected:,} for every count, got {actual}'
+        )
+    quick_check = str(conn.execute('PRAGMA quick_check').fetchone()[0])
+    if quick_check != 'ok':
+        raise RuntimeError(f'manifest staging database failed quick_check: {quick_check}')
+    print(
+        f'[validate] manifest coverage: {expected:,} returns / filings / objects / sources; '
+        'quick_check=ok'
+    )
+
+
+def _checkpoint_manifest_staging(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    checkpoint = conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+    if checkpoint is None or int(checkpoint[0]) != 0:
+        raise RuntimeError(f'manifest staging WAL checkpoint failed or was busy: {checkpoint}')
+    journal_mode = str(conn.execute('PRAGMA journal_mode=DELETE').fetchone()[0]).casefold()
+    if journal_mode != 'delete':
+        raise RuntimeError(f'manifest staging journal mode did not finalize: {journal_mode}')
+
+
+def _remove_staging_files(path: Path) -> None:
+    for candidate in (path, Path(str(path) + '-wal'), Path(str(path) + '-shm'), Path(str(path) + '-journal')):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def build_database(
+    db_path: Path,
+    xml_dirs: Sequence[Path],
+    args: argparse.Namespace,
+    manifest_selection: Optional[ManifestSelection] = None,
+) -> int:
+    conn = db_connect(db_path)
+    try:
+        if manifest_selection is not None:
+            conn.execute('PRAGMA synchronous=NORMAL;')
+        print('[schema] creating/updating slim schema...')
+        build_schema(conn)
+        ensure_schema_columns(conn)
+
+        print('[load] loading XML into slim schema...')
+        manifest_files = manifest_selection.files if manifest_selection is not None else None
+        manifest_file_stats = None
+        if manifest_selection is not None:
+            manifest_file_stats = {
+                'total': manifest_selection.stats['manifest_source_rows'],
+                'selected': manifest_selection.stats['selected_objects'],
+                'skipped_existing': 0,
+                'skipped_duplicate_input': (
+                    manifest_selection.stats['manifest_source_rows']
+                    - manifest_selection.stats['selected_objects']
+                ),
+            }
+        processed = load_data(
+            conn,
+            xml_dirs,
+            args.workers,
+            args.chunksize,
+            args.commit_every,
+            append_only=bool(args.append or args.keep_db),
+            selected_files=manifest_files,
+            selected_file_stats=manifest_file_stats,
+            strict_errors=manifest_selection is not None,
+        )
+
+        print('[canon] rebuilding canonical_by_ein_year...')
+        rebuild_canonical(conn)
+
+        print('[schema] creating views + indexes...')
+        build_views_indexes(conn)
+
+        print('[opt] ANALYZE / optimize...')
+        conn.execute('ANALYZE;')
+        conn.execute('PRAGMA optimize;')
+        conn.commit()
+
+        if args.vacuum:
+            print('[opt] VACUUM...')
+            conn.execute('VACUUM;')
+
+        if manifest_selection is not None:
+            validate_manifest_load(conn, manifest_selection, processed)
+            _checkpoint_manifest_staging(conn)
+        validate(conn)
+        return processed
+    finally:
+        conn.close()
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description='Slim rebuild for current IRS 990 query modules')
     ap.add_argument('--db', required=False,
-                    help='SQLite database to create/rebuild/append. Required unless --preflight is used.')
-    ap.add_argument('--xml-dir', required=True, action='append',
-                    help='XML directory to scan. Repeat the option to load multiple roots in one maintenance pass.')
+                    help='SQLite database to create/rebuild/append. Required unless a read-only selection/preflight mode is used.')
+    ap.add_argument('--xml-dir', action='append',
+                    help='XML directory to scan. Repeat for ordinary multi-root loads. Manifest mode accepts exactly one root and falls back to IRS_XML_ROOT.')
     ap.add_argument('--preflight', action='store_true',
                     help='Scan XML files recursively and report parser/extraction compatibility without writing to SQLite.')
     ap.add_argument('--preflight-report', default=None,
@@ -2429,16 +3111,45 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                     help='Append only XML filings not already present in the database. Implies --keep-db.')
     ap.add_argument('--keep-db', action='store_true',
                     help='Keep the existing DB file and skip filings already present. Alias for safe append behavior.')
+    ap.add_argument('--manifest-clean-rebuild', action='store_true',
+                    help='Select a clean rebuild from the source manifest, with complete validation before the destination is touched.')
+    ap.add_argument('--manifest-selection-only', action='store_true',
+                    help='Validate and count the manifest clean-rebuild selection without creating, deleting, or writing a destination database.')
+    ap.add_argument('--manifest-db', default=str(DEFAULT_SOURCE_MANIFEST),
+                    help='Read-only source inventory for manifest clean-rebuild mode (default: db/irs990_sources.db).')
+    ap.add_argument('--expected-selection-count', type=int,
+                    help='Optional exact object/filing count required for manifest selection.')
     ap.add_argument('--vacuum', action='store_true')
     return ap.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    xml_dirs = [Path(value) for value in args.xml_dir]
+    manifest_mode = bool(args.manifest_clean_rebuild or args.manifest_selection_only)
+    if args.preflight and manifest_mode:
+        print('ERROR: --preflight cannot be combined with manifest clean-rebuild mode', file=sys.stderr)
+        return 2
+    if args.expected_selection_count is not None and not manifest_mode:
+        print('ERROR: --expected-selection-count requires manifest clean-rebuild mode', file=sys.stderr)
+        return 2
+    if manifest_mode and (args.append or args.keep_db):
+        print('ERROR: manifest clean-rebuild mode cannot be combined with --append/--keep-db', file=sys.stderr)
+        return 2
+
+    if args.xml_dir:
+        xml_dirs = [Path(value).expanduser().resolve() for value in args.xml_dir]
+    elif manifest_mode:
+        configured_root = configured_xml_root()
+        if configured_root is None:
+            print('ERROR: XML root is not configured; set IRS_XML_ROOT or pass --xml-dir', file=sys.stderr)
+            return 2
+        xml_dirs = [configured_root]
+    else:
+        print('ERROR: at least one --xml-dir is required', file=sys.stderr)
+        return 2
 
     for xml_dir in xml_dirs:
-        if not xml_dir.exists():
+        if not xml_dir.is_dir():
             print(f'ERROR: xml dir not found: {xml_dir}', file=sys.stderr)
             return 2
 
@@ -2456,48 +3167,113 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sample_limit=args.preflight_sample_limit,
         )
 
+    manifest_selection: Optional[ManifestSelection] = None
+    manifest_destination: Optional[Path] = None
+    if manifest_mode:
+        if len(xml_dirs) != 1:
+            print('ERROR: manifest clean-rebuild mode accepts exactly one XML root', file=sys.stderr)
+            return 2
+        if args.manifest_selection_only and args.db:
+            print('ERROR: --manifest-selection-only does not accept --db', file=sys.stderr)
+            return 2
+        if args.manifest_clean_rebuild and not args.manifest_selection_only:
+            if not args.db:
+                print('ERROR: --manifest-clean-rebuild requires a new staging --db path', file=sys.stderr)
+                return 2
+            manifest_destination = Path(args.db).expanduser().resolve()
+            active_db = Path(os.getenv('IRS_DB_PATH') or DB_PATH).expanduser().resolve()
+            if manifest_destination == active_db:
+                print('ERROR: manifest clean rebuild refuses the active IRS_DB_PATH', file=sys.stderr)
+                return 2
+            if os.path.lexists(str(manifest_destination)):
+                print(
+                    'ERROR: manifest clean rebuild destination already exists; choose a new staging filename',
+                    file=sys.stderr,
+                )
+                return 2
+            root = xml_dirs[0].resolve()
+            if manifest_destination == root or root in manifest_destination.parents:
+                print('ERROR: manifest clean rebuild destination must be outside the XML root', file=sys.stderr)
+                return 2
+        manifest_path = Path(args.manifest_db).expanduser().resolve()
+        if manifest_destination is not None and manifest_destination == manifest_path:
+            print('ERROR: destination --db must differ from the read-only source manifest', file=sys.stderr)
+            return 2
+        try:
+            manifest_selection = select_manifest_xml_files(
+                manifest_path,
+                xml_dirs[0],
+                expected_count=args.expected_selection_count,
+                collect_files=not args.manifest_selection_only,
+            )
+        except ManifestSelectionError as exc:
+            print(f'ERROR: manifest selection rejected: {exc}', file=sys.stderr)
+            return 2
+        if manifest_destination is not None:
+            destination_key = os.path.normcase(str(manifest_destination))
+            if any(os.path.normcase(path) == destination_key for path in manifest_selection.files or ()):
+                print('ERROR: manifest destination equals a selected XML source', file=sys.stderr)
+                return 2
+        stats = manifest_selection.stats
+        print(f'[manifest] source inventory: {manifest_path}')
+        print(f'[manifest] XML root: {xml_dirs[0]}')
+        print(
+            f"[manifest] selected objects/filings: {stats['selected_objects']:,}; "
+            f"source rows: {stats['manifest_source_rows']:,}; "
+            f"files validated: {stats['files_validated']:,}"
+        )
+        print(
+            f"[manifest] unique: {stats['unique']:,}; "
+            f"exact-duplicate primaries: {stats['exact_duplicate_primary']:,}; "
+            f"loaded conflict paths: "
+            f"{stats['object_id_conflict_loaded_path'] + stats['object_id_conflict_loaded_path_normalized_old']:,}"
+        )
+        if args.manifest_selection_only:
+            print('[manifest] selection only: no destination database was opened or changed')
+            return 0
+
     if not args.db:
-        print('ERROR: --db is required unless --preflight is used', file=sys.stderr)
+        print('ERROR: --db is required unless a read-only selection/preflight mode is used', file=sys.stderr)
         return 2
 
-    db_path = Path(args.db)
+    db_path = manifest_destination or Path(args.db)
     append_mode = bool(args.append or args.keep_db)
 
-    if db_path.exists() and not append_mode:
+    if manifest_selection is None and db_path.exists() and not append_mode:
         print(f'[init] removing existing DB: {db_path}')
         db_path.unlink()
-    elif db_path.exists() and append_mode:
+    elif manifest_selection is None and db_path.exists() and append_mode:
         print(f'[init] append mode: preserving existing DB: {db_path}')
-    elif append_mode:
+    elif manifest_selection is None and append_mode:
         print(f'[init] append mode requested, but DB does not exist yet; creating new DB: {db_path}')
 
-    conn = db_connect(db_path)
-    try:
-        print('[schema] creating/updating slim schema...')
-        build_schema(conn)
-        ensure_schema_columns(conn)
-
-        print('[load] loading XML into slim schema...')
-        load_data(conn, xml_dirs, args.workers, args.chunksize, args.commit_every, append_only=append_mode)
-
-        print('[canon] rebuilding canonical_by_ein_year...')
-        rebuild_canonical(conn)
-
-        print('[schema] creating views + indexes...')
-        build_views_indexes(conn)
-
-        print('[opt] ANALYZE / optimize...')
-        conn.execute('ANALYZE;')
-        conn.execute('PRAGMA optimize;')
-        conn.commit()
-
-        if args.vacuum:
-            print('[opt] VACUUM...')
-            conn.execute('VACUUM;')
-
-        validate(conn)
-    finally:
-        conn.close()
+    if manifest_selection is not None:
+        assert manifest_destination is not None
+        manifest_destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=manifest_destination.name + '.building-',
+            suffix='.db',
+            dir=str(manifest_destination.parent),
+        )
+        os.close(fd)
+        temp_path = Path(temp_name)
+        try:
+            build_database(temp_path, xml_dirs, args, manifest_selection)
+            if os.path.lexists(str(manifest_destination)):
+                raise RuntimeError(
+                    'manifest destination appeared during the build; refusing to overwrite it'
+                )
+            os.replace(temp_path, manifest_destination)
+        except Exception as exc:
+            print(f'ERROR: manifest clean rebuild failed atomically: {exc}', file=sys.stderr)
+            return 1
+        finally:
+            # BaseException subclasses (KeyboardInterrupt/SystemExit) bypass
+            # the ordinary error handler but must never leave a partial DB/WAL.
+            _remove_staging_files(temp_path)
+        print(f'[publish] installed validated staging database: {manifest_destination}')
+    else:
+        build_database(db_path, xml_dirs, args)
 
     print('[done] slim rebuild complete')
     return 0
