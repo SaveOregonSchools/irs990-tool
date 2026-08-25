@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from common import connect_olms_ro
+from queries._links import query_url
 from queries._olms_common import clean_ein, fnums, h
 
 
@@ -112,7 +113,9 @@ def _build_report(form) -> Dict:
     form = form or {}
     name = (form.get("org_search") or "").strip()
     selected = _selected_fnum(form)
-    if form.get("_action") == "search_org" or (name and selected is None):
+    # A typed organization name is an explicit search request. Do not let a
+    # file number left over from a previously opened union override it.
+    if form.get("_action") == "search_org" or name:
         matches = _search(name)
         if len(matches) != 1 or form.get("_action") == "search_org":
             return {"search_query": name, "search_results": matches, "rows": []}
@@ -226,7 +229,7 @@ def _render_search(report: Dict) -> str:
     if not rows:
         return f'<div class="err">No OLMS organizations matched <b>{h(report.get("search_query"))}</b>.</div>'
     body = "".join(
-        f"<tr><td><a href='/query/olms_union_deep_dive?f_num={row[0]}'>{h(row[0])}</a></td>"
+        f"<tr><td><a href='{h(query_url('olms_union_deep_dive', f_num=row[0]))}'>{h(row[0])}</a></td>"
         f"<td>{h(row[1])}</td><td>{h(row[2])}</td><td>{h(row[3])}, {h(row[4])}</td>"
         f"<td>{h(row[5])}</td><td>{h(row[6])}</td></tr>"
         for row in rows
@@ -242,7 +245,10 @@ def render_results(form, headers, rows) -> str:
         return f'<div class="err"><b>{h(report["error"])}</b></div>'
     org = report["org"]
     ein = org.get("candidate_ein")
-    ein_link = f"<a href='/query/nonprofit_deep_dive?ein={h(ein)}'>{h(ein)}</a>" if ein else "Unmatched"
+    ein_link = (
+        f"<a href='{h(query_url('nonprofit_deep_dive', ein=ein))}'>{h(ein)}</a>"
+        if ein else "Unmatched"
+    )
     summary = f"""
       <div style="border:1px solid #d8dde6;padding:14px;border-radius:7px;margin:12px 0">
         <h2 style="margin-top:0">{h(org.get('display_name'))}</h2>

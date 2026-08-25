@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from common import attach_grant_work_ro, connect_ro, normalize_eins
+from queries._links import query_url
 from queries._risk_external import fetch_external_checks
 from queries._risk_network import (
     available as risk_network_available,
@@ -3051,7 +3052,7 @@ def _render_search_results(report: Dict) -> str:
               <td>{_h(item.get("tax_year"))}</td>
               <td>{_h(item.get("return_type"))}</td>
               <td>
-                <form method="post" action="/query/fraud_risk_dashboard" style="margin:0;">
+                <form method="post" action="{_h(query_url('fraud_risk_dashboard'))}" style="margin:0;">
                   <input type="hidden" name="qkey" value="fraud_risk_dashboard">
                   <input type="hidden" name="org_search" value="{_h(query)}">
                   <input type="hidden" name="ein" value="{_h(item.get("ein"))}">
@@ -3523,7 +3524,7 @@ def _network_rows(connections: List[Dict], subject_ein: str) -> str:
         analyze = ""
         if item.get("ein"):
             analyze = f"""
-            <form method="post" action="/query/fraud_risk_dashboard" class="inline-analyze">
+            <form method="post" action="{_h(query_url('fraud_risk_dashboard'))}" class="inline-analyze">
               <input type="hidden" name="qkey" value="fraud_risk_dashboard">
               <input type="hidden" name="ein" value="{_h(item.get('ein'))}">
               <input type="hidden" name="external_mode" value="local">
@@ -4104,6 +4105,42 @@ def _fac_award_rows(reports: List[Dict]) -> str:
     return "".join(rows)
 
 
+def _usaspending_recipient_links(result: Dict) -> List[str]:
+    links = []
+    seen = set()
+    for item in result.get("matches") or []:
+        recipient_id = _text(item.get("id")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9-]+", recipient_id) or recipient_id in seen:
+            continue
+        seen.add(recipient_id)
+        label = item.get("name") or item.get("uei") or recipient_id
+        uei = _text(item.get("uei"))
+        if uei and uei not in _text(label):
+            label = f"{label} ({uei})"
+        url = (
+            "https://www.usaspending.gov/recipient/"
+            + urllib.parse.quote(recipient_id, safe="-")
+            + "/all"
+        )
+        links.append(f'<a href="{_h(url)}" target="_blank" rel="noopener">{_h(label)}</a>')
+    return links
+
+
+def _federal_program_note(usaspending: Dict) -> str:
+    recipient_links = _usaspending_recipient_links(usaspending)
+    exact_recipients = (
+        f" Exact recipient page{'s' if len(recipient_links) != 1 else ''} "
+        f"found by UEI: {', '.join(recipient_links)}."
+        if recipient_links else ""
+    )
+    return f"""
+      <p class="panel-footnote"><b>This is a non-exhaustive list, sorted by dollars expended.</b>
+      Pull the complete list of federal funding from
+      <a href="https://www.usaspending.gov/search" target="_blank" rel="noopener">USAspending Advanced Search</a>.
+      {exact_recipients}</p>
+    """
+
+
 def _external_candidate_sections(external: Dict) -> str:
     sections = []
     usa = external.get("usaspending") or {}
@@ -4225,6 +4262,7 @@ def _external_candidate_sections(external: Dict) -> str:
 
 def _external_panel(external: Dict, mode: str) -> str:
     fac = external.get("fac") or {}
+    usaspending = external.get("usaspending") or {}
     reports = fac.get("reports") or []
     audit_rows = _fac_audit_rows(reports)
     finding_count = len(_fac_finding_groups(reports))
@@ -4245,7 +4283,7 @@ def _external_panel(external: Dict, mode: str) -> str:
           </div>
           <div class="table-scroll"><table class="risk-table external-findings-table"><thead><tr><th>Year</th><th>Reference / linked awards</th><th>Requirement</th><th>Flags</th><th>Finding narrative</th><th>Corrective action</th></tr></thead><tbody>{finding_rows}</tbody></table></div>
         </details>''' if finding_rows else '<p class="empty-note">No FAC finding rows were returned for these reports.</p>'}
-        {f'<details><summary><b>Largest federal programs ({sum(len(r.get("federal_awards") or []) for r in reports)})</b></summary><div class="table-scroll"><table class="risk-table"><thead><tr><th>Year</th><th>Assistance listing</th><th>Program</th><th>Expended</th><th>Major</th><th>Opinion</th><th>Findings</th></tr></thead><tbody>{award_rows}</tbody></table></div></details>' if award_rows else ''}
+        {f'<details open><summary><b>Largest federal programs ({sum(len(r.get("federal_awards") or []) for r in reports)})</b></summary>{_federal_program_note(usaspending)}<div class="table-scroll"><table class="risk-table"><thead><tr><th>Year</th><th>Assistance listing</th><th>Program</th><th>Expended</th><th>Major</th><th>Opinion</th><th>Findings</th></tr></thead><tbody>{award_rows}</tbody></table></div></details>' if award_rows else ''}
         """
     elif fac.get("status") == "no_match":
         fac_details = '<p class="empty-note">FAC checked both primary and additional EIN fields in the available live and/or local sources and returned no audit match.</p>'

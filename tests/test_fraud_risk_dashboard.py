@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import app as app_module
 from queries import fraud_risk_dashboard as mod
 from queries import ngo_core_data
 from queries import nonprofit_deep_dive as deep
@@ -1753,6 +1754,75 @@ class FraudRiskDashboardTests(unittest.TestCase):
         self.assertIn("Risky Org", html)
         self.assertIn("Analyze</button>", html)
         self.assertIn('name="qkey" value="fraud_risk_dashboard"', html)
+
+    def test_internal_dashboard_forms_honor_script_name(self):
+        with app_module.app.test_request_context(
+            "/query/fraud_risk_dashboard",
+            environ_overrides={"SCRIPT_NAME": "/irs990"},
+        ):
+            search_html = mod._render_search_results({
+                "search_query": "Risky",
+                "external_mode": "local",
+                "search_results": [{
+                    "org_name": "Risky Org",
+                    "ein": "111111111",
+                    "city": "Portland",
+                    "state": "OR",
+                    "tax_year": 2024,
+                    "return_type": "990",
+                }],
+            })
+            network_html = mod._network_rows([{
+                "name": "Related Org",
+                "ein": "222222222",
+                "relationships": {"grant_paid"},
+                "years": [2024],
+                "amount_by_type": {},
+                "evidence": [],
+            }], "111111111")
+
+        expected = 'action="/irs990/query/fraud_risk_dashboard"'
+        self.assertIn(expected, search_html)
+        self.assertIn(expected, network_html)
+
+    def test_federal_program_note_links_complete_search_and_exact_recipients(self):
+        external = {
+            "fac": {
+                "status": "ok",
+                "reports": [{
+                    "general": {"audit_year": "2024"},
+                    "federal_awards": [{
+                        "federal_agency_prefix": "84",
+                        "federal_award_extension": "027",
+                        "federal_program_name": "Education Stabilization Fund",
+                        "amount_expended": 2000000,
+                    }],
+                }],
+            },
+            "usaspending": {
+                "status": "ok",
+                "matches": [{
+                    "id": "abc123-P",
+                    "name": "Risky Org",
+                    "uei": "ABCDEFGHIJKL",
+                }],
+            },
+        }
+
+        html = mod._external_panel(external, "live")
+
+        heading_position = html.index("Largest federal programs")
+        note_position = html.index("This is a non-exhaustive list")
+        table_position = html.index('<div class="table-scroll">', note_position)
+        self.assertLess(heading_position, note_position)
+        self.assertLess(note_position, table_position)
+        self.assertIn("<details open><summary><b>Largest federal programs", html)
+        self.assertIn('href="https://www.usaspending.gov/search"', html)
+        self.assertIn(
+            'href="https://www.usaspending.gov/recipient/abc123-P/all"',
+            html,
+        )
+        self.assertIn("Risky Org (ABCDEFGHIJKL)", html)
 
     def test_requires_single_ein_or_name_search(self):
         headers, rows = mod.run({"ein": "111111111 222222222"})

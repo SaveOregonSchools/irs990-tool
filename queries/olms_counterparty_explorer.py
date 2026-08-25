@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, Iterable, List, Tuple
 
 from common import connect_olms_ro
+from queries._links import query_url
 from queries._olms_common import clean_ein, h, iter_query, preview_limit
 
 
@@ -180,7 +181,7 @@ def render_results(form, headers, rows) -> str:
         if not search:
             return '<div class="err">Enter search criteria; no counterparties matched the current search.</div>'
         body = "".join(
-            f"<tr><td><a href='/query/olms_counterparty_explorer?counterparty_id={h(r[0])}'>{h(r[1])}</a></td>"
+            f"<tr><td><a href='{h(query_url('olms_counterparty_explorer', counterparty_id=r[0]))}'>{h(r[1])}</a></td>"
             f"<td>{h(r[2])}, {h(r[3])} {h(r[4])}</td><td>{h(r[5])}</td><td>{h(r[6])}</td>"
             f"<td>{h(r[7])}</td><td>{_money(r[8])}</td><td>{h(r[9])}</td><td>{h(r[10])} - {h(r[11])}</td></tr>"
             for r in search
