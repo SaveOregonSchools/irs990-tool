@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from common import configured_xml_root, connect_ro, normalize_eins
 from queries import ngo_core_data, ngo_grants_in, ngo_grants_out
+from queries._links import query_url
 
 
 META = {
@@ -1068,7 +1069,7 @@ def _render_search_results(report: Dict) -> str:
               <td>{_h(item.get("tax_year"))}</td>
               <td>{_h(item.get("return_type"))}</td>
               <td>
-                <form method="post" action="/query/nonprofit_deep_dive" style="margin:0;">
+                <form method="post" action="{_h(query_url('nonprofit_deep_dive'))}" style="margin:0;">
                   <input type="hidden" name="qkey" value="nonprofit_deep_dive">
                   <input type="hidden" name="org_search" value="{_h(query)}">
                   <input type="hidden" name="ein" value="{ein}">

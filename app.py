@@ -665,6 +665,16 @@ QUERY_HTML = LAYOUT_START + """
     document.body.classList.add("is-running");
 
     const submitter = event.submitter;
+    // Disabled controls are omitted from submitted form data. Preserve the
+    // clicked button's action before disabling buttons so modules can tell a
+    // name search from their primary action.
+    if (submitter && submitter.name) {
+      const submittedAction = document.createElement("input");
+      submittedAction.type = "hidden";
+      submittedAction.name = submitter.name;
+      submittedAction.value = submitter.value;
+      form.appendChild(submittedAction);
+    }
     const submitAction = submitter ? submitter.getAttribute("formaction") : "";
     const isExport = submitAction === "{{ url_for('export') }}" ||
       submitAction === "{{ url_for('export_pdf') }}" ||

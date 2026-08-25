@@ -302,6 +302,20 @@ class AppPagesAndStatsTests(unittest.TestCase):
         self.assertEqual(run_response.request.path, "/query/fixture_query")
         self.assertIn("value", run_body)
 
+    def test_query_page_urls_honor_script_name_and_preserve_button_action(self):
+        client = app_module.app.test_client()
+        response = client.get(
+            "/query/fixture_query",
+            environ_overrides={"SCRIPT_NAME": "/irs990"},
+        )
+        body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('action="/irs990/query/fixture_query"', body)
+        self.assertIn('href="/irs990/"', body)
+        self.assertIn("submittedAction.name = submitter.name", body)
+        self.assertIn("submittedAction.value = submitter.value", body)
+
     def test_pdf_query_hides_generic_preview_and_csv_controls(self):
         client = app_module.app.test_client()
         response = client.get("/query/pdf_query")
