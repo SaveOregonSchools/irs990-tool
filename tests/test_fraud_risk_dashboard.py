@@ -1811,12 +1811,15 @@ class FraudRiskDashboardTests(unittest.TestCase):
 
         html = mod._external_panel(external, "live")
 
-        note_position = html.index("This is a non-exhaustive list")
         heading_position = html.index("Largest federal programs")
-        self.assertLess(note_position, heading_position)
+        note_position = html.index("This is a non-exhaustive list")
+        table_position = html.index('<div class="table-scroll">', note_position)
+        self.assertLess(heading_position, note_position)
+        self.assertLess(note_position, table_position)
+        self.assertIn("<details open><summary><b>Largest federal programs", html)
         self.assertIn('href="https://www.usaspending.gov/search"', html)
         self.assertIn(
-            'href="https://www.usaspending.gov/recipient/abc123-P"',
+            'href="https://www.usaspending.gov/recipient/abc123-P/all"',
             html,
         )
         self.assertIn("Risky Org (ABCDEFGHIJKL)", html)

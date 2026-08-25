@@ -4117,7 +4117,11 @@ def _usaspending_recipient_links(result: Dict) -> List[str]:
         uei = _text(item.get("uei"))
         if uei and uei not in _text(label):
             label = f"{label} ({uei})"
-        url = "https://www.usaspending.gov/recipient/" + urllib.parse.quote(recipient_id, safe="-")
+        url = (
+            "https://www.usaspending.gov/recipient/"
+            + urllib.parse.quote(recipient_id, safe="-")
+            + "/all"
+        )
         links.append(f'<a href="{_h(url)}" target="_blank" rel="noopener">{_h(label)}</a>')
     return links
 
@@ -4279,7 +4283,7 @@ def _external_panel(external: Dict, mode: str) -> str:
           </div>
           <div class="table-scroll"><table class="risk-table external-findings-table"><thead><tr><th>Year</th><th>Reference / linked awards</th><th>Requirement</th><th>Flags</th><th>Finding narrative</th><th>Corrective action</th></tr></thead><tbody>{finding_rows}</tbody></table></div>
         </details>''' if finding_rows else '<p class="empty-note">No FAC finding rows were returned for these reports.</p>'}
-        {f'{_federal_program_note(usaspending)}<details><summary><b>Largest federal programs ({sum(len(r.get("federal_awards") or []) for r in reports)})</b></summary><div class="table-scroll"><table class="risk-table"><thead><tr><th>Year</th><th>Assistance listing</th><th>Program</th><th>Expended</th><th>Major</th><th>Opinion</th><th>Findings</th></tr></thead><tbody>{award_rows}</tbody></table></div></details>' if award_rows else ''}
+        {f'<details open><summary><b>Largest federal programs ({sum(len(r.get("federal_awards") or []) for r in reports)})</b></summary>{_federal_program_note(usaspending)}<div class="table-scroll"><table class="risk-table"><thead><tr><th>Year</th><th>Assistance listing</th><th>Program</th><th>Expended</th><th>Major</th><th>Opinion</th><th>Findings</th></tr></thead><tbody>{award_rows}</tbody></table></div></details>' if award_rows else ''}
         """
     elif fac.get("status") == "no_match":
         fac_details = '<p class="empty-note">FAC checked both primary and additional EIN fields in the available live and/or local sources and returned no audit match.</p>'
