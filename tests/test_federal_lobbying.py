@@ -68,6 +68,22 @@ class FederalLobbyingTests(unittest.TestCase):
             mod.run({"ein": "123"})
         with self.assertRaisesRegex(ValueError, "exactly one"):
             mod.run({"ein": "11-1111111 22-2222222"})
+        with self.assertRaisesRegex(ValueError, "not both"):
+            mod.run({"ein": "11-1111111", "organization_name": "Example"})
+        with self.assertRaisesRegex(ValueError, "either"):
+            mod.run({})
+
+    def test_organization_name_can_start_match_search_without_an_ein(self):
+        match = mod.MatchName("EXAMPLE ORGANIZATION", "client", 123)
+        with patch.object(
+            mod,
+            "_find_matches",
+            return_value=[("Client", match, "Oregon", "EXAMPLE REGISTRANT")],
+        ) as find:
+            headers, rows = mod.run({"organization_name": "Example Organization"})
+        self.assertEqual(headers, mod.MATCH_HEADERS)
+        self.assertEqual(str(rows[0][1]), "EXAMPLE ORGANIZATION")
+        find.assert_called_once_with(["Example Organization"])
 
     def test_name_normalization_handles_the_ampersand_and_legal_suffixes(self):
         self.assertTrue(mod._names_equivalent("The Example & Company, LLC", "EXAMPLE AND COMPANY"))
@@ -101,7 +117,13 @@ class FederalLobbyingTests(unittest.TestCase):
 
         self.assertEqual(
             names,
-            ["Example & Company, LLC", "Example Learning", "Former Example Name"],
+            [
+                "Example & Company, LLC Example Learning",
+                "Example & Company, LLC",
+                "Example Learning",
+                "Example and Company Former Example Name",
+                "Former Example Name",
+            ],
         )
 
     def test_collection_follows_only_valid_lda_pagination(self):
@@ -161,17 +183,31 @@ class FederalLobbyingTests(unittest.TestCase):
                     "https://lda.gov/api/v1/clients/?client_name=Example"
                 )
 
-    def test_run_verifies_names_deduplicates_roles_and_sorts_newest_first(self):
+    def test_two_step_run_lists_matches_then_loads_only_selected_client(self):
         calls = []
 
-        def fetch(endpoint, params):
-            calls.append((endpoint, dict(params)))
+        def fetch(endpoint, params, **kwargs):
+            calls.append((endpoint, dict(params), dict(kwargs)))
             if endpoint == mod._REGISTRANTS_URL:
-                return [{"name": "THE INSTITUTE FOR EDUCATIONAL LEADERSHIP"}]
+                return [
+                    {
+                        "id": 310995,
+                        "name": "THE INSTITUTE FOR EDUCATIONAL LEADERSHIP",
+                        "state_display": "District of Columbia",
+                    }
+                ]
             if endpoint == mod._CLIENTS_URL:
-                return [{"name": "INSTITUTE FOR EDUCATIONAL LEADERSHIP"}]
-            if "registrant_name" in params:
-                return [FILING_ONE]
+                return [
+                    {
+                        "id": 183738,
+                        "name": "INSTITUTE FOR EDUCATIONAL LEADERSHIP",
+                        "state_display": "District of Columbia",
+                        "registrant": {
+                            "name": "THE INSTITUTE FOR EDUCATIONAL LEADERSHIP"
+                        },
+                    }
+                ]
+            self.assertEqual(params["client_id"], 183738)
             return [FILING_ONE, FILING_TWO, FALSE_POSITIVE_FILING]
 
         with patch.object(
@@ -180,8 +216,22 @@ class FederalLobbyingTests(unittest.TestCase):
             return_value=["Institute for Educational Leadership"],
         ):
             with patch.object(mod, "_fetch_collection", side_effect=fetch):
-                headers, rows = mod.run({"ein": "11-1111111"})
+                match_headers, matches = mod.run({"ein": "11-1111111"})
+                headers, rows = mod.run(
+                    {
+                        "action": "load_filings",
+                        "selected_role": "client",
+                        "selected_id": "183738",
+                        "selected_name": "INSTITUTE FOR EDUCATIONAL LEADERSHIP",
+                    }
+                )
 
+        self.assertEqual(match_headers, mod.MATCH_HEADERS)
+        self.assertEqual([row[0] for row in matches], ["Registrant", "Client"])
+        self.assertEqual(matches[1][1].entity_id, 183738)
+        self.assertEqual(
+            matches[1][3], "THE INSTITUTE FOR EDUCATIONAL LEADERSHIP"
+        )
         self.assertEqual(headers, mod.HEADERS)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][2], "Registration - Amendment")
@@ -192,15 +242,81 @@ class FederalLobbyingTests(unittest.TestCase):
             "https://lda.gov/filings/public/filing/"
             "22222222-2222-4222-8222-222222222222/print/",
         )
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][2]["max_results"], mod._MAX_MATCHES_PER_ROLE)
 
     def test_export_reuses_short_lived_result_cache(self):
-        with patch.object(mod, "_resolve_name_candidates", return_value=["Example"]):
-            with patch.object(mod, "_find_filings", return_value=[mod._filing_row(FILING_ONE)]) as find:
-                first = mod.run({"ein": "11-1111111"})[1]
-                exported = list(mod.export_rows({"ein": "11-1111111"}))
+        form = {
+            "action": "load_filings",
+            "selected_role": "client",
+            "selected_id": "183738",
+            "selected_name": "INSTITUTE FOR EDUCATIONAL LEADERSHIP",
+        }
+        with patch.object(
+            mod,
+            "_filings_for_match",
+            return_value=[mod._filing_row(FILING_ONE)],
+        ) as find:
+            first = mod.run(form)[1]
+            exported = list(mod.export_rows(form))
         self.assertEqual(exported, first)
-        find.assert_called_once_with(["Example"])
+        self.assertEqual(mod.export_headers(form), mod.HEADERS)
+        find.assert_called_once_with(
+            "client", 183738, "INSTITUTE FOR EDUCATIONAL LEADERSHIP"
+        )
+
+    def test_match_results_render_selectable_official_names(self):
+        name = mod.MatchName("INSTITUTE FOR EDUCATIONAL LEADERSHIP", "client", 183738)
+        rendered = mod.render_results(
+            {"ein": "52-1198450"},
+            mod.MATCH_HEADERS,
+            [
+                (
+                    "Client",
+                    name,
+                    "District of Columbia",
+                    "THE INSTITUTE FOR EDUCATIONAL LEADERSHIP",
+                )
+            ],
+        )
+        self.assertIn("Possible LDA.gov matches", rendered)
+        self.assertIn('name="selected_id" value="183738"', rendered)
+        self.assertIn('name="selected_role" value="client"', rendered)
+        self.assertIn('name="ein" value="52-1198450"', rendered)
+        self.assertIn('class="lda-match-button"', rendered)
+        self.assertIn("THE INSTITUTE FOR EDUCATIONAL LEADERSHIP", rendered)
+
+    def test_query_page_exposes_ein_or_name_and_renders_first_step(self):
+        import app
+
+        original_registry = app.REGISTRY
+        original_fingerprint = app.PLUGIN_FINGERPRINT
+        try:
+            app.REGISTRY = {mod.META["key"]: mod}
+            app.PLUGIN_FINGERPRINT = app.plugin_fingerprint()
+            app.app.config.update(TESTING=True)
+            match = mod.MatchName("EXAMPLE ORGANIZATION", "client", 123)
+            with patch.object(
+                mod,
+                "_find_matches",
+                return_value=[("Client", match, "Oregon", "EXAMPLE REGISTRANT")],
+            ):
+                client = app.app.test_client()
+                get_body = client.get("/query/federal_lobbying").get_data(as_text=True)
+                post_body = client.post(
+                    "/query/federal_lobbying",
+                    data={"organization_name": "Example Organization"},
+                ).get_data(as_text=True)
+        finally:
+            app.REGISTRY = original_registry
+            app.PLUGIN_FINGERPRINT = original_fingerprint
+
+        self.assertIn('name="ein"', get_body)
+        self.assertIn('name="organization_name"', get_body)
+        self.assertIn("Find LDA.gov Matches", get_body)
+        self.assertNotIn("Export CSV (full result)", get_body)
+        self.assertIn("Possible LDA.gov matches", post_body)
+        self.assertIn("EXAMPLE ORGANIZATION", post_body)
 
     def test_render_results_has_six_sort_controls_and_safe_filing_link(self):
         registrant = mod.FilingRegistrant(
@@ -218,7 +334,16 @@ class FederalLobbyingTests(unittest.TestCase):
                 "2024-04-20T09:43:00-04:00",
             )
         ]
-        rendered = mod.render_results({"ein": "111111111"}, mod.HEADERS, rows)
+        rendered = mod.render_results(
+            {
+                "action": "load_filings",
+                "selected_role": "client",
+                "selected_id": "183738",
+                "selected_name": "Client <One>",
+            },
+            mod.HEADERS,
+            rows,
+        )
         self.assertEqual(rendered.count('class="lda-sort-button"'), 6)
         self.assertIn("$1,234.50", rendered)
         self.assertIn("04/20/2024 @ 09:43 AM", rendered)
@@ -226,6 +351,8 @@ class FederalLobbyingTests(unittest.TestCase):
         self.assertIn("&lt;Example &amp; Registrant&gt;", rendered)
         self.assertIn("Client &lt;One&gt;", rendered)
         self.assertIn("aria-sort=\"descending\"", rendered)
+        self.assertIn("Export CSV (full result)", rendered)
+        self.assertIn("Selected <b>Client</b>", rendered)
 
         unsafe = mod.FilingRegistrant("Unsafe", "javascript:alert(1)")
         unsafe_rendered = mod.render_results(
