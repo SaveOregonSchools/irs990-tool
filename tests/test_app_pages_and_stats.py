@@ -235,6 +235,7 @@ class AppPagesAndStatsTests(unittest.TestCase):
                     "Fraud & Risk Indicators",
                     "Contractors",
                     "Lobbying & Political Activity",
+                    "Federal Lobbyist Registrations & Reports",
                     "Ask Database",
                     "Schedule R: Related Orgs",
                     "Find Filings by Person Name",

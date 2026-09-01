@@ -443,6 +443,12 @@ HOME_MENU = [
             ),
             (
                 "query",
+                "federal_lobbying",
+                "Federal Lobbyist Registrations & Reports",
+                "Find LDA.gov registrations and reports by EIN or organization name.",
+            ),
+            (
+                "query",
                 "ask_database",
                 "Ask Database",
                 "Ask a plain-English question involving nonprofit tax data.",
