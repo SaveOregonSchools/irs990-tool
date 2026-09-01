@@ -118,6 +118,15 @@ def _h(value: object) -> str:
 def render_fields(form) -> str:
     ein = (form or {}).get("ein", "")
     organization_name = (form or {}).get("organization_name", "")
+    both_entered = bool(str(ein).strip() and str(organization_name).strip())
+    precedence_warning = (
+        "<div style=\"margin:8px 0; padding:8px 10px; max-width:820px; "
+        "background:#fff8d6; border:1px solid #e6d37a; border-radius:6px;\">"
+        "Both fields are populated, so this search will use the EIN and ignore "
+        "the organization-name field.</div>"
+        if both_entered
+        else ""
+    )
     return f"""
     <div class="row" style="display:flex; gap:22px; flex-wrap:wrap; align-items:flex-start;">
       <div>
@@ -138,8 +147,10 @@ def render_fields(form) -> str:
     <div style="color:#666; font-size:90%; margin:6px 0 12px; max-width:820px;">
       Enter either one 9-digit EIN or an organization name. First, the tool shows
       possible registrant and client names from LDA.gov. Select the best match to
-      retrieve its LD-1 and LD-2 filings. LDA.gov does not publish EINs.
+      retrieve its LD-1 and LD-2 filings. If both fields are populated, the EIN
+      takes precedence. LDA.gov does not publish EINs.
     </div>
+    {precedence_warning}
     """
 
 
@@ -153,8 +164,6 @@ def _parse_ein(form) -> str:
 def _parse_search(form) -> Tuple[str, List[str]]:
     raw_ein = str((form or {}).get("ein") or "").strip()
     organization_name = str((form or {}).get("organization_name") or "").strip()
-    if raw_ein and organization_name:
-        raise ValueError("Enter either an EIN or an organization name, not both.")
     if raw_ein:
         ein = _parse_ein(form)
         candidates = _resolve_name_candidates(ein)

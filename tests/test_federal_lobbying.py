@@ -68,10 +68,29 @@ class FederalLobbyingTests(unittest.TestCase):
             mod.run({"ein": "123"})
         with self.assertRaisesRegex(ValueError, "exactly one"):
             mod.run({"ein": "11-1111111 22-2222222"})
-        with self.assertRaisesRegex(ValueError, "not both"):
-            mod.run({"ein": "11-1111111", "organization_name": "Example"})
         with self.assertRaisesRegex(ValueError, "either"):
             mod.run({})
+
+    def test_ein_takes_precedence_when_both_search_fields_are_present(self):
+        with patch.object(
+            mod, "_resolve_name_candidates", return_value=["Resolved EIN Name"]
+        ):
+            with patch.object(mod, "_find_matches", return_value=[]) as find:
+                headers, rows = mod.run(
+                    {
+                        "ein": "11-1111111",
+                        "organization_name": "Ignored Organization Name",
+                    }
+                )
+        self.assertEqual(headers, mod.MATCH_HEADERS)
+        self.assertEqual(rows, [])
+        find.assert_called_once_with(["Resolved EIN Name"])
+
+        fields = mod.render_fields(
+            {"ein": "11-1111111", "organization_name": "Ignored Name"}
+        )
+        self.assertIn("search will use the EIN", fields)
+        self.assertIn("organization-name field", fields)
 
     def test_organization_name_can_start_match_search_without_an_ein(self):
         match = mod.MatchName("EXAMPLE ORGANIZATION", "client", 123)
